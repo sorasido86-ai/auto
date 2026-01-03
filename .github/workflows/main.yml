@@ -1,0 +1,68 @@
+name: Daily WordPress Post
+
+on:
+  workflow_dispatch: {}
+  schedule:
+    # 09:00 KST = 00:00 UTC
+    - cron: "0 0 * * *"
+
+jobs:
+  run-daily-post:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    env:
+      # Python의 datetime.now()가 한국 날짜로 찍히게
+      TZ: Asia/Seoul
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6 # 최신 사용 예시 :contentReference[oaicite:2]{index=2}
+
+      - name: Setup Python
+        uses: actions/setup-python@v6 # 최신 사용 예시 :contentReference[oaicite:3]{index=3}
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; else pip install requests; fi
+
+      - name: Create bot_config.json from GitHub Secrets
+        env:
+          WP_BASE_URL: ${{ secrets.WP_BASE_URL }}
+          WP_USER: ${{ secrets.WP_USER }}
+          WP_APP_PASS: ${{ secrets.WP_APP_PASS }}
+          KAKAO_REST_KEY: ${{ secrets.KAKAO_REST_KEY }}
+          KAKAO_REFRESH_TOKEN: ${{ secrets.KAKAO_REFRESH_TOKEN }}
+        run: |
+          python - <<'PY'
+          import os, json
+
+          required = ["WP_BASE_URL", "WP_USER", "WP_APP_PASS"]
+          missing = [k for k in required if not os.environ.get(k)]
+          if missing:
+            raise SystemExit(f"Missing required secrets: {missing}")
+
+          cfg = {
+            "wp_base_url": os.environ["WP_BASE_URL"],
+            "wp_user": os.environ["WP_USER"],
+            "wp_app_pass": os.environ["WP_APP_PASS"],
+          }
+
+          # Kakao는 선택(없으면 config에 넣지 않음)
+          if os.environ.get("KAKAO_REST_KEY") and os.environ.get("KAKAO_REFRESH_TOKEN"):
+            cfg["kakao_rest_key"] = os.environ["KAKAO_REST_KEY"]
+            cfg["kakao_refresh_token"] = os.environ["KAKAO_REFRESH_TOKEN"]
+
+          with open("bot_config.json", "w", encoding="utf-8") as f:
+            json.dump(cfg, f, ensure_ascii=False, indent=2)
+
+          print("bot_config.json created.")
+          PY
+
+      - name: Run daily_post.py
+        run: |
+          python daily_post.py
