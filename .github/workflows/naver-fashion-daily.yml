@@ -3,7 +3,7 @@ name: Naver Fashion Daily to WordPress
 on:
   workflow_dispatch: {}
   schedule:
-    - cron: "13 0 * * *"  # 09:13 KST
+    - cron: "13 0 * * *"  # 09:13 KST (UTC 기준)
 
 permissions:
   contents: write
@@ -24,18 +24,19 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Run bot (debug first)
+      - name: Run bot (debug)
         run: |
           python naver_fashion_daily_to_wp.py --debug
         env:
           NAVER_CLIENT_ID: ${{ secrets.NAVER_CLIENT_ID }}
           NAVER_CLIENT_SECRET: ${{ secrets.NAVER_CLIENT_SECRET }}
-          WP_SITE_URL: ${{ secrets.WP_SITE_URL }}
-          WP_USERNAME: ${{ secrets.WP_USERNAME }}
-          WP_APP_PASSWORD: ${{ secrets.WP_APP_PASSWORD }}
+
+          # ✅ 너가 등록한 워드프레스 Secrets 이름 그대로
+          WP_BASE_URL: ${{ secrets.WP_BASE_URL }}
+          WP_USER: ${{ secrets.WP_USER }}
+          WP_APP_PASS: ${{ secrets.WP_APP_PASS }}
+
           SQLITE_PATH: data/naver_fashion_rankings.sqlite3
-          # DEBUG: "1"  # --debug 대신 이걸 써도 됨
-          # DRY_RUN: "1" # 테스트로 글 발행 없이 HTML만 보고 싶으면
 
       - name: Commit DB back to repo (optional)
         run: |
