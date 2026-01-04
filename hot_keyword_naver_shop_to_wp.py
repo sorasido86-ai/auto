@@ -1,39 +1,24 @@
 # -*- coding: utf-8 -*-
 """
-hot_keyword_naver_shop_to_wp.py (완전 통합)
-- 구글 트렌드 "일별 급상승" RSS에서 핫 키워드 N개 수집
-- 각 키워드로 네이버 쇼핑 검색 API(shop.json) 호출 → 상품 TOP M개 추천
-- 오전/오후 RUN_SLOT 별로 글을 "따로" 생성(슬롯별 slug 고정)
-- WordPress REST API로 생성/업데이트
-- SQLite로 슬롯별 발행 이력 저장(같은 슬롯은 업데이트)
+hot_keyword_naver_shop_to_wp.py (완전 통합본)
+- Google 트렌드(핫 키워드) 수집: RSS 우선 + 다중 폴백 + (최후) hidden JSON dailytrends 폴백
+- 각 키워드별 네이버 쇼핑 TOP상품(기본 5개) 추천
+- 워드프레스 REST API로 글 발행(AM/PM 슬롯별로 글을 따로 생성)
+- SQLite에 키워드/상품/포스트ID 저장(전일 대비 % 계산용)
 
-✅ GitHub Secrets(환경변수) 이름 그대로 사용:
+✅ GitHub Actions Secrets 이름(너가 쓰는 그대로)
+  - XNAVERCLIENT_ID
+  - XNAVERCLIENT_SECRET
   - WP_BASE_URL
   - WP_USER
   - WP_APP_PASS
 
-✅ 네이버 API 키 (둘 중 하나만 있어도 됨)
-  - NAVER_CLIENT_ID / NAVER_CLIENT_SECRET
-  - XNAVERCLIENT_ID / XNAVERCLIENT_SECRET   (네가 쓰는 이름)
-
-✅ 옵션 환경변수:
-  - WP_STATUS: publish (기본 publish)
-  - WP_CATEGORY_IDS: "31" (기본 31)
-  - WP_TAG_IDS: "1,2,3" (선택)
-  - SQLITE_PATH: data/hot_keyword_shop.sqlite3
-  - RUN_SLOT: am / pm
-  - HOT_KEYWORDS_LIMIT: 20 (기본 20)
-  - PRODUCTS_PER_KEYWORD: 5 (기본 5)
-  - GOOGLE_TRENDS_GEO: KR (기본 KR)
-  - NAVER_SORT: sim (기본 sim)
-  - DRY_RUN: 1이면 워드프레스 발행 안하고 미리보기 출력
-  - DEBUG: 1이면 상세 로그
+✅ 카테고리 기본값: 31
 """
 
 from __future__ import annotations
 
 import base64
-import hashlib
 import html as htmlmod
 import json
 import os
@@ -42,151 +27,138 @@ import sqlite3
 import sys
 import time
 import xml.etree.ElementTree as ET
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
-from urllib.parse import quote
 
 import requests
 
 
+# -----------------------------
+# Timezone
+# -----------------------------
 KST = timezone(timedelta(hours=9))
-NAVER_SHOP_ENDPOINT = "https://openapi.naver.com/v1/search/shop.json"
-
-
-# -----------------------------
-# Utils / env
-# -----------------------------
-def _env(name: str, default: str = "") -> str:
-    return str(os.getenv(name, default) or "").strip()
-
-
-def _env_int(name: str, default: int) -> int:
-    v = _env(name, str(default))
-    try:
-        return int(v)
-    except Exception:
-        return default
-
-
-def _env_bool(name: str, default: bool = False) -> bool:
-    v = _env(name, "1" if default else "0").lower()
-    return v in ("1", "true", "yes", "y", "on")
-
-
-def _parse_int_list(csv: str) -> List[int]:
-    out: List[int] = []
-    for x in (csv or "").split(","):
-        x = x.strip()
-        if not x:
-            continue
-        try:
-            out.append(int(x))
-        except Exception:
-            pass
-    return out
-
-
-def clean_title(t: str) -> str:
-    t = htmlmod.unescape(t or "")
-    t = re.sub(r"</?b>", "", t)
-    t = re.sub(r"\s+", " ", t).strip()
-    return t
-
-
-def fmt_krw(n: int) -> str:
-    try:
-        return f"{int(n):,}원"
-    except Exception:
-        return str(n)
 
 
 # -----------------------------
 # Config
 # -----------------------------
+def _env(name: str, default: str = "") -> str:
+    return str(os.getenv(name, default) or "").strip()
+
+
 @dataclass
-class NaverConfig:
-    client_id: str
-    client_secret: str
-    sort: str = "sim"
+class GoogleTrendsConfig:
+    geo: str = "KR"
+    limit: int = 20  # hot keywords count
+    request_timeout: int = 25
+
+
+@dataclass
+class NaverShopConfig:
+    client_id: str = ""
+    client_secret: str = ""
+    display: int = 5  # products per keyword
+    sort: str = "sim"  # sim/date/asc/dsc
+    exclude: str = "used:rental:cbshop"
+    request_timeout: int = 25
+    throttle_sec: float = 0.25
 
 
 @dataclass
 class WordPressConfig:
-    base_url: str
-    user: str
-    app_pass: str
+    base_url: str = ""  # e.g. https://your-site.com
+    user: str = ""
+    app_pass: str = ""
     status: str = "publish"
-    category_ids: List[int] = field(default_factory=list)
-    tag_ids: List[int] = field(default_factory=list)
+    category_ids: List[int] = None  # default [31]
+
+    def __post_init__(self):
+        if self.category_ids is None:
+            self.category_ids = [31]
+
+
+@dataclass
+class StorageConfig:
+    sqlite_path: str = "data/hot_keyword_naver_shop.sqlite3"
 
 
 @dataclass
 class RunConfig:
-    run_slot: str = "am"  # am/pm
-    hot_keywords_limit: int = 20
-    products_per_keyword: int = 5
-    trends_geo: str = "KR"
+    slot: str = "am"  # am / pm
     dry_run: bool = False
     debug: bool = False
 
 
 @dataclass
 class AppConfig:
-    naver: NaverConfig
+    google: GoogleTrendsConfig
+    naver: NaverShopConfig
     wp: WordPressConfig
+    store: StorageConfig
     run: RunConfig
-    sqlite_path: str
 
 
-def load_cfg() -> AppConfig:
-    # Naver keys: 네가 쓰는 이름(XNAVER...) 우선 + 일반 이름도 fallback
+def load_cfg_from_env() -> AppConfig:
+    # ✅ 너가 바꿔쓴 이름 우선
     naver_id = _env("XNAVERCLIENT_ID") or _env("NAVER_CLIENT_ID")
     naver_secret = _env("XNAVERCLIENT_SECRET") or _env("NAVER_CLIENT_SECRET")
-    naver_sort = _env("NAVER_SORT", "sim") or "sim"
 
     wp_base = (_env("WP_BASE_URL") or _env("WP_SITE_URL")).rstrip("/")
     wp_user = _env("WP_USER") or _env("WP_USERNAME")
     wp_pass = _env("WP_APP_PASS") or _env("WP_APP_PASSWORD")
+
+    # run
+    slot = (_env("RUN_SLOT", "am") or "am").lower()
+    dry_run = _env("DRY_RUN", "0").lower() in ("1", "true", "yes")
+    debug = _env("DEBUG", "0").lower() in ("1", "true", "yes")
+
+    # google
+    geo = (_env("TRENDS_GEO", "KR") or "KR").upper()
+    hot_limit = int(_env("HOT_KEYWORDS_LIMIT", "20") or "20")
+    g_timeout = int(_env("GOOGLE_TIMEOUT", "25") or "25")
+
+    # naver
+    p_per_kw = int(_env("NAVER_PER_KEYWORD", "5") or "5")
+    sort = _env("NAVER_SORT", "sim") or "sim"
+    exclude = _env("NAVER_EXCLUDE", "used:rental:cbshop")
+    n_timeout = int(_env("NAVER_TIMEOUT", "25") or "25")
+    throttle = float(_env("NAVER_THROTTLE_SEC", "0.25") or "0.25")
+
+    # wp
     wp_status = _env("WP_STATUS", "publish") or "publish"
+    cat_ids_raw = _env("WP_CATEGORY_IDS", "31") or "31"
+    cat_ids = []
+    for x in re.split(r"[,\s]+", cat_ids_raw.strip()):
+        if x.strip().isdigit():
+            cat_ids.append(int(x.strip()))
+    if not cat_ids:
+        cat_ids = [31]
 
-    wp_cats = _parse_int_list(_env("WP_CATEGORY_IDS", "31"))
-    wp_tags = _parse_int_list(_env("WP_TAG_IDS", ""))
-
-    run_slot = (_env("RUN_SLOT", "am") or "am").lower()
-    if run_slot not in ("am", "pm"):
-        run_slot = "am"
-
-    hot_limit = _env_int("HOT_KEYWORDS_LIMIT", 20)
-    prod_per = _env_int("PRODUCTS_PER_KEYWORD", 5)
-    geo = (_env("GOOGLE_TRENDS_GEO", "KR") or "KR").upper()
-
-    sqlite_path = _env("SQLITE_PATH", "data/hot_keyword_shop.sqlite3")
-
-    dry_run = _env_bool("DRY_RUN", False)
-    debug = _env_bool("DEBUG", False)
+    # storage
+    sqlite_path = _env("SQLITE_PATH", "data/hot_keyword_naver_shop.sqlite3")
 
     return AppConfig(
-        naver=NaverConfig(client_id=naver_id, client_secret=naver_secret, sort=naver_sort),
+        google=GoogleTrendsConfig(geo=geo, limit=hot_limit, request_timeout=g_timeout),
+        naver=NaverShopConfig(
+            client_id=naver_id,
+            client_secret=naver_secret,
+            display=p_per_kw,
+            sort=sort,
+            exclude=exclude,
+            request_timeout=n_timeout,
+            throttle_sec=throttle,
+        ),
         wp=WordPressConfig(
             base_url=wp_base,
             user=wp_user,
             app_pass=wp_pass,
             status=wp_status,
-            category_ids=wp_cats,
-            tag_ids=wp_tags,
+            category_ids=cat_ids,
         ),
-        run=RunConfig(
-            run_slot=run_slot,
-            hot_keywords_limit=hot_limit,
-            products_per_keyword=prod_per,
-            trends_geo=geo,
-            dry_run=dry_run,
-            debug=debug,
-        ),
-        sqlite_path=sqlite_path,
+        store=StorageConfig(sqlite_path=sqlite_path),
+        run=RunConfig(slot=slot, dry_run=dry_run, debug=debug),
     )
 
 
@@ -202,53 +174,101 @@ def validate_cfg(cfg: AppConfig) -> None:
         missing.append("WP_USER")
     if not cfg.wp.app_pass:
         missing.append("WP_APP_PASS")
+    if cfg.run.slot not in ("am", "pm"):
+        missing.append("RUN_SLOT must be am or pm")
     if missing:
-        raise RuntimeError("필수 설정 누락:\n- " + "\n- ".join(missing))
+        raise RuntimeError("필수 설정 누락/오류:\n- " + "\n- ".join(missing))
 
 
 def print_safe_cfg(cfg: AppConfig) -> None:
     def ok(v: str) -> str:
         return f"OK(len={len(v)})" if v else "MISSING"
 
-    print("[CFG] XNAVERCLIENT_ID:", ok(cfg.naver.client_id))
-    print("[CFG] XNAVERCLIENT_SECRET:", ok(cfg.naver.client_secret))
-    print("[CFG] NAVER_SORT:", cfg.naver.sort)
-    print("[CFG] WP_BASE_URL:", cfg.wp.base_url or "MISSING")
-    print("[CFG] WP_USER:", ok(cfg.wp.user))
-    print("[CFG] WP_APP_PASS:", ok(cfg.wp.app_pass))
-    print("[CFG] WP_STATUS:", cfg.wp.status)
-    print("[CFG] WP_CATEGORY_IDS:", cfg.wp.category_ids)
-    print("[CFG] WP_TAG_IDS:", cfg.wp.tag_ids)
-    print("[CFG] RUN_SLOT:", cfg.run.run_slot, "| GEO:", cfg.run.trends_geo,
-          "| HOT_LIMIT:", cfg.run.hot_keywords_limit, "| PROD_PER:", cfg.run.products_per_keyword)
-    print("[CFG] SQLITE_PATH:", cfg.sqlite_path)
+    print("[CFG] RUN_SLOT:", cfg.run.slot)
+    print("[CFG] DRY_RUN:", cfg.run.dry_run, "DEBUG:", cfg.run.debug)
+    print("[CFG] GOOGLE geo/limit:", cfg.google.geo, cfg.google.limit)
+    print("[CFG] NAVER id/secret:", ok(cfg.naver.client_id), ok(cfg.naver.client_secret))
+    print("[CFG] NAVER per_keyword/sort:", cfg.naver.display, cfg.naver.sort)
+    print("[CFG] WP_BASE_URL:", cfg.wp.base_url)
+    print("[CFG] WP_USER/WP_APP_PASS:", ok(cfg.wp.user), ok(cfg.wp.app_pass))
+    print("[CFG] WP categories:", cfg.wp.category_ids)
+    print("[CFG] SQLITE:", cfg.store.sqlite_path)
 
 
 # -----------------------------
-# SQLite (slot post history)
+# SQLite
 # -----------------------------
-def init_db(path: str) -> None:
-    Path(path).parent.mkdir(parents=True, exist_ok=True)
-    con = sqlite3.connect(path)
+def init_db(db_path: str) -> None:
+    Path(db_path).parent.mkdir(parents=True, exist_ok=True)
+    con = sqlite3.connect(db_path)
+    cur = con.cursor()
+
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS posts (
+          date TEXT,
+          slot TEXT,
+          wp_post_id INTEGER,
+          wp_link TEXT,
+          created_at TEXT,
+          PRIMARY KEY (date, slot)
+        )
+        """
+    )
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS keywords (
+          date TEXT,
+          slot TEXT,
+          rank INTEGER,
+          keyword TEXT,
+          traffic_str TEXT,
+          traffic_int INTEGER,
+          link TEXT,
+          PRIMARY KEY (date, slot, rank)
+        )
+        """
+    )
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS products (
+          date TEXT,
+          slot TEXT,
+          keyword TEXT,
+          rank INTEGER,
+          title TEXT,
+          link TEXT,
+          image TEXT,
+          lprice INTEGER,
+          mall_name TEXT,
+          product_id TEXT,
+          PRIMARY KEY (date, slot, keyword, rank)
+        )
+        """
+    )
+
+    con.commit()
+    con.close()
+
+
+def save_post_meta(db_path: str, date_str: str, slot: str, wp_post_id: int, wp_link: str) -> None:
+    con = sqlite3.connect(db_path)
     cur = con.cursor()
     cur.execute(
         """
-        CREATE TABLE IF NOT EXISTS daily_posts (
-          date_slot TEXT PRIMARY KEY,
-          wp_post_id INTEGER,
-          wp_link TEXT,
-          created_at TEXT
-        )
-        """
+        INSERT OR REPLACE INTO posts(date, slot, wp_post_id, wp_link, created_at)
+        VALUES (?, ?, ?, ?, ?)
+        """,
+        (date_str, slot, wp_post_id, wp_link, datetime.utcnow().isoformat()),
     )
     con.commit()
     con.close()
 
 
-def get_existing_post(path: str, date_slot: str) -> Optional[Tuple[int, str]]:
-    con = sqlite3.connect(path)
+def get_existing_post(db_path: str, date_str: str, slot: str) -> Optional[Tuple[int, str]]:
+    con = sqlite3.connect(db_path)
     cur = con.cursor()
-    cur.execute("SELECT wp_post_id, wp_link FROM daily_posts WHERE date_slot=?", (date_slot,))
+    cur.execute("SELECT wp_post_id, wp_link FROM posts WHERE date=? AND slot=?", (date_str, slot))
     row = cur.fetchone()
     con.close()
     if not row:
@@ -256,18 +276,257 @@ def get_existing_post(path: str, date_slot: str) -> Optional[Tuple[int, str]]:
     return int(row[0]), str(row[1] or "")
 
 
-def save_post_meta(path: str, date_slot: str, post_id: int, link: str) -> None:
-    con = sqlite3.connect(path)
+def upsert_keywords(db_path: str, date_str: str, slot: str, items: List[Dict[str, Any]]) -> None:
+    con = sqlite3.connect(db_path)
     cur = con.cursor()
-    cur.execute(
-        """
-        INSERT OR REPLACE INTO daily_posts(date_slot, wp_post_id, wp_link, created_at)
-        VALUES (?, ?, ?, ?)
-        """,
-        (date_slot, post_id, link, datetime.utcnow().isoformat()),
-    )
+    for i, it in enumerate(items, start=1):
+        cur.execute(
+            """
+            INSERT OR REPLACE INTO keywords(date, slot, rank, keyword, traffic_str, traffic_int, link)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                date_str,
+                slot,
+                i,
+                str(it.get("keyword", "")),
+                str(it.get("traffic_str", "")),
+                int(it.get("traffic_int", 0) or 0),
+                str(it.get("link", "")),
+            ),
+        )
     con.commit()
     con.close()
+
+
+def upsert_products(db_path: str, date_str: str, slot: str, keyword: str, products: List[Dict[str, Any]]) -> None:
+    con = sqlite3.connect(db_path)
+    cur = con.cursor()
+    for i, p in enumerate(products, start=1):
+        cur.execute(
+            """
+            INSERT OR REPLACE INTO products(date, slot, keyword, rank, title, link, image, lprice, mall_name, product_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                date_str,
+                slot,
+                keyword,
+                i,
+                str(p.get("title", "")),
+                str(p.get("link", "")),
+                str(p.get("image", "")),
+                int(p.get("lprice", 0) or 0),
+                str(p.get("mallName", "")),
+                str(p.get("productId", "")),
+            ),
+        )
+    con.commit()
+    con.close()
+
+
+def get_prev_traffic(db_path: str, prev_date: str, keyword: str) -> Optional[int]:
+    con = sqlite3.connect(db_path)
+    cur = con.cursor()
+    # 전날(AM/PM 상관 없이)에서 같은 키워드 traffic_int 하나라도 있으면 가져옴
+    cur.execute(
+        """
+        SELECT traffic_int
+        FROM keywords
+        WHERE date=? AND keyword=?
+        ORDER BY traffic_int DESC
+        LIMIT 1
+        """,
+        (prev_date, keyword),
+    )
+    row = cur.fetchone()
+    con.close()
+    if not row:
+        return None
+    return int(row[0] or 0)
+
+
+# -----------------------------
+# Google Trends (RSS + fallback)
+# -----------------------------
+def _parse_traffic_to_int(s: str) -> int:
+    if not s:
+        return 0
+    t = s.strip().upper().replace("+", "").replace(",", "")
+    m = re.match(r"^(\d+(?:\.\d+)?)([KM])?$", t)
+    if not m:
+        t = re.sub(r"\D", "", t)
+        return int(t or 0)
+    num = float(m.group(1))
+    unit = m.group(2)
+    if unit == "K":
+        num *= 1_000
+    elif unit == "M":
+        num *= 1_000_000
+    return int(num)
+
+
+def _parse_google_trends_rss(xml_text: str) -> List[Dict[str, Any]]:
+    root = ET.fromstring(xml_text)
+    channel = root.find("channel")
+    if channel is None:
+        return []
+
+    out: List[Dict[str, Any]] = []
+    for item in channel.findall("item"):
+        title = (item.findtext("title") or "").strip()
+        link = (item.findtext("link") or "").strip()
+
+        approx_traffic = ""
+        for child in list(item):
+            if child.tag.endswith("approx_traffic"):
+                approx_traffic = (child.text or "").strip()
+                break
+
+        keyword = title.split(" - ", 1)[0].strip() if title else ""
+        if keyword:
+            out.append(
+                {
+                    "keyword": keyword,
+                    "traffic_str": approx_traffic,
+                    "traffic_int": _parse_traffic_to_int(approx_traffic),
+                    "link": link,
+                }
+            )
+    return out
+
+
+def _fetch_google_rss_candidates(geo: str) -> List[str]:
+    geo = (geo or "KR").upper().strip()
+    return [
+        # ✅ 많이 쓰이는 RSS
+        f"https://trends.google.com/trending/rss?geo={geo}",
+        # ✅ 일별 트렌드 RSS
+        f"https://trends.google.com/trends/trendingsearches/daily/rss?geo={geo}",
+        # (레거시; 일부 환경에서 404/변동 가능)
+        f"https://trends.google.co.kr/trending/rss?geo={geo}",
+        f"https://trends.google.co.kr/trends/trendingsearches/daily/rss?geo={geo}",
+    ]
+
+
+def _fetch_google_dailytrends_json(geo: str, timeout: int) -> List[Dict[str, Any]]:
+    # hidden endpoint (프론트에서 쓰는 형태로 널리 알려짐)
+    # 예시: /trends/api/dailytrends?hl=en-US&tz=300&geo=US&ns=15 :contentReference[oaicite:3]{index=3}
+    geo = (geo or "KR").upper().strip()
+    url = f"https://trends.google.com/trends/api/dailytrends?hl=ko&tz=-540&geo={geo}&ns=15"
+    r = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=timeout)
+    if r.status_code != 200:
+        return []
+    text = r.text.strip()
+    # 응답 앞에 )]}', 같은 프리픽스가 붙는 경우 제거
+    text = re.sub(r"^\)\]\}',?\s*", "", text)
+    try:
+        data = json.loads(text)
+    except Exception:
+        return []
+
+    days = (((data or {}).get("default") or {}).get("trendingSearchesDays") or [])
+    if not days:
+        return []
+    # 가장 최신 day
+    day0 = days[0] or {}
+    searches = day0.get("trendingSearches") or []
+    out: List[Dict[str, Any]] = []
+    for s in searches:
+        q = (((s.get("title") or {}).get("query")) or "").strip()
+        traffic_str = (s.get("formattedTraffic") or "").strip()
+        traffic_int = _parse_traffic_to_int(traffic_str)
+        # 대표 기사 링크 하나
+        link = ""
+        arts = s.get("articles") or []
+        if arts and isinstance(arts, list):
+            link = str((arts[0] or {}).get("url") or "").strip()
+        if q:
+            out.append({"keyword": q, "traffic_str": traffic_str, "traffic_int": traffic_int, "link": link})
+    return out
+
+
+def fetch_google_hot_keywords(cfg: GoogleTrendsConfig, debug: bool) -> List[Dict[str, Any]]:
+    headers = {
+        "User-Agent": "Mozilla/5.0 (compatible; hot-keyword-bot/1.0)",
+        "Accept": "application/rss+xml, application/xml;q=0.9, */*;q=0.8",
+    }
+
+    # 1) RSS 우선
+    for url in _fetch_google_rss_candidates(cfg.geo):
+        try:
+            r = requests.get(url, headers=headers, timeout=cfg.request_timeout, allow_redirects=True)
+            if debug:
+                print("[DEBUG] Google RSS try:", url, "status=", r.status_code)
+            if r.status_code != 200:
+                continue
+            txt = (r.text or "").strip()
+            if "<rss" not in txt.lower():
+                continue
+            items = _parse_google_trends_rss(txt)
+            # 중복 제거 + limit
+            seen = set()
+            uniq = []
+            for it in items:
+                k = it["keyword"]
+                if k in seen:
+                    continue
+                seen.add(k)
+                uniq.append(it)
+                if len(uniq) >= cfg.limit:
+                    break
+            if uniq:
+                return uniq
+        except Exception as e:
+            if debug:
+                print("[DEBUG] Google RSS error:", repr(e))
+            continue
+
+    # 2) 최후 폴백: dailytrends JSON
+    items = _fetch_google_dailytrends_json(cfg.geo, cfg.request_timeout)
+    if items:
+        return items[: cfg.limit]
+
+    raise RuntimeError("Google Trends fetch failed (all RSS candidates + dailytrends JSON failed)")
+
+
+# -----------------------------
+# Naver Shop Search API (shop.json)
+# -----------------------------
+NAVER_SHOP_ENDPOINT = "https://openapi.naver.com/v1/search/shop.json"  # 공식 문서 :contentReference[oaicite:4]{index=4}
+
+
+def _clean_title(t: str) -> str:
+    t = htmlmod.unescape(t or "")
+    t = re.sub(r"</?b>", "", t)
+    t = re.sub(r"\s+", " ", t).strip()
+    return t
+
+
+def naver_shop_search(session: requests.Session, cfg: NaverShopConfig, query: str) -> List[Dict[str, Any]]:
+    headers = {
+        "X-Naver-Client-Id": cfg.client_id,
+        "X-Naver-Client-Secret": cfg.client_secret,
+        "User-Agent": "Mozilla/5.0 (compatible; hot-keyword-bot/1.0)",
+    }
+    params: Dict[str, Any] = {
+        "query": query,
+        "display": cfg.display,
+        "start": 1,
+        "sort": cfg.sort,
+        "exclude": cfg.exclude,
+    }
+
+    r = session.get(NAVER_SHOP_ENDPOINT, headers=headers, params=params, timeout=cfg.request_timeout)
+    if r.status_code != 200:
+        raise RuntimeError(f"Naver Shop API failed: {r.status_code} body={r.text[:300]}")
+    data = r.json()
+    items = data.get("items", [])
+    if not isinstance(items, list):
+        return []
+    for it in items:
+        it["title"] = _clean_title(str(it.get("title", "")))
+    return items
 
 
 # -----------------------------
@@ -275,161 +534,139 @@ def save_post_meta(path: str, date_slot: str, post_id: int, link: str) -> None:
 # -----------------------------
 def wp_auth_header(user: str, app_pass: str) -> Dict[str, str]:
     token = base64.b64encode(f"{user}:{app_pass}".encode("utf-8")).decode("utf-8")
-    return {"Authorization": f"Basic {token}", "User-Agent": "hot-keyword-shop-bot/1.0"}
+    return {"Authorization": f"Basic {token}", "User-Agent": "hot-keyword-bot/1.0"}
 
 
-def wp_create_post(cfg: WordPressConfig, title: str, slug: str, html: str) -> Tuple[int, str]:
-    url = cfg.base_url.rstrip("/") + "/wp-json/wp/v2/posts"
+def wp_create_post(cfg: WordPressConfig, title: str, html: str) -> Tuple[int, str]:
+    endpoint = cfg.base_url.rstrip("/") + "/wp-json/wp/v2/posts"
     headers = {**wp_auth_header(cfg.user, cfg.app_pass), "Content-Type": "application/json"}
-
-    payload: Dict[str, Any] = {"title": title, "slug": slug, "content": html, "status": cfg.status}
-    if cfg.category_ids:
-        payload["categories"] = cfg.category_ids
-    if cfg.tag_ids:
-        payload["tags"] = cfg.tag_ids
-
-    r = requests.post(url, headers=headers, json=payload, timeout=25)
+    payload: Dict[str, Any] = {
+        "title": title,
+        "content": html,
+        "status": cfg.status,
+        "categories": cfg.category_ids,
+    }
+    r = requests.post(endpoint, headers=headers, json=payload, timeout=30)
     if r.status_code not in (200, 201):
-        raise RuntimeError(f"WP create failed: {r.status_code} body={r.text[:500]}")
+        raise RuntimeError(f"WP create failed: {r.status_code} body={r.text[:300]}")
     data = r.json()
     return int(data["id"]), str(data.get("link") or "")
 
 
 def wp_update_post(cfg: WordPressConfig, post_id: int, title: str, html: str) -> Tuple[int, str]:
-    url = cfg.base_url.rstrip("/") + f"/wp-json/wp/v2/posts/{post_id}"
+    endpoint = cfg.base_url.rstrip("/") + f"/wp-json/wp/v2/posts/{post_id}"
     headers = {**wp_auth_header(cfg.user, cfg.app_pass), "Content-Type": "application/json"}
-
-    payload: Dict[str, Any] = {"title": title, "content": html, "status": cfg.status}
-    if cfg.category_ids:
-        payload["categories"] = cfg.category_ids
-    if cfg.tag_ids:
-        payload["tags"] = cfg.tag_ids
-
-    r = requests.post(url, headers=headers, json=payload, timeout=25)
+    payload: Dict[str, Any] = {
+        "title": title,
+        "content": html,
+        "status": cfg.status,
+        "categories": cfg.category_ids,
+    }
+    r = requests.post(endpoint, headers=headers, json=payload, timeout=30)
     if r.status_code not in (200, 201):
-        raise RuntimeError(f"WP update failed: {r.status_code} body={r.text[:500]}")
+        raise RuntimeError(f"WP update failed: {r.status_code} body={r.text[:300]}")
     data = r.json()
     return int(data["id"]), str(data.get("link") or "")
 
 
 # -----------------------------
-# Google Trends Daily RSS
-# -----------------------------
-def fetch_google_trends_daily(geo: str, limit: int, debug: bool = False) -> List[Dict[str, Any]]:
-    # 널리 쓰이는 일별 RSS 엔드포인트 (KR 가능) :contentReference[oaicite:2]{index=2}
-    url = f"https://trends.google.co.kr/trends/trendingsearches/daily/rss?geo={quote(geo)}"
-    headers = {"User-Agent": "Mozilla/5.0 (compatible; hot-keyword-shop-bot/1.0)"}
-
-    r = requests.get(url, headers=headers, timeout=25)
-    if r.status_code != 200:
-        raise RuntimeError(f"Google Trends RSS failed: {r.status_code} body={r.text[:300]}")
-
-    try:
-        root = ET.fromstring(r.text)
-    except Exception as e:
-        raise RuntimeError(f"Google Trends RSS parse error: {e}")
-
-    out: List[Dict[str, Any]] = []
-    for item in root.findall(".//item"):
-        title = (item.findtext("title") or "").strip()
-        if not title:
-            continue
-
-        # ht:approx_traffic 같은 namespaced tag를 와일드카드로 찾기
-        approx = ""
-        for ch in list(item):
-            tag = ch.tag.lower()
-            if tag.endswith("approx_traffic"):
-                approx = (ch.text or "").strip()
-                break
-
-        pub = (item.findtext("pubDate") or "").strip()
-        dt = None
-        if pub:
-            try:
-                dt = parsedate_to_datetime(pub).astimezone(KST)
-            except Exception:
-                dt = None
-        if dt is None:
-            dt = datetime.now(tz=KST)
-
-        out.append({"keyword": title, "approx_traffic": approx, "published_at": dt.isoformat()})
-
-        if len(out) >= limit:
-            break
-
-    if debug:
-        print(f"[DEBUG] Google Trends keywords={len(out)} from {url}")
-
-    return out
-
-
-# -----------------------------
-# Naver Shopping Search
-# -----------------------------
-def naver_shop_search(
-    session: requests.Session,
-    ncfg: NaverConfig,
-    query: str,
-    display: int,
-    sort: str,
-    retry: int = 3,
-) -> List[Dict[str, Any]]:
-    headers = {
-        "X-Naver-Client-Id": ncfg.client_id,
-        "X-Naver-Client-Secret": ncfg.client_secret,
-        "User-Agent": "Mozilla/5.0 (compatible; hot-keyword-shop-bot/1.0)",
-    }
-    params: Dict[str, Any] = {"query": query, "display": display, "start": 1, "sort": sort}
-
-    last_err = None
-    for attempt in range(1, retry + 1):
-        try:
-            r = session.get(NAVER_SHOP_ENDPOINT, headers=headers, params=params, timeout=25)
-            if r.status_code == 200:
-                data = r.json()
-                items = data.get("items", [])
-                return items if isinstance(items, list) else []
-            # 429/5xx는 재시도
-            if r.status_code in (429, 500, 502, 503, 504):
-                last_err = f"{r.status_code} {r.text[:200]}"
-                time.sleep(1.2 * attempt)
-                continue
-            raise RuntimeError(f"Naver API failed: {r.status_code} body={r.text[:300]}")
-        except Exception as e:
-            last_err = repr(e)
-            time.sleep(1.0 * attempt)
-
-    raise RuntimeError(f"Naver API retry exhausted: {last_err}")
-
-
-# -----------------------------
 # Rendering
 # -----------------------------
-DISCLOSURE = "※ 이 포스팅은 제휴마케팅 활동의 일환으로, 이에 따른 일정액의 수수료를 제공받을 수 있습니다."
-NOTE = "핫 키워드(구글 트렌드) 기준으로 네이버 쇼핑 검색 결과 상위 상품을 자동 추천합니다."
+def fmt_krw(n: int) -> str:
+    try:
+        return f"{int(n):,}원"
+    except Exception:
+        return str(n)
 
 
-def build_product_table(items: List[Dict[str, Any]]) -> str:
+def pct_change(today: int, prev: Optional[int]) -> str:
+    if prev is None or prev <= 0 or today <= 0:
+        return "-"
+    ch = (today - prev) / prev * 100.0
+    sign = "+" if ch >= 0 else ""
+    return f"{sign}{ch:.1f}%"
+
+
+def bar_width(value: int, max_value: int) -> int:
+    if max_value <= 0 or value <= 0:
+        return 0
+    w = int(round((value / max_value) * 100))
+    return max(1, min(100, w))
+
+
+def build_keyword_overview_table(items: List[Dict[str, Any]]) -> str:
+    if not items:
+        return "<p>(키워드 없음)</p>"
+    maxv = max(int(x.get("traffic_int", 0) or 0) for x in items) or 0
+
     rows = []
     for i, it in enumerate(items, start=1):
-        name = clean_title(str(it.get("title", "")))
+        kw = htmlmod.escape(str(it.get("keyword", "")))
+        link = str(it.get("link", ""))
+        traffic = htmlmod.escape(str(it.get("traffic_str", "") or "-"))
+        ch = htmlmod.escape(str(it.get("change", "-")))
+        v = int(it.get("traffic_int", 0) or 0)
+        w = bar_width(v, maxv)
+
+        kw_html = f'<a href="{htmlmod.escape(link)}" target="_blank" rel="noopener noreferrer">{kw}</a>' if link else kw
+        bar = f'<div style="height:10px;background:#eee;border-radius:999px;overflow:hidden;"><div style="height:10px;width:{w}%;background:#111;"></div></div>'
+
+        rows.append(
+            f"""
+            <tr>
+              <td style="padding:8px;border:1px solid #e5e5e5;text-align:center;">{i}</td>
+              <td style="padding:8px;border:1px solid #e5e5e5;">{kw_html}</td>
+              <td style="padding:8px;border:1px solid #e5e5e5;text-align:right;white-space:nowrap;">{traffic}</td>
+              <td style="padding:8px;border:1px solid #e5e5e5;text-align:right;white-space:nowrap;">{ch}</td>
+              <td style="padding:8px;border:1px solid #e5e5e5;">{bar}</td>
+            </tr>
+            """
+        )
+
+    return f"""
+    <h2>오늘의 핫 키워드 TOP {len(items)}</h2>
+    <table style="border-collapse:collapse;width:100%;font-size:14px;">
+      <thead>
+        <tr>
+          <th style="padding:8px;border:1px solid #e5e5e5;">순위</th>
+          <th style="padding:8px;border:1px solid #e5e5e5;">키워드</th>
+          <th style="padding:8px;border:1px solid #e5e5e5;">대략 트래픽</th>
+          <th style="padding:8px;border:1px solid #e5e5e5;">전일 대비(대략)</th>
+          <th style="padding:8px;border:1px solid #e5e5e5;">그래프</th>
+        </tr>
+      </thead>
+      <tbody>
+        {''.join(rows)}
+      </tbody>
+    </table>
+    """
+
+
+def build_products_table(keyword: str, items: List[Dict[str, Any]]) -> str:
+    rows = []
+    for i, it in enumerate(items, start=1):
+        name = htmlmod.escape(str(it.get("title", "")))
         link = str(it.get("link", ""))
         img = str(it.get("image", ""))
         lprice = int(it.get("lprice", 0) or 0)
         mall = htmlmod.escape(str(it.get("mallName", "")))
 
-        img_html = f'<img src="{img}" alt="{htmlmod.escape(name)}" style="width:64px;height:auto;border-radius:10px;">' if img else ""
+        img_html = (
+            f'<img src="{htmlmod.escape(img)}" alt="{name}" style="width:72px;height:auto;border-radius:10px;">'
+            if img
+            else ""
+        )
         name_html = (
-            f'<a href="{htmlmod.escape(link)}" target="_blank" rel="nofollow sponsored noopener">{htmlmod.escape(name)}</a>'
-            if link else htmlmod.escape(name)
+            f'<a href="{htmlmod.escape(link)}" target="_blank" rel="nofollow sponsored noopener">{name}</a>'
+            if link
+            else name
         )
 
         rows.append(
             f"""
             <tr>
               <td style="padding:8px;border:1px solid #e5e5e5;text-align:center;">{i}</td>
-              <td style="padding:8px;border:1px solid #e5e5e5;text-align:center;">{img_html}</td>
+              <td style="padding:8px;border:1px solid #e5e5e5;">{img_html}</td>
               <td style="padding:8px;border:1px solid #e5e5e5;">
                 {name_html}
                 <div style="font-size:12px;opacity:.75;margin-top:4px;">{mall}</div>
@@ -440,116 +677,52 @@ def build_product_table(items: List[Dict[str, Any]]) -> str:
         )
 
     return f"""
-    <table style="border-collapse:collapse;width:100%;font-size:14px;margin-top:8px;">
+    <h3 style="margin-top:18px;">{htmlmod.escape(keyword)} → 네이버 쇼핑 추천 TOP {len(items)}</h3>
+    <table style="border-collapse:collapse;width:100%;font-size:14px;">
       <thead>
         <tr>
-          <th style="padding:8px;border:1px solid #e5e5e5;">#</th>
+          <th style="padding:8px;border:1px solid #e5e5e5;">순위</th>
           <th style="padding:8px;border:1px solid #e5e5e5;">이미지</th>
           <th style="padding:8px;border:1px solid #e5e5e5;">상품</th>
           <th style="padding:8px;border:1px solid #e5e5e5;">최저가</th>
         </tr>
       </thead>
       <tbody>
-        {''.join(rows) if rows else '<tr><td colspan="4" style="padding:10px;border:1px solid #e5e5e5;">검색 결과 없음</td></tr>'}
+        {''.join(rows) if rows else '<tr><td colspan="4" style="padding:10px;border:1px solid #e5e5e5;">결과 없음</td></tr>'}
       </tbody>
     </table>
     """
 
 
-def build_post_html(now: datetime, slot_label: str, keywords: List[Dict[str, Any]], products_map: Dict[str, List[Dict[str, Any]]]) -> str:
-    disclosure = f'<p style="padding:10px;border-left:4px solid #111;background:#f7f7f7;">{htmlmod.escape(DISCLOSURE)}</p>'
-    head = f"<p>기준시각: <b>{htmlmod.escape(now.strftime('%Y-%m-%d %H:%M'))}</b> / 슬롯: <b>{htmlmod.escape(slot_label)}</b></p>"
-    note = f'<p style="font-size:13px;opacity:.8;">{htmlmod.escape(NOTE)}</p>'
-
-    sections = []
-    for idx, k in enumerate(keywords, start=1):
-        kw = k["keyword"]
-        traffic = k.get("approx_traffic", "")
-        badge = f'<span style="display:inline-block;padding:2px 8px;border-radius:999px;background:#f1f1f1;font-size:12px;opacity:.85;margin-left:8px;">{htmlmod.escape(traffic)}</span>' if traffic else ""
-        naver_search_link = f"https://search.shopping.naver.com/search/all?query={quote(kw)}"
-        table = build_product_table(products_map.get(kw, []))
-
-        sections.append(
-            f"""
-            <details {'open' if idx <= 3 else ''} style="margin:14px 0;">
-              <summary style="cursor:pointer;font-size:16px;">
-                <b>{idx}. {htmlmod.escape(kw)}</b>{badge}
-                <span style="font-size:12px;opacity:.7;margin-left:10px;">
-                  <a href="{htmlmod.escape(naver_search_link)}" target="_blank" rel="nofollow noopener">네이버쇼핑 검색</a>
-                </span>
-              </summary>
-              {table}
-            </details>
-            """
-        )
-
-    return disclosure + head + note + "".join(sections)
-
-
-# -----------------------------
-# Main
-# -----------------------------
-def run(cfg: AppConfig) -> None:
-    now = datetime.now(tz=KST)
-    date_str = now.strftime("%Y-%m-%d")
-    slot = cfg.run.run_slot
+def build_post_html(date_str: str, slot: str, geo: str, items: List[Dict[str, Any]], kw_to_products: Dict[str, List[Dict[str, Any]]]) -> str:
     slot_label = "오전" if slot == "am" else "오후"
-    date_slot = f"{date_str}_{slot}"
+    disclosure = (
+        '<p style="padding:10px;border-left:4px solid #111;background:#f7f7f7;">'
+        "※ 이 포스팅은 제휴마케팅 활동의 일환으로, 이에 따른 일정액의 수수료를 제공받을 수 있습니다."
+        "</p>"
+    )
+    head = f"<p>기준일: <b>{htmlmod.escape(date_str)}</b> / 슬롯: <b>{slot_label}</b> / 지역: <b>{htmlmod.escape(geo)}</b></p>"
+    note = '<p style="font-size:13px;opacity:.8;">키워드 출처: Google Trends (RSS/일별 트렌드 폴백). 상품 출처: 네이버 쇼핑 검색 API.</p>'
 
-    init_db(cfg.sqlite_path)
+    overview = build_keyword_overview_table(items)
 
-    # 1) hot keywords
-    keywords = fetch_google_trends_daily(cfg.run.trends_geo, cfg.run.hot_keywords_limit, cfg.run.debug)
-    if not keywords:
-        raise RuntimeError("핫 키워드가 0개입니다(구글 트렌드 RSS 파싱 실패 가능).")
+    parts = [disclosure, head, note, overview, "<hr/>", "<h2>키워드별 추천 상품</h2>"]
+    for it in items:
+        kw = str(it.get("keyword", ""))
+        prods = kw_to_products.get(kw, [])
+        parts.append(build_products_table(kw, prods))
 
-    # 2) map keyword -> products
-    products_map: Dict[str, List[Dict[str, Any]]] = {}
-    with requests.Session() as session:
-        for k in keywords:
-            kw = k["keyword"]
-            items = naver_shop_search(
-                session=session,
-                ncfg=cfg.naver,
-                query=kw,
-                display=cfg.run.products_per_keyword,
-                sort=cfg.naver.sort,
-                retry=3,
-            )
-            products_map[kw] = items
-            # 과도한 호출 방지(가벼운 딜레이)
-            time.sleep(0.15)
-
-    title = f"{date_str} 핫키워드 쇼핑 추천 TOP{len(keywords)} ({slot_label})"
-    slug = f"hotkeyword-shop-{date_str}-{slot}"
-    html = build_post_html(now, slot_label, keywords, products_map)
-
-    if cfg.run.dry_run:
-        print("[DRY_RUN] 발행 생략. HTML 미리보기 ↓\n")
-        print(html)
-        return
-
-    existing = get_existing_post(cfg.sqlite_path, date_slot)
-    if existing:
-        post_id, old_link = existing
-        wp_post_id, wp_link = wp_update_post(cfg.wp, post_id, title, html)
-        save_post_meta(cfg.sqlite_path, date_slot, wp_post_id, wp_link)
-        print("OK(updated):", wp_post_id, wp_link or old_link)
-    else:
-        wp_post_id, wp_link = wp_create_post(cfg.wp, title, slug, html)
-        save_post_meta(cfg.sqlite_path, date_slot, wp_post_id, wp_link)
-        print("OK(created):", wp_post_id, wp_link)
+    return "".join(parts)
 
 
+# -----------------------------
+# Main run
+# -----------------------------
 def parse_args(argv: List[str]) -> Dict[str, Any]:
-    out = {"slot": None, "dry_run": False, "debug": False}
+    out = {"dry_run": False, "debug": False, "slot": None}
     i = 0
     while i < len(argv):
         a = argv[i]
-        if a == "--slot" and i + 1 < len(argv):
-            out["slot"] = (argv[i + 1] or "").lower()
-            i += 2
-            continue
         if a == "--dry-run":
             out["dry_run"] = True
             i += 1
@@ -558,20 +731,80 @@ def parse_args(argv: List[str]) -> Dict[str, Any]:
             out["debug"] = True
             i += 1
             continue
+        if a in ("--slot", "-s") and i + 1 < len(argv):
+            out["slot"] = (argv[i + 1] or "").lower().strip()
+            i += 2
+            continue
         i += 1
     return out
 
 
+def run(cfg: AppConfig) -> None:
+    # 날짜는 KST 기준
+    now_kst = datetime.now(KST)
+    date_str = now_kst.strftime("%Y-%m-%d")
+    slot = cfg.run.slot
+
+    init_db(cfg.store.sqlite_path)
+
+    # 1) Google hot keywords
+    hot = fetch_google_hot_keywords(cfg.google, cfg.run.debug)
+    hot = hot[: cfg.google.limit]
+
+    # 2) 전일 대비(대략) 계산(traffic_int 기반)
+    prev_date = (now_kst - timedelta(days=1)).strftime("%Y-%m-%d")
+    for it in hot:
+        prev = get_prev_traffic(cfg.store.sqlite_path, prev_date, str(it.get("keyword", "")))
+        it["change"] = pct_change(int(it.get("traffic_int", 0) or 0), prev)
+
+    upsert_keywords(cfg.store.sqlite_path, date_str, slot, hot)
+
+    # 3) 각 키워드 -> 네이버 쇼핑 TOP 상품
+    kw_to_products: Dict[str, List[Dict[str, Any]]] = {}
+    with requests.Session() as s:
+        for idx, it in enumerate(hot, start=1):
+            kw = str(it.get("keyword", "")).strip()
+            if not kw:
+                continue
+            if cfg.run.debug:
+                print(f"[DEBUG] ({idx}/{len(hot)}) Naver search:", kw)
+            items = naver_shop_search(s, cfg.naver, kw)
+            kw_to_products[kw] = items
+            upsert_products(cfg.store.sqlite_path, date_str, slot, kw, items)
+            time.sleep(cfg.naver.throttle_sec)
+
+    # 4) 글 생성/업데이트
+    slot_label = "오전" if slot == "am" else "오후"
+    title = f"{date_str} {slot_label} 핫 키워드 → 네이버 쇼핑 추천 TOP상품"
+    html = build_post_html(date_str, slot, cfg.google.geo, hot, kw_to_products)
+
+    if cfg.run.dry_run:
+        print("[DRY_RUN] Posting skipped.\n")
+        print(html[:2000] + ("\n...(truncated)" if len(html) > 2000 else ""))
+        return
+
+    existing = get_existing_post(cfg.store.sqlite_path, date_str, slot)
+    if existing:
+        post_id, old_link = existing
+        wp_post_id, wp_link = wp_update_post(cfg.wp, post_id, title, html)
+        save_post_meta(cfg.store.sqlite_path, date_str, slot, wp_post_id, wp_link or old_link)
+        print(f"OK(updated): {wp_post_id} {wp_link or old_link}")
+    else:
+        wp_post_id, wp_link = wp_create_post(cfg.wp, title, html)
+        save_post_meta(cfg.store.sqlite_path, date_str, slot, wp_post_id, wp_link)
+        print(f"OK(created): {wp_post_id} {wp_link}")
+
+
 def main():
     args = parse_args(sys.argv[1:])
-    cfg = load_cfg()
+    cfg = load_cfg_from_env()
 
-    if args["slot"] in ("am", "pm"):
-        cfg.run.run_slot = args["slot"]
     if args["dry_run"]:
         cfg.run.dry_run = True
     if args["debug"]:
         cfg.run.debug = True
+    if args["slot"] in ("am", "pm"):
+        cfg.run.slot = args["slot"]
 
     validate_cfg(cfg)
     print_safe_cfg(cfg)
@@ -583,5 +816,6 @@ if __name__ == "__main__":
         main()
     except Exception:
         import traceback
+
         traceback.print_exc()
         raise
