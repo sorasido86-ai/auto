@@ -1,26 +1,27 @@
 # -*- coding: utf-8 -*-
 """
 daily_issue_keywords_to_wp.py (완전 통합/안정화)
-- Google Trends(geo=KR) 트렌딩 검색어 수집
+- Google Trends(geo=KR) 트렌딩 검색어 수집 + 전날 대비(순위/트래픽) 표 출력
 - Google News RSS(검색/토픽) + 커뮤니티 RSS 수집 (총 FEEDS_MAX까지)
-- 최근 WINDOW_HOURS 시간 기준 "데일리 이슈 키워드 TOP N" 집계
+- 최근 WINDOW_HOURS 시간 기준 "데일리 이슈 키워드 TOP N" 집계 (기본 50)
+- 대표링크(각 키워드) 최대 5개 표시
 - WordPress REST API로 오전/오후(am/pm) 글을 별도로 생성/업데이트 (slug 분리)
-- GitHub Actions Secrets(환경변수)만으로 실행
+- 어제 대비를 위해 SQLite에 트렌딩 데이터 저장 (GitHub Actions 캐시와 함께 사용 권장)
 
 필수 Secrets
   - WP_BASE_URL
   - WP_USER
   - WP_APP_PASS
 
-카테고리(요청: 4번)
-  - WP_CATEGORY_IDS="4"
-
 권장 env
+  - WP_CATEGORY_IDS=4
+  - LIMIT=50
+  - EXAMPLE_LINKS=5
+  - TREND_LIMIT=20
+  - WINDOW_HOURS=12
   - FEEDS_MAX=100
   - FEED_TIMEOUT=8
   - MAX_WORKERS=20
-  - WINDOW_HOURS=12
-  - LIMIT=20
   - RUN_SLOT=am|pm
   - DEBUG=1
 """
@@ -32,6 +33,7 @@ import html as htmlmod
 import os
 import re
 import sys
+import sqlite3
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Set, Tuple
@@ -112,7 +114,9 @@ class WordPressConfig:
 
 @dataclass
 class RunConfig:
-    limit: int = 20
+    limit: int = 50
+    example_links: int = 5
+    trend_limit: int = 20
     window_hours: int = 12
     google_geo: str = "KR"
     feeds_max: int = 100
@@ -121,6 +125,7 @@ class RunConfig:
     dry_run: bool = False
     debug: bool = False
     slot: str = "am"  # am|pm
+    sqlite_path: str = "data/issue_trends.sqlite3"
 
 
 @dataclass
@@ -140,7 +145,9 @@ def load_cfg() -> AppConfig:
     )
 
     run = RunConfig(
-        limit=_env_int("LIMIT", 20),
+        limit=_env_int("LIMIT", 50),
+        example_links=_env_int("EXAMPLE_LINKS", 5),
+        trend_limit=_env_int("TREND_LIMIT", 20),
         window_hours=_env_int("WINDOW_HOURS", 12),
         google_geo=_env("GOOGLE_GEO", "KR") or "KR",
         feeds_max=_env_int("FEEDS_MAX", 100),
@@ -149,9 +156,13 @@ def load_cfg() -> AppConfig:
         dry_run=_env_bool("DRY_RUN", False),
         debug=_env_bool("DEBUG", False),
         slot=(_env("RUN_SLOT", "am") or "am").lower(),
+        sqlite_path=_env("SQLITE_PATH", "data/issue_trends.sqlite3") or "data/issue_trends.sqlite3",
     )
     if run.slot not in ("am", "pm"):
         run.slot = "am"
+    run.limit = max(1, min(run.limit, 200))
+    run.example_links = max(1, min(run.example_links, 10))
+    run.trend_limit = max(1, min(run.trend_limit, 50))
 
     base_block = {
         "net", "com", "co", "kr", "www", "m", "amp",
@@ -192,16 +203,125 @@ def print_safe(cfg: AppConfig) -> None:
     print("[CONFIG] WP_APP_PASS:", ok(cfg.wp.app_password))
     print("[CONFIG] WP_CATEGORY_IDS:", cfg.wp.category_ids)
     print("[CONFIG] STATUS:", cfg.wp.status)
-    print("[CONFIG] LIMIT:", cfg.run.limit, "WINDOW_HOURS:", cfg.run.window_hours, "SLOT:", cfg.run.slot)
+    print("[CONFIG] LIMIT:", cfg.run.limit, "EXAMPLE_LINKS:", cfg.run.example_links)
+    print("[CONFIG] TREND_LIMIT:", cfg.run.trend_limit)
+    print("[CONFIG] WINDOW_HOURS:", cfg.run.window_hours, "SLOT:", cfg.run.slot)
     print("[CONFIG] GEO:", cfg.run.google_geo, "FEEDS_MAX:", cfg.run.feeds_max)
     print("[CONFIG] TIMEOUT:", cfg.run.feed_timeout, "MAX_WORKERS:", cfg.run.max_workers)
+    print("[CONFIG] SQLITE:", cfg.run.sqlite_path)
     print("[CONFIG] DRY_RUN:", cfg.run.dry_run, "DEBUG:", cfg.run.debug)
     print("[CONFIG] BLOCKLIST size:", len(cfg.blocklist))
 
 
 # -----------------------------
+# SQLite (for day-over-day)
+# -----------------------------
+def init_db(path: str) -> None:
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    con = sqlite3.connect(path)
+    cur = con.cursor()
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS trends_daily (
+            date TEXT NOT NULL,
+            rank INTEGER NOT NULL,
+            keyword TEXT NOT NULL,
+            traffic_text TEXT,
+            traffic_num INTEGER,
+            link TEXT,
+            PRIMARY KEY(date, rank)
+        )
+        """
+    )
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_trends_daily_kw_date ON trends_daily(keyword, date)")
+    con.commit()
+    con.close()
+
+
+def upsert_trends(path: str, date_str: str, trends: List[Dict[str, Any]]) -> None:
+    con = sqlite3.connect(path)
+    cur = con.cursor()
+    cur.execute("DELETE FROM trends_daily WHERE date = ?", (date_str,))
+    for i, t in enumerate(trends, start=1):
+        cur.execute(
+            """
+            INSERT OR REPLACE INTO trends_daily(date, rank, keyword, traffic_text, traffic_num, link)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                date_str,
+                i,
+                str(t.get("keyword") or ""),
+                str(t.get("traffic") or ""),
+                int(t.get("traffic_num") or 0),
+                str(t.get("link") or ""),
+            ),
+        )
+    con.commit()
+    con.close()
+
+
+def load_trends_by_date(path: str, date_str: str) -> List[Dict[str, Any]]:
+    con = sqlite3.connect(path)
+    cur = con.cursor()
+    cur.execute(
+        "SELECT rank, keyword, traffic_text, traffic_num, link FROM trends_daily WHERE date=? ORDER BY rank ASC",
+        (date_str,),
+    )
+    rows = cur.fetchall()
+    con.close()
+    out = []
+    for r in rows:
+        out.append(
+            {
+                "rank": int(r[0]),
+                "keyword": str(r[1] or ""),
+                "traffic": str(r[2] or ""),
+                "traffic_num": int(r[3] or 0),
+                "link": str(r[4] or ""),
+            }
+        )
+    return out
+
+
+# -----------------------------
 # Google Trends RSS
 # -----------------------------
+def parse_traffic_to_int(s: str) -> int:
+    """
+    RSS의 approx_traffic은 대략값 문자열(예: '10만+', '20K+', '1M+') 형태.
+    숫자로 바꿔 '전날 대비' 계산에 사용(정확한 실측이 아니라 '대략'임).
+    """
+    if not s:
+        return 0
+    t = str(s).strip().replace(",", "").replace("+", "").upper()
+
+    # 한글 단위
+    m = re.search(r"(\d+(?:\.\d+)?)\s*만", t)
+    if m:
+        return int(float(m.group(1)) * 10000)
+    m = re.search(r"(\d+(?:\.\d+)?)\s*천", t)
+    if m:
+        return int(float(m.group(1)) * 1000)
+
+    # 영문 단위
+    m = re.search(r"(\d+(?:\.\d+)?)\s*K", t)
+    if m:
+        return int(float(m.group(1)) * 1000)
+    m = re.search(r"(\d+(?:\.\d+)?)\s*M", t)
+    if m:
+        return int(float(m.group(1)) * 1_000_000)
+
+    # 숫자만
+    m = re.search(r"(\d+)", t)
+    if m:
+        try:
+            return int(m.group(1))
+        except Exception:
+            return 0
+    return 0
+
+
 def fetch_google_trends(geo: str, limit: int) -> List[Dict[str, Any]]:
     url = f"https://trends.google.com/trending/rss?geo={geo}"
     r = requests.get(url, timeout=25)
@@ -221,7 +341,7 @@ def fetch_google_trends(geo: str, limit: int) -> List[Dict[str, Any]]:
             if child.tag.lower().endswith("approx_traffic"):
                 approx = (child.text or "").strip()
         if title:
-            out.append({"keyword": title, "link": link, "traffic": approx})
+            out.append({"keyword": title, "link": link, "traffic": approx, "traffic_num": parse_traffic_to_int(approx)})
     return out
 
 
@@ -255,11 +375,6 @@ def default_news_keywords() -> List[str]:
 
 
 def build_default_news_feeds(max_n: int) -> List[str]:
-    """
-    - FEEDS_MAX(예:100)까지 채우되 무한루프 없음
-    - 토픽 + 검색 키워드 + (분야×사건) 조합으로 후보를 넉넉히 만든 후
-      dedup해서 max_n만큼 자름
-    """
     urls: List[str] = [google_news_rss_top()]
 
     topics = ["WORLD", "NATION", "BUSINESS", "TECHNOLOGY", "ENTERTAINMENT", "SCIENCE", "SPORTS", "HEALTH"]
@@ -283,7 +398,6 @@ def build_default_news_feeds(max_n: int) -> List[str]:
         "검찰", "경찰", "법원", "국회",
     ]
 
-    # 후보를 넉넉히 생성 (max_n의 3배 정도)
     for m in mods:
         for b in bases:
             urls.append(google_news_rss_search(f"{m} {b}"))
@@ -292,7 +406,6 @@ def build_default_news_feeds(max_n: int) -> List[str]:
         if len(urls) >= max_n * 3:
             break
 
-    # dedup + max_n
     seen = set()
     out: List[str] = []
     for u in urls:
@@ -302,7 +415,6 @@ def build_default_news_feeds(max_n: int) -> List[str]:
         out.append(u)
         if len(out) >= max_n:
             break
-
     return out
 
 
@@ -365,7 +477,7 @@ def fetch_feed(session: requests.Session, url: str, timeout: int) -> Tuple[str, 
         now = datetime.now(KST)
 
         items: List[FeedItem] = []
-        for e in parsed.entries[:40]:
+        for e in parsed.entries[:50]:
             t = (getattr(e, "title", "") or "").strip()
             if not t:
                 continue
@@ -491,14 +603,13 @@ def score_keywords(cfg: AppConfig, items: List[FeedItem], trends: List[str]) -> 
                 continue
             seen.add(key)
 
-            # phrase 내부에 블록리스트 포함되면 제거
             if any(w.lower() in cfg.blocklist for w in key.split()):
                 continue
 
             counts[key] = counts.get(key, 0) + 1
             sources.setdefault(key, set()).add(it.source)
             examples.setdefault(key, [])
-            if len(examples[key]) < 4:
+            if len(examples[key]) < cfg.run.example_links:
                 examples[key].append(it)
 
     scored: List[Tuple[float, str]] = []
@@ -542,7 +653,7 @@ def score_keywords(cfg: AppConfig, items: List[FeedItem], trends: List[str]) -> 
                 "score": round(score, 2),
                 "mentions": counts.get(k, 0),
                 "sources": len(sources.get(k, set())),
-                "examples": examples.get(k, [])[:3],
+                "examples": examples.get(k, [])[: cfg.run.example_links],
                 "is_trend": (k in trend_set),
             }
         )
@@ -617,54 +728,111 @@ def slot_label(slot: str) -> str:
     return "오전" if slot == "am" else "오후"
 
 
-def build_html(cfg: AppConfig, date_str: str, trends: List[Dict[str, Any]], keywords: List[Dict[str, Any]], stats: Dict[str, Any]) -> str:
-    disclosure = (
-        '<p style="padding:10px;border-left:4px solid #111;background:#f7f7f7;">'
-        "※ Google 트렌딩 검색어 + 커뮤니티/뉴스 헤드라인을 기반으로 '데일리 이슈 키워드'를 자동 집계했습니다."
-        "</p>"
-    )
-    head = (
-        f"<p>기준일: <b>{esc(date_str)}</b> / 구분: <b>{esc(slot_label(cfg.run.slot))}</b><br/>"
-        f"집계범위: 최근 <b>{cfg.run.window_hours}시간</b> / 수집헤드라인: <b>{stats.get('items',0)}</b>개 / "
-        f"피드성공: <b>{stats.get('ok_feeds',0)}</b> / 실패: <b>{stats.get('err_feeds',0)}</b></p>"
-    )
+def fmt_delta(n: int) -> str:
+    if n > 0:
+        return f"+{n:,}"
+    if n < 0:
+        return f"{n:,}"
+    return "0"
 
-    tr_rows = []
-    for i, t in enumerate(trends[:cfg.run.limit], start=1):
-        kw = esc(t.get("keyword", ""))
-        link = esc(t.get("link", ""))
-        traffic = esc(t.get("traffic", ""))
-        kw_html = f'<a href="{link}" target="_blank" rel="nofollow noopener">{kw}</a>' if link else kw
-        tr_rows.append(
-            f"<tr>"
-            f"<td style='padding:8px;border:1px solid #e5e5e5;text-align:center;'>{i}</td>"
-            f"<td style='padding:8px;border:1px solid #e5e5e5;'>{kw_html}</td>"
-            f"<td style='padding:8px;border:1px solid #e5e5e5;text-align:right;white-space:nowrap;'>{traffic}</td>"
-            f"</tr>"
+
+def build_trends_delta_table(today: List[Dict[str, Any]], yday: List[Dict[str, Any]]) -> str:
+    """
+    전날 대비:
+    - 순위변동: (어제rank - 오늘rank) > 0 이면 상승(▲)
+    - 트래픽변동: today.traffic_num - yday.traffic_num
+    - 바(bar): 오늘 traffic_num을 max 기준으로 %로 표현
+    """
+    y_map: Dict[str, Dict[str, Any]] = {}
+    for it in yday:
+        k = (it.get("keyword") or "").strip()
+        if k:
+            y_map[k] = it
+
+    max_tr = max([int(x.get("traffic_num") or 0) for x in today] + [1])
+
+    rows = []
+    for i, t in enumerate(today, start=1):
+        kw = str(t.get("keyword") or "")
+        link = str(t.get("link") or "")
+        tr_txt = str(t.get("traffic") or "")
+        tr_num = int(t.get("traffic_num") or 0)
+
+        y = y_map.get(kw)
+        y_rank = int(y["rank"]) if y and "rank" in y else None
+        y_tr_txt = str(y.get("traffic") or "") if y else ""
+        y_tr_num = int(y.get("traffic_num") or 0) if y else 0
+
+        if y_rank is None:
+            rchg = "NEW"
+        else:
+            diff = y_rank - i  # +면 상승
+            if diff > 0:
+                rchg = f"▲{diff}"
+            elif diff < 0:
+                rchg = f"▼{abs(diff)}"
+            else:
+                rchg = "—"
+
+        d_tr = tr_num - y_tr_num
+        bar_w = int(round((tr_num / max_tr) * 100)) if max_tr > 0 else 0
+
+        kw_html = f'<a href="{esc(link)}" target="_blank" rel="nofollow noopener">{esc(kw)}</a>' if link else esc(kw)
+
+        rows.append(
+            f"""
+            <tr>
+              <td style="padding:8px;border:1px solid #e5e5e5;text-align:center;">{i}</td>
+              <td style="padding:8px;border:1px solid #e5e5e5;">{kw_html}</td>
+              <td style="padding:8px;border:1px solid #e5e5e5;text-align:center;">{esc(rchg)}</td>
+              <td style="padding:8px;border:1px solid #e5e5e5;text-align:right;white-space:nowrap;">
+                {esc(tr_txt)}<div style="font-size:12px;opacity:.7;">(전날: {esc(y_tr_txt) if y_rank is not None else "—"})</div>
+              </td>
+              <td style="padding:8px;border:1px solid #e5e5e5;text-align:right;white-space:nowrap;">
+                {esc(fmt_delta(d_tr))}
+              </td>
+              <td style="padding:8px;border:1px solid #e5e5e5;">
+                <div style="height:10px;background:#f0f0f0;border-radius:999px;overflow:hidden;">
+                  <div style="height:10px;width:{bar_w}%;background:#111;"></div>
+                </div>
+              </td>
+            </tr>
+            """
         )
 
-    trends_html = f"""
-    <h2>Google 트렌딩 검색어</h2>
+    return f"""
+    <h2>Google 트렌딩 검색어 (전날 대비)</h2>
+    <p style="font-size:12px;opacity:.75;">
+      ※ 전날 대비는 RSS의 대략 트래픽(approx_traffic) 문자열을 숫자로 환산해 계산합니다(정확한 실측 수치 아님).
+    </p>
     <table style="border-collapse:collapse;width:100%;font-size:14px;">
       <thead>
         <tr>
           <th style="padding:8px;border:1px solid #e5e5e5;">순위</th>
           <th style="padding:8px;border:1px solid #e5e5e5;">키워드</th>
-          <th style="padding:8px;border:1px solid #e5e5e5;">트래픽</th>
+          <th style="padding:8px;border:1px solid #e5e5e5;">순위변동</th>
+          <th style="padding:8px;border:1px solid #e5e5e5;">트래픽(오늘/전날)</th>
+          <th style="padding:8px;border:1px solid #e5e5e5;">Δ트래픽</th>
+          <th style="padding:8px;border:1px solid #e5e5e5;">그래프</th>
         </tr>
       </thead>
-      <tbody>{''.join(tr_rows) if tr_rows else "<tr><td colspan='3' style='padding:8px;border:1px solid #e5e5e5;'>데이터 없음</td></tr>"}</tbody>
+      <tbody>
+        {''.join(rows) if rows else "<tr><td colspan='6' style='padding:8px;border:1px solid #e5e5e5;'>데이터 없음</td></tr>"}
+      </tbody>
     </table>
     """
 
+
+def build_keywords_table(cfg: AppConfig, keywords: List[Dict[str, Any]]) -> str:
     rows = []
     for i, k in enumerate(keywords, start=1):
         label = esc(k["keyword"])
         mentions = k.get("mentions", 0)
         srcs = k.get("sources", 0)
         is_tr = "✅" if k.get("is_trend") else ""
+
         ex_lines = []
-        for it in k.get("examples", []):
+        for it in k.get("examples", [])[: cfg.run.example_links]:
             tt = esc(normalize_title(it.title))
             lk = esc(it.link)
             sc = esc(it.source)
@@ -686,7 +854,7 @@ def build_html(cfg: AppConfig, date_str: str, trends: List[Dict[str, Any]], keyw
             f"</tr>"
         )
 
-    kw_html = f"""
+    return f"""
     <h2>데일리 이슈 키워드 TOP {len(keywords)}</h2>
     <p style="font-size:12px;opacity:.75;">※ ✅ 표시 = Google 트렌딩에도 걸린 키워드(가중치 적용)</p>
     <table style="border-collapse:collapse;width:100%;font-size:14px;">
@@ -696,12 +864,32 @@ def build_html(cfg: AppConfig, date_str: str, trends: List[Dict[str, Any]], keyw
           <th style="padding:8px;border:1px solid #e5e5e5;">키워드</th>
           <th style="padding:8px;border:1px solid #e5e5e5;">언급</th>
           <th style="padding:8px;border:1px solid #e5e5e5;">출처수</th>
-          <th style="padding:8px;border:1px solid #e5e5e5;">대표 링크</th>
+          <th style="padding:8px;border:1px solid #e5e5e5;">대표 링크(최대 {cfg.run.example_links})</th>
         </tr>
       </thead>
-      <tbody>{''.join(rows) if rows else "<tr><td colspan='5' style='padding:8px;border:1px solid #e5e5e5;'>키워드 부족(피드/커뮤니티 소스 확대 필요)</td></tr>"}</tbody>
+      <tbody>
+        {''.join(rows) if rows else "<tr><td colspan='5' style='padding:8px;border:1px solid #e5e5e5;'>키워드 부족(피드/커뮤니티 소스 확대 필요)</td></tr>"}
+      </tbody>
     </table>
     """
+
+
+def build_html(cfg: AppConfig, date_str: str, trends_today: List[Dict[str, Any]], trends_yday: List[Dict[str, Any]],
+               keywords: List[Dict[str, Any]], stats: Dict[str, Any]) -> str:
+    disclosure = (
+        '<p style="padding:10px;border-left:4px solid #111;background:#f7f7f7;">'
+        "※ Google 트렌딩 검색어 + 커뮤니티/뉴스 헤드라인을 기반으로 '데일리 이슈 키워드'를 자동 집계했습니다."
+        "</p>"
+    )
+    head = (
+        f"<p>기준일: <b>{esc(date_str)}</b> / 구분: <b>{esc(slot_label(cfg.run.slot))}</b><br/>"
+        f"집계범위: 최근 <b>{cfg.run.window_hours}시간</b> / 수집헤드라인: <b>{stats.get('items',0)}</b>개 / "
+        f"피드성공: <b>{stats.get('ok_feeds',0)}</b> / 실패: <b>{stats.get('err_feeds',0)}</b></p>"
+    )
+
+    trends_html = build_trends_delta_table(trends_today, trends_yday)
+    kw_html = build_keywords_table(cfg, keywords)
+
     return disclosure + head + trends_html + "<hr/>" + kw_html + "<hr/><p style='font-size:12px;opacity:.7;'>자동 포스팅 봇</p>"
 
 
@@ -745,19 +933,27 @@ def main() -> None:
 
     now = datetime.now(KST)
     date_str = now.strftime("%Y-%m-%d")
+    yday_str = (now - timedelta(days=1)).strftime("%Y-%m-%d")
 
     slug = f"daily-issue-keywords-{date_str}-{cfg.run.slot}"
     title = f"{date_str} 데일리 이슈 키워드 TOP{cfg.run.limit} ({slot_label(cfg.run.slot)})"
 
-    # 1) Google Trends
+    # DB init + load yesterday
+    init_db(cfg.run.sqlite_path)
+    trends_yday = load_trends_by_date(cfg.run.sqlite_path, yday_str)
+
+    # 1) Google Trends (today)
     try:
-        trends = fetch_google_trends(cfg.run.google_geo, cfg.run.limit)
-        print(f"[TRENDS] ok {len(trends)} items")
+        trends_today = fetch_google_trends(cfg.run.google_geo, cfg.run.trend_limit)
+        print(f"[TRENDS] ok {len(trends_today)} items")
     except Exception as ex:
-        trends = []
+        trends_today = []
         print("[TRENDS] failed:", ex)
 
-    trend_keywords = [t.get("keyword", "") for t in trends if t.get("keyword")]
+    # store today trends for tomorrow compare
+    upsert_trends(cfg.run.sqlite_path, date_str, trends_today)
+
+    trend_keywords = [t.get("keyword", "") for t in trends_today if t.get("keyword")]
 
     # 2) feeds
     print("[FEEDS] building feed list...")
@@ -778,7 +974,7 @@ def main() -> None:
     print(f"[SCORE] keywords={len(keywords)}")
 
     stats = {"items": len(items), "ok_feeds": ok_feeds, "err_feeds": err_feeds}
-    html = build_html(cfg, date_str, trends, keywords, stats)
+    html = build_html(cfg, date_str, trends_today, trends_yday, keywords, stats)
 
     if cfg.run.dry_run:
         print("[DRY_RUN] Posting skipped. HTML preview:\n")
