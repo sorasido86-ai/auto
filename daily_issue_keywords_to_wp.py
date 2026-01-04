@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-daily_issue_keywords_to_wp.py (완전 통합/최적화)
+daily_issue_keywords_to_wp.py (완전 통합/안정화)
 - Google Trends(geo=KR) 트렌딩 검색어 수집
 - Google News RSS(검색/토픽) + 커뮤니티 RSS 수집 (총 FEEDS_MAX까지)
 - 최근 WINDOW_HOURS 시간 기준 "데일리 이슈 키워드 TOP N" 집계
@@ -12,7 +12,7 @@ daily_issue_keywords_to_wp.py (완전 통합/최적화)
   - WP_USER
   - WP_APP_PASS
 
-카테고리
+카테고리(요청: 4번)
   - WP_CATEGORY_IDS="4"
 
 권장 env
@@ -256,10 +256,9 @@ def default_news_keywords() -> List[str]:
 
 def build_default_news_feeds(max_n: int) -> List[str]:
     """
-    ✅ 수정 포인트(중요):
-    - 예전 버전은 채우기 키워드가 10개뿐이라 max_n(100)을 못 채우면 무한루프 가능
-    - 이 버전은 (분야 키워드 × 사건 키워드) 조합으로 수백개 후보를 만들어 max_n까지 채움
-    - 그래도 못 채우면 그냥 있는 만큼 반환(무한루프 없음)
+    - FEEDS_MAX(예:100)까지 채우되 무한루프 없음
+    - 토픽 + 검색 키워드 + (분야×사건) 조합으로 후보를 넉넉히 만든 후
+      dedup해서 max_n만큼 자름
     """
     urls: List[str] = [google_news_rss_top()]
 
@@ -270,15 +269,6 @@ def build_default_news_feeds(max_n: int) -> List[str]:
     for kw in default_news_keywords():
         urls.append(google_news_rss_search(kw))
 
-    # 조합 생성(충분히 많이)
-    bases = [
-        "논란", "구속", "사퇴", "파면", "기소", "선고", "재판", "수사", "압수수색", "검거",
-        "사고", "화재", "추락", "폭발", "정전", "침수", "붕괴", "산불", "태풍", "지진",
-        "감염", "독감", "확진", "백신", "주의보", "특보",
-        "해킹", "유출", "장애", "점검", "업데이트", "출시",
-        "인상", "인하", "상승",igger = "폭등"
-    ]
-    # 위 라인 오타 방지: (깃헙에 올릴 때 혹시 편집 중 깨질까봐) 아래처럼 정상화
     bases = [
         "논란", "구속", "사퇴", "파면", "기소", "선고", "재판", "수사", "압수수색", "검거",
         "사고", "화재", "추락", "폭발", "정전", "침수", "붕괴", "산불", "태풍", "지진",
@@ -293,7 +283,7 @@ def build_default_news_feeds(max_n: int) -> List[str]:
         "검찰", "경찰", "법원", "국회",
     ]
 
-    # 먼저 모듈×베이스 조합으로 유니크 URL을 많이 생성
+    # 후보를 넉넉히 생성 (max_n의 3배 정도)
     for m in mods:
         for b in bases:
             urls.append(google_news_rss_search(f"{m} {b}"))
@@ -302,7 +292,7 @@ def build_default_news_feeds(max_n: int) -> List[str]:
         if len(urls) >= max_n * 3:
             break
 
-    # dedup + max_n까지 채우기
+    # dedup + max_n
     seen = set()
     out: List[str] = []
     for u in urls:
@@ -313,7 +303,6 @@ def build_default_news_feeds(max_n: int) -> List[str]:
         if len(out) >= max_n:
             break
 
-    # ✅ 안전장치: max_n 못 채워도 무한루프 없이 그대로 반환
     return out
 
 
@@ -326,13 +315,8 @@ def default_community_feeds() -> List[str]:
 
 
 def build_feed_list(cfg: AppConfig) -> List[str]:
-    community = _split_lines_env("COMMUNITY_FEEDS")
-    if not community:
-        community = default_community_feeds()
-
-    news = _split_lines_env("NEWS_FEEDS")
-    if not news:
-        news = build_default_news_feeds(cfg.run.feeds_max)
+    community = _split_lines_env("COMMUNITY_FEEDS") or default_community_feeds()
+    news = _split_lines_env("NEWS_FEEDS") or build_default_news_feeds(cfg.run.feeds_max)
 
     urls = community + news
     seen = set()
@@ -372,16 +356,6 @@ def _entry_dt(e: Any) -> Optional[datetime]:
 
 def fetch_feed(session: requests.Session, url: str, timeout: int) -> Tuple[str, List[FeedItem], Optional[str]]:
     try:
-        # 짧은 HEAD 체크
-        try:
-            h = session.head(url, timeout=3, allow_redirects=True, headers={"User-Agent": "daily-issue-bot/1.0"})
-            if h.status_code == 405:
-                pass
-        except requests.exceptions.Timeout:
-            return url, [], "HEAD timeout"
-        except requests.exceptions.RequestException:
-            return url, [], "HEAD failed"
-
         r = session.get(url, timeout=timeout, headers={"User-Agent": "daily-issue-bot/1.0"})
         if r.status_code != 200:
             return url, [], f"HTTP {r.status_code}"
@@ -488,7 +462,7 @@ def tokenize(cfg: AppConfig, title: str) -> List[str]:
 
 
 def phrases_from_tokens(tokens: List[str]) -> List[str]:
-    bigrams = [f"{tokens[i]} {tokens[i+1]}" for i in range(len(tokens)-1)]
+    bigrams = [f"{tokens[i]} {tokens[i+1]}" for i in range(len(tokens) - 1)]
     return bigrams + tokens
 
 
@@ -589,7 +563,7 @@ def wp_auth_header(user: str, app_pass: str) -> Dict[str, str]:
 def wp_find_post_by_slug(cfg: WordPressConfig, slug: str) -> Optional[Tuple[int, str]]:
     url = cfg.base_url.rstrip("/") + "/wp-json/wp/v2/posts"
     headers = wp_auth_header(cfg.username, cfg.app_password)
-    r = requests.get(url, relaxed=True) if False else requests.get(url, headers=headers, params={"slug": slug, "per_page": 1}, timeout=25)
+    r = requests.get(url, headers=headers, params={"slug": slug, "per_page": 1}, timeout=25)
     if r.status_code != 200:
         return None
     arr = r.json()
@@ -695,7 +669,10 @@ def build_html(cfg: AppConfig, date_str: str, trends: List[Dict[str, Any]], keyw
             lk = esc(it.link)
             sc = esc(it.source)
             if lk:
-                ex_lines.append(f'• <a href="{lk}" target="_blank" rel="nofollow noopener">{tt}</a> <span style="opacity:.7;">({sc})</span>')
+                ex_lines.append(
+                    f'• <a href="{lk}" target="_blank" rel="nofollow noopener">{tt}</a> '
+                    f"<span style='opacity:.7;'>({sc})</span>"
+                )
             else:
                 ex_lines.append(f"• {tt} <span style='opacity:.7;'>({sc})</span>")
 
@@ -782,15 +759,15 @@ def main() -> None:
 
     trend_keywords = [t.get("keyword", "") for t in trends if t.get("keyword")]
 
-    # 2) feeds (여기서 예전 코드가 무한루프였음)
+    # 2) feeds
     print("[FEEDS] building feed list...")
     feeds = build_feed_list(cfg)
-    print(f"[FEEDS] total urls={len(feeds)} (community+news)")
+    print(f"[FEEDS] total urls={len(feeds)}")
 
     items, errors = fetch_all(cfg, feeds)
-
     ok_feeds = len(feeds) - len(errors)
     err_feeds = len(errors)
+
     if cfg.run.debug and errors:
         print("[FEEDS] sample errors:")
         for u, e in list(errors.items())[:15]:
