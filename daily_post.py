@@ -1,13 +1,13 @@
 # -*- coding: utf-8 -*-
 """
-daily_post.py (통합/안정화 버전)
+daily_post.py (통합/안정화 버전 - Brent 강화)
 - WordPress REST API로 '오늘의 지표 리포트' 자동 발행
 - 카테고리: 팁(카테고리 ID=8)
-- 데이터 수집 안정화:
-  1) USD/KRW: 네이버(기본)  (Stooq 안씀)
-  2) KOSPI  : 네이버(기본)  (Stooq 안씀)
-  3) Brent  : 네이버(우선) + Stooq(보조) 중 "더 최신 날짜"를 선택
-- 뉴스: Google News RSS ko-KR (한자/중국어 확률 낮춤)
+- 데이터 수집:
+  1) USD/KRW: 네이버(고정)
+  2) KOSPI  : 네이버(고정)
+  3) Brent  : 네이버(우선) -> FRED(키 없이) -> Stooq(보조)
+            성공한 후보들 중 "가장 최신 날짜" 데이터 사용
 
 필수 패키지:
 pip install requests beautifulsoup4 lxml feedparser
@@ -48,13 +48,27 @@ COMMON_HEADERS = {
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
 }
 
+NAVER_HEADERS = {
+    **COMMON_HEADERS,
+    "Referer": "https://finance.naver.com/",
+}
+
 # Naver(안정)
 NAVER_USDKRW_URL = "https://finance.naver.com/marketindex/exchangeDailyQuote.naver?marketindexCd=FX_USDKRW"
 NAVER_KOSPI_URL  = "https://finance.naver.com/sise/sise_index_day.naver?code=KOSPI&page=1"
 NAVER_BRENT_DAILY_URL = "https://finance.naver.com/marketindex/worldOilDailyQuote.naver?marketindexCd=OIL_BRT"
 NAVER_BRENT_DETAIL_URL = "https://finance.naver.com/marketindex/worldOilDetail.naver?marketindexCd=OIL_BRT"
 
-# Stooq(보조: Brent만)
+# FRED (키 없이 CSV 가능)
+FRED_HEADERS = {
+    "User-Agent": UA,
+    "Accept": "text/csv,*/*;q=0.8",
+    "Referer": "https://fred.stlouisfed.org/",
+}
+FRED_BRENT_SERIES = "DCOILBRENTEU"  # Brent spot price (FRED 그래프 CSV, 키 없이 접근 가능)
+FRED_GRAPH_CSV = "https://fred.stlouisfed.org/graph/fredgraph.csv?id={series}"
+
+# Stooq (Brent 보조)
 STOOQ_RETRY = 3
 STOOQ_SLEEP = 1.2
 STOOQ_HEADERS = {
@@ -133,9 +147,6 @@ def html_escape(s: str) -> str:
     )
 
 def parse_dot_date(s: str) -> Optional[str]:
-    """
-    '2026.01.02' -> '2026-01-02'
-    """
     m = re.search(r"(\d{4})\.(\d{2})\.(\d{2})", s)
     if not m:
         return None
@@ -150,7 +161,6 @@ def iso_to_date(s: Optional[str]) -> Optional[date]:
     except:
         return None
 
-
 def http_get(url: str, headers: Optional[Dict[str, str]] = None) -> str:
     h = COMMON_HEADERS.copy()
     if headers:
@@ -158,42 +168,6 @@ def http_get(url: str, headers: Optional[Dict[str, str]] = None) -> str:
     r = requests.get(url, headers=h, timeout=REQUEST_TIMEOUT, allow_redirects=True)
     r.raise_for_status()
     return (r.text or "")
-
-
-# =========================
-# Kakao (선택)
-# =========================
-def refresh_access_token(cfg: Dict[str, Any]) -> str:
-    url = "https://kauth.kakao.com/oauth/token"
-    data = {
-        "grant_type": "refresh_token",
-        "client_id": cfg["kakao_rest_key"],
-        "refresh_token": cfg["kakao_refresh_token"],
-    }
-    r = requests.post(url, data=data, timeout=REQUEST_TIMEOUT)
-    r.raise_for_status()
-    tokens = r.json()
-    if "refresh_token" in tokens and tokens["refresh_token"]:
-        cfg["kakao_refresh_token"] = tokens["refresh_token"]
-        with open(config_path(), "w", encoding="utf-8") as f:
-            json.dump(cfg, f, ensure_ascii=False, indent=2)
-    return tokens["access_token"]
-
-def kakao_send_to_me(cfg: Dict[str, Any], text: str) -> None:
-    if not cfg.get("kakao_rest_key") or not cfg.get("kakao_refresh_token"):
-        return
-    access_token = refresh_access_token(cfg)
-    url = "https://kapi.kakao.com/v2/api/talk/memo/default/send"
-    headers = {"Authorization": f"Bearer {access_token}"}
-    template_object = {
-        "object_type": "text",
-        "text": text[:1000],
-        "link": {"web_url": cfg["wp_base_url"], "mobile_web_url": cfg["wp_base_url"]},
-        "button_title": "사이트 열기"
-    }
-    data = {"template_object": json.dumps(template_object, ensure_ascii=False)}
-    r = requests.post(url, headers=headers, data=data, timeout=REQUEST_TIMEOUT)
-    r.raise_for_status()
 
 
 # =========================
@@ -247,16 +221,10 @@ def wp_create_post(cfg: Dict[str, Any], title: str, slug: str, content_html: str
 
 
 # =========================
-# Naver 파서 (핵심)
+# Naver 파서
 # =========================
 def naver_extract_last_two_from_table(url: str) -> Tuple[float, float, str]:
-    """
-    네이버 페이지의 테이블에서 날짜/값(2개)을 뽑아 latest, prev, latest_date(ISO)를 반환
-    - 여러 페이지에서 공통적으로 동작하도록:
-      각 <tr>의 첫번째 td가 'YYYY.MM.DD' 형태면 날짜로 보고,
-      두번째 td를 값으로 사용.
-    """
-    html = http_get(url)
+    html = http_get(url, headers=NAVER_HEADERS)
     soup = BeautifulSoup(html, "lxml")
 
     rows: List[Tuple[str, float]] = []
@@ -277,7 +245,7 @@ def naver_extract_last_two_from_table(url: str) -> Tuple[float, float, str]:
 
         rows.append((iso, v))
 
-    # 중복 날짜 제거(앞에서부터 유지)
+    # 중복 제거
     dedup: List[Tuple[str, float]] = []
     seen = set()
     for d, v in rows:
@@ -289,10 +257,9 @@ def naver_extract_last_two_from_table(url: str) -> Tuple[float, float, str]:
     if len(dedup) < 2:
         raise ValueError("네이버 테이블 데이터가 부족합니다(2개 미만)")
 
-    latest_d, latest_v = dedup[0]  # 네이버는 최신이 위에 오는 경우가 많음
+    latest_d, latest_v = dedup[0]
     prev_d, prev_v = dedup[1]
     return latest_v, prev_v, latest_d
-
 
 def fetch_usdkrw_naver() -> Tuple[float, float, str]:
     return naver_extract_last_two_from_table(NAVER_USDKRW_URL)
@@ -301,7 +268,6 @@ def fetch_kospi_naver() -> Tuple[float, float, str]:
     return naver_extract_last_two_from_table(NAVER_KOSPI_URL)
 
 def fetch_brent_naver() -> Tuple[float, float, str]:
-    # dailyQuote가 막히면 detail로 1번 더 시도
     try:
         return naver_extract_last_two_from_table(NAVER_BRENT_DAILY_URL)
     except Exception:
@@ -309,7 +275,42 @@ def fetch_brent_naver() -> Tuple[float, float, str]:
 
 
 # =========================
-# Stooq (Brent 보조용)
+# FRED (키 없이 CSV)
+# =========================
+def fetch_fred_last_two(series: str) -> Tuple[float, float, str]:
+    url = FRED_GRAPH_CSV.format(series=series)
+    txt = http_get(url, headers=FRED_HEADERS)
+    if not txt.lower().startswith("date,"):
+        raise ValueError("FRED CSV 응답이 CSV가 아닙니다(차단/HTML 가능)")
+
+    lines = txt.splitlines()
+    # DATE,VALUE
+    data: List[Tuple[str, float]] = []
+    for line in lines[1:]:
+        parts = line.split(",")
+        if len(parts) < 2:
+            continue
+        d = parts[0].strip()
+        v = parts[1].strip()
+        if not d or not re.match(r"^\d{4}-\d{2}-\d{2}$", d):
+            continue
+        if v in (".", "", "nan", "NaN"):
+            continue
+        fv = safe_float(v)
+        if fv is None:
+            continue
+        data.append((d, fv))
+
+    if len(data) < 2:
+        raise ValueError("FRED 데이터가 부족합니다(2개 미만)")
+
+    latest_d, latest_v = data[-1]
+    prev_d, prev_v = data[-2]
+    return latest_v, prev_v, latest_d
+
+
+# =========================
+# Stooq (보조)
 # =========================
 def fetch_stooq_csv(symbol: str) -> str:
     last_err = None
@@ -344,15 +345,13 @@ def parse_stooq_last_two_closes(csv_text: str) -> Tuple[float, float, str]:
         raise ValueError("Stooq 데이터가 부족합니다(2개 미만)")
     latest_d, latest_c = rows[-1]
     prev_d, prev_c = rows[-2]
-    return latest_c, prev_c, latest_d  # Date는 이미 YYYY-MM-DD
+    return latest_c, prev_c, latest_d
 
 
+# =========================
+# Brent Best Effort (네이버 -> FRED -> Stooq)
+# =========================
 def fetch_brent_best_effort() -> Tuple[Optional[float], Optional[float], Optional[str], Optional[str]]:
-    """
-    Brent는 네이버(우선) + Stooq(보조) 둘다 시도해서
-    '더 최신 날짜' 결과를 선택.
-    return: latest, prev, date, source
-    """
     cand: List[Tuple[Optional[float], Optional[float], Optional[str], str]] = []
 
     # 1) Naver
@@ -362,7 +361,14 @@ def fetch_brent_best_effort() -> Tuple[Optional[float], Optional[float], Optiona
     except Exception:
         cand.append((None, None, None, "NAVER_FAIL"))
 
-    # 2) Stooq (심볼 후보 넉넉히)
+    # 2) FRED (키 없이)
+    try:
+        a, b, d = fetch_fred_last_two(FRED_BRENT_SERIES)
+        cand.append((a, b, d, f"FRED:{FRED_BRENT_SERIES}"))
+    except Exception:
+        cand.append((None, None, None, "FRED_FAIL"))
+
+    # 3) Stooq (보조)
     for sym in ["brent.f", "brn.f", "cb.f", "co.f"]:
         try:
             txt = fetch_stooq_csv(sym)
@@ -372,7 +378,7 @@ def fetch_brent_best_effort() -> Tuple[Optional[float], Optional[float], Optiona
         except Exception:
             continue
 
-    # 유효한 후보만 골라 최신 날짜 선택
+    # 유효 후보 중 가장 최신 날짜 선택
     best = None
     best_date = None
     for a, b, d, src in cand:
@@ -381,12 +387,12 @@ def fetch_brent_best_effort() -> Tuple[Optional[float], Optional[float], Optiona
         dd = iso_to_date(d)
         if dd is None:
             continue
-        if best is None or (best_date is not None and dd > best_date) or best_date is None:
+        if best is None or best_date is None or dd > best_date:
             best = (a, b, d, src)
             best_date = dd
 
     if best is None:
-        return None, None, None, "FAIL(네이버+Stooq 모두 실패)"
+        return None, None, None, "FAIL(네이버+FRED+Stooq 모두 실패)"
     return best
 
 
@@ -394,15 +400,9 @@ def fetch_brent_best_effort() -> Tuple[Optional[float], Optional[float], Optiona
 # Google News RSS (ko-KR)
 # =========================
 def google_news_rss(query: str, max_items: int = 3) -> List[Dict[str, str]]:
-    params = {
-        "q": query,
-        "hl": "ko",
-        "gl": "KR",
-        "ceid": "KR:ko",
-    }
+    params = {"q": query, "hl": "ko", "gl": "KR", "ceid": "KR:ko"}
     r = requests.get(GOOGLE_NEWS_BASE, params=params, headers={"User-Agent": UA}, timeout=REQUEST_TIMEOUT)
     r.raise_for_status()
-
     feed = feedparser.parse(r.text)
     items = []
     for e in (feed.entries or [])[:max_items]:
@@ -481,7 +481,7 @@ def build_html_report(
           <div style="font-weight:700; margin-bottom:6px;">⚠️ 일부 데이터 수집 실패</div>
           <ul style="margin:8px 0 0 18px; padding:0;">{li}</ul>
           <div style="color:#666; font-size:13px; margin-top:10px;">
-            ※ 사이트 차단/지연/휴장 등으로 값이 비어 있을 수 있어요. (네이버 우선 + Brent는 Stooq 보조 fallback)
+            ※ 차단/지연/휴장 등으로 값이 비어 있을 수 있어요. (Brent는 네이버→FRED→Stooq 순으로 fallback)
           </div>
         </div>
         """
@@ -563,7 +563,7 @@ def build_html_report(
       </div>
 
       <div style="color:#666; font-size:12px; margin-top:16px;">
-        데이터 출처: Naver Finance(기본), Stooq(Brent 보조), Google News RSS(헤드라인)
+        데이터 출처: Naver Finance(USD/KRW,KOSPI 우선), FRED(Brent fallback), Stooq(Brent 보조), Google News RSS
       </div>
     </div>
     """
@@ -591,7 +591,7 @@ def fetch_indicators_stable() -> Tuple[Dict[str, Any], List[str]]:
         kospi = {"latest": None, "prev": None, "date": None, "source": "NAVER_FAIL"}
         errors.append(f"KOSPI 수집 실패: {type(e).__name__}: {e}")
 
-    # Brent (네이버 우선 + Stooq 보조, 최신 날짜 선택)
+    # Brent (네이버 -> FRED -> Stooq)
     try:
         latest, prev, d, src = fetch_brent_best_effort()
         brent = {"latest": latest, "prev": prev, "date": d, "source": src}
@@ -609,14 +609,12 @@ def fetch_indicators_stable() -> Tuple[Dict[str, Any], List[str]]:
 # =========================
 def main():
     cfg = load_config()
-
     for k in ("wp_base_url", "wp_user", "wp_app_pass"):
         if not cfg.get(k):
             raise ValueError(f"필수 설정 누락: {k}")
 
     today = now_date_str()
 
-    # 테스트 모드(원하면 workflow에서 TEST_RUN_ID 세팅)
     test_id = os.getenv("TEST_RUN_ID", "").strip()
     if test_id:
         slug = f"daily-indicator-report-{today}-{test_id}"
@@ -625,47 +623,26 @@ def main():
         slug = f"daily-indicator-report-{today}"
         title = f"오늘의 지표 리포트 ({today})"
 
-    try:
-        # 중복 발행 방지(테스트 모드가 아닐 때)
-        if not test_id and wp_post_exists(cfg, slug):
-            msg = f"✅ 이미 오늘 글이 있어요 ({today})\n중복 발행 안 함\nslug={slug}\n카테고리=팁(ID={DEFAULT_CATEGORY_ID})"
-            print(msg)
-            kakao_send_to_me(cfg, msg)
-            return
+    # 중복 발행 방지(테스트가 아닐 때)
+    if not test_id and wp_post_exists(cfg, slug):
+        print(f"✅ 이미 오늘 글이 있어요 ({today}) - 중복 발행 안 함")
+        return
 
-        ind, errors = fetch_indicators_stable()
-        news = build_reason_section()
+    ind, errors = fetch_indicators_stable()
+    news = build_reason_section()
 
-        html = build_html_report(
-            today=today,
-            usd=ind["usdkrw"],
-            brent=ind["brent"],
-            kospi=ind["kospi"],
-            errors=errors,
-            news=news,
-        )
+    html = build_html_report(
+        today=today,
+        usd=ind["usdkrw"],
+        brent=ind["brent"],
+        kospi=ind["kospi"],
+        errors=errors,
+        news=news,
+    )
 
-        post = wp_create_post(cfg, title, slug, html, status=POST_STATUS)
-        link = post.get("link", cfg["wp_base_url"])
-
-        msg = (
-            f"✅ 글 발행 성공!\n"
-            f"날짜: {today}\n"
-            f"상태: {POST_STATUS}\n"
-            f"카테고리: 팁(ID={DEFAULT_CATEGORY_ID})\n"
-            f"링크: {link}"
-        )
-        print(msg)
-        kakao_send_to_me(cfg, msg)
-
-    except Exception as e:
-        msg = f"❌ 자동발행 실패 ({today})\n{type(e).__name__}: {e}"
-        print(msg)
-        try:
-            kakao_send_to_me(cfg, msg)
-        except Exception as e2:
-            print("카톡 알림까지 실패:", type(e2).__name__, e2)
-        raise
+    post = wp_create_post(cfg, title, slug, html, status=POST_STATUS)
+    link = post.get("link", cfg["wp_base_url"])
+    print(f"✅ 글 발행 성공: {link}")
 
 
 if __name__ == "__main__":
