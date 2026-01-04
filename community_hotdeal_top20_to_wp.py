@@ -562,7 +562,7 @@ def fetch_fmkorea_hotdeal(url: str, now: datetime, window_hours: int) -> List[De
 # -----------------------------
 # Rendering
 # -----------------------------
-DISCLOSURE = "※ 이 포스팅은 제휴마케팅 활동의 일환으로, 이에 따른 일정액의 수수료를 제공받을 수 있습니다."
+DISCLOSURE = "※ 이 포스팅은 자료를 모으기 위해 만든 글입니다."
 POST_NOTE = "데이터 출처: 커뮤니티 핫딜(루리웹/뽐뿌RSS/기타). 일부 사이트는 봇 차단으로 누락될 수 있습니다."
 
 
