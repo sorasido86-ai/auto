@@ -8,12 +8,18 @@ on:
         required: false
         default: "am"
   schedule:
-    - cron: "5 0 * * *"   # 09:05 KST (00:05 UTC)
-    - cron: "5 9 * * *"   # 18:05 KST (09:05 UTC)
+    - cron: "5 0 * * *"   # 09:05 KST
+    - cron: "5 9 * * *"   # 18:05 KST
+
+# ✅ 같은 워크플로가 줄서기/겹침 되면 최신 것만 실행
+concurrency:
+  group: daily-issue-keywords
+  cancel-in-progress: true
 
 jobs:
   post:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
 
     steps:
       - name: Checkout
@@ -23,16 +29,19 @@ jobs:
         run: |
           echo "PWD=$(pwd)"
           ls -la
+          echo "---- find daily_issue_keywords_to_wp.py ----"
+          find . -maxdepth 5 -type f -name "daily_issue_keywords_to_wp.py" -print
           echo "---- find *.py ----"
           find . -maxdepth 5 -type f -name "*.py" -print
 
-      - name: Set up Python
+      - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
       - name: Install deps
         run: |
+          python -V
           python -m pip install --upgrade pip
           pip install requests feedparser
 
@@ -56,18 +65,21 @@ jobs:
           echo "RUN_SLOT=$SLOT" >> $GITHUB_ENV
           echo "RUN_SLOT decided: $SLOT"
 
-      - name: Run bot (auto locate)
+      - name: Run bot (unbuffered)
         env:
+          # ✅ 핵심: 로그 버퍼링 방지
+          PYTHONUNBUFFERED: "1"
+
           # ✅ WordPress (Secrets)
           WP_BASE_URL: ${{ secrets.WP_BASE_URL }}
           WP_USER: ${{ secrets.WP_USER }}
           WP_APP_PASS: ${{ secrets.WP_APP_PASS }}
 
-          # ✅ Category (고정 4번)
+          # ✅ Category 고정(4번)
           WP_CATEGORY_IDS: "4"
           WP_STATUS: "publish"
 
-          # ✅ Issue settings (속도/품질 기본값)
+          # ✅ Issue settings
           RUN_SLOT: ${{ env.RUN_SLOT }}
           LIMIT: "20"
           WINDOW_HOURS: "12"
@@ -75,36 +87,34 @@ jobs:
           FEEDS_MAX: "100"
           FEED_TIMEOUT: "8"
           MAX_WORKERS: "20"
-
-          # ✅ 로그 보고 싶으면 1
           DEBUG: "1"
 
           # DRY_RUN: "1"
 
-          # (선택) RSS 직접 넣고 싶을 때:
-          # COMMUNITY_FEEDS: ${{ secrets.COMMUNITY_FEEDS }}
-          # NEWS_FEEDS: ${{ secrets.NEWS_FEEDS }}
-          # BLOCKLIST: "daum,net,com,kr,naver,google"
-
         run: |
           set -e
+          echo "RUN_SLOT=${RUN_SLOT}"
+          date
 
-          # 1) 루트에 파일이 있으면 실행
+          # 1) 루트에 있으면 실행
           if [ -f "daily_issue_keywords_to_wp.py" ]; then
-            python daily_issue_keywords_to_wp.py --slot "${RUN_SLOT}"
+            echo "Found: ./daily_issue_keywords_to_wp.py"
+            python -u daily_issue_keywords_to_wp.py --slot "${RUN_SLOT}"
             exit 0
           fi
 
-          # 2) scripts/ 에 있으면 실행
+          # 2) scripts/에 있으면 실행
           if [ -f "scripts/daily_issue_keywords_to_wp.py" ]; then
-            python scripts/daily_issue_keywords_to_wp.py --slot "${RUN_SLOT}"
+            echo "Found: ./scripts/daily_issue_keywords_to_wp.py"
+            python -u scripts/daily_issue_keywords_to_wp.py --slot "${RUN_SLOT}"
             exit 0
           fi
 
           # 3) 그래도 없으면 찾아서 실행
           TARGET=$(find . -maxdepth 5 -type f -name "daily_issue_keywords_to_wp.py" | head -n 1)
           if [ -n "$TARGET" ]; then
-            python "$TARGET" --slot "${RUN_SLOT}"
+            echo "Found by search: $TARGET"
+            python -u "$TARGET" --slot "${RUN_SLOT}"
             exit 0
           fi
 
