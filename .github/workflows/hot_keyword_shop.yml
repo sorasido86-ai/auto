@@ -1,13 +1,18 @@
-name: Hot Keywords -> Naver Shop 추천 -> WordPress (AM/PM)
+name: Hot Keyword -> Naver Shop -> WP (AM/PM)
 
 on:
-  schedule:
-    - cron: "0 0,9 * * *"   # 00:00 UTC(09:00 KST), 09:00 UTC(18:00 KST)
   workflow_dispatch:
+  schedule:
+    - cron: "5 0 * * *"   # 09:05 KST
+    - cron: "5 6 * * *"   # 15:05 KST
+
+permissions:
+  contents: read
 
 jobs:
   run:
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -22,57 +27,55 @@ jobs:
           python -m pip install --upgrade pip
           pip install requests
 
-      - name: Cache sqlite
-        uses: actions/cache@v4
-        with:
-          path: data
-          key: hot-keyword-shop-sqlite-${{ runner.os }}-${{ github.ref_name }}
-          restore-keys: |
-            hot-keyword-shop-sqlite-${{ runner.os }}-
-
-      - name: Decide RUN_SLOT (am/pm)
+      - name: Set RUN_SLOT (am/pm)
         shell: bash
         run: |
-          HOUR_UTC=$(date -u +%H)
-          echo "UTC hour=$HOUR_UTC"
-          if [ "$HOUR_UTC" = "00" ]; then
-            echo "RUN_SLOT=am" >> $GITHUB_ENV
+          # github.event.schedule 값으로 어떤 cron이 트리거됐는지 판별
+          if [ "${{ github.event_name }}" = "schedule" ]; then
+            if [ "${{ github.event.schedule }}" = "5 0 * * *" ]; then
+              echo "RUN_SLOT=am" >> $GITHUB_ENV
+            else
+              echo "RUN_SLOT=pm" >> $GITHUB_ENV
+            fi
           else
-            echo "RUN_SLOT=pm" >> $GITHUB_ENV
+            # 수동 실행(workflow_dispatch) 기본 am (원하면 Actions UI에서 env로 override 가능)
+            echo "RUN_SLOT=am" >> $GITHUB_ENV
           fi
+
+      - name: Restore SQLite cache
+        uses: actions/cache@v4
+        with:
+          path: data/hot_keyword_naver_shop.sqlite3
+          key: hotkw-${{ runner.os }}-${{ github.run_id }}
+          restore-keys: |
+            hotkw-${{ runner.os }}-
+
+      - name: Sanity check file
+        run: |
+          ls -la
+          test -f hot_keyword_naver_shop_to_wp.py
 
       - name: Run bot
         env:
-          # ✅ WP Secrets
+          # ✅ 네이버 (너가 쓰는 이름)
+          XNAVERCLIENT_ID: ${{ secrets.XNAVERCLIENT_ID }}
+          XNAVERCLIENT_SECRET: ${{ secrets.XNAVERCLIENT_SECRET }}
+
+          # ✅ 워드프레스 (너가 쓰는 이름)
           WP_BASE_URL: ${{ secrets.WP_BASE_URL }}
           WP_USER: ${{ secrets.WP_USER }}
           WP_APP_PASS: ${{ secrets.WP_APP_PASS }}
 
-          # ✅ 네가 쓰는 네이버 키 이름
-          XNAVERCLIENT_ID: ${{ secrets.XNAVERCLIENT_ID }}
-          XNAVERCLIENT_SECRET: ${{ secrets.XNAVERCLIENT_SECRET }}
-
-          # (선택) 일반 이름도 같이 두면 편함
-          NAVER_CLIENT_ID: ${{ secrets.NAVER_CLIENT_ID }}
-          NAVER_CLIENT_SECRET: ${{ secrets.NAVER_CLIENT_SECRET }}
-
-          # ✅ 카테고리 31번
+          # 옵션(원하면 Secrets 말고 여기서 고정도 가능)
           WP_CATEGORY_IDS: "31"
-
-          # 실행 슬롯
-          RUN_SLOT: ${{ env.RUN_SLOT }}
-
-          # 수집 설정
-          GOOGLE_TRENDS_GEO: "KR"
           HOT_KEYWORDS_LIMIT: "20"
-          PRODUCTS_PER_KEYWORD: "5"
+          NAVER_PER_KEYWORD: "5"
+          TRENDS_GEO: "KR"
           NAVER_SORT: "sim"
 
-          SQLITE_PATH: "data/hot_keyword_shop.sqlite3"
-
+          # 디버그 옵션
           DEBUG: "0"
           DRY_RUN: "0"
         run: |
-          set -e
-          ls -la
-          python hot_keyword_naver_shop_to_wp.py
+          echo "RUN_SLOT=$RUN_SLOT"
+          python hot_keyword_naver_shop_to_wp.py --debug
