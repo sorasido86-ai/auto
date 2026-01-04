@@ -623,7 +623,7 @@ def build_post_html(date_str: str, slot: str, geo: str, items: List[Dict[str, An
     slot_label = "오전" if slot == "am" else "오후"
     disclosure = (
         '<p style="padding:10px;border-left:4px solid #111;background:#f7f7f7;">'
-        "※ 이 포스팅은 제휴마케팅 활동의 일환으로, 이에 따른 일정액의 수수료를 제공받을 수 있습니다."
+        "※ 이 포스팅은 자료모으는 용도입니다."
         "</p>"
     )
     head = f"<p>기준일: <b>{htmlmod.escape(date_str)}</b> / 슬롯: <b>{slot_label}</b> / 지역: <b>{htmlmod.escape(geo)}</b></p>"
