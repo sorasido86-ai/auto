@@ -1,10 +1,17 @@
 # -*- coding: utf-8 -*-
 """
-naver_fashion_daily_to_wp.py (통합코드)
+naver_fashion_daily_to_wp.py (완전 통합)
 - 네이버 쇼핑 검색 API로 남/여 의류 TOP20 수집
 - SQLite 누적 저장(월간 결산용)
 - 워드프레스 REST API로 데일리 포스트 생성/업데이트
-- GitHub Actions에서 bot_config.json 없이 환경변수(Secrets)로 실행 가능
+- GitHub Actions에서 bot_config.json 없이 Secrets(환경변수)로 실행 가능
+
+✅ 너의 Secrets 이름 그대로 사용:
+  - WP_BASE_URL
+  - WP_USER
+  - WP_APP_PASS
+
+(호환용 fallback도 포함)
 """
 
 from __future__ import annotations
@@ -82,22 +89,19 @@ def _env(name: str, default: str = "") -> str:
 def cfg_from_env() -> AppConfig:
     """
     GitHub Actions(Secrets → env)용
-    필수 env:
+    ✅ 너의 Secrets 이름:
       NAVER_CLIENT_ID, NAVER_CLIENT_SECRET
-      WP_SITE_URL, WP_USERNAME, WP_APP_PASSWORD
-    선택 env:
-      NAVER_WOMEN_QUERY, NAVER_MEN_QUERY
-      NAVER_SORT, NAVER_EXCLUDE, NAVER_FILTER, NAVER_DISPLAY
-      WP_STATUS
-      SQLITE_PATH
-      DRY_RUN=1, DEBUG=1
+      WP_BASE_URL, WP_USER, WP_APP_PASS
+
+    (호환용 fallback도 포함: WP_SITE_URL/WP_USERNAME/WP_APP_PASSWORD)
     """
     naver_client_id = _env("NAVER_CLIENT_ID")
     naver_client_secret = _env("NAVER_CLIENT_SECRET")
 
-    wp_site_url = _env("WP_SITE_URL").rstrip("/")
-    wp_username = _env("WP_USERNAME")
-    wp_app_password = _env("WP_APP_PASSWORD")
+    # ✅ 너의 Secrets 이름 우선
+    wp_site_url = (_env("WP_BASE_URL") or _env("WP_SITE_URL")).rstrip("/")
+    wp_username = _env("WP_USER") or _env("WP_USERNAME")
+    wp_app_password = _env("WP_APP_PASS") or _env("WP_APP_PASSWORD")
 
     display = int(_env("NAVER_DISPLAY", "20") or "20")
     sort = _env("NAVER_SORT", "sim") or "sim"
@@ -199,15 +203,17 @@ def load_config_auto(cli_config_path: Optional[str] = None) -> AppConfig:
 def validate_cfg(cfg: AppConfig) -> None:
     missing = []
     if not cfg.naver.client_id:
-        missing.append("NAVER_CLIENT_ID (or bot_config.json naver.client_id)")
+        missing.append("NAVER_CLIENT_ID")
     if not cfg.naver.client_secret:
-        missing.append("NAVER_CLIENT_SECRET (or bot_config.json naver.client_secret)")
+        missing.append("NAVER_CLIENT_SECRET")
+
+    # ✅ 너의 Secrets 이름으로 안내
     if not cfg.wordpress.site_url:
-        missing.append("WP_SITE_URL (or bot_config.json wordpress.site_url)")
+        missing.append("WP_BASE_URL (또는 WP_SITE_URL / bot_config.json wordpress.site_url)")
     if not cfg.wordpress.username:
-        missing.append("WP_USERNAME (or bot_config.json wordpress.username)")
+        missing.append("WP_USER (또는 WP_USERNAME / bot_config.json wordpress.username)")
     if not cfg.wordpress.app_password:
-        missing.append("WP_APP_PASSWORD (or bot_config.json wordpress.app_password)")
+        missing.append("WP_APP_PASS (또는 WP_APP_PASSWORD / bot_config.json wordpress.app_password)")
 
     if missing:
         raise RuntimeError("필수 설정 누락:\n- " + "\n- ".join(missing))
@@ -219,9 +225,9 @@ def print_safe_settings(cfg: AppConfig) -> None:
 
     print("[CONFIG] NAVER_CLIENT_ID:", ok(cfg.naver.client_id))
     print("[CONFIG] NAVER_CLIENT_SECRET:", ok(cfg.naver.client_secret))
-    print("[CONFIG] WP_SITE_URL:", cfg.wordpress.site_url or "MISSING")
-    print("[CONFIG] WP_USERNAME:", ok(cfg.wordpress.username))
-    print("[CONFIG] WP_APP_PASSWORD:", ok(cfg.wordpress.app_password))
+    print("[CONFIG] WP_BASE_URL:", cfg.wordpress.site_url or "MISSING")
+    print("[CONFIG] WP_USER:", ok(cfg.wordpress.username))
+    print("[CONFIG] WP_APP_PASS:", ok(cfg.wordpress.app_password))
     print("[CONFIG] queries:", cfg.naver.queries)
     print("[CONFIG] sort:", cfg.naver.sort, "display:", cfg.naver.display)
     print("[CONFIG] sqlite:", cfg.storage.sqlite_path)
@@ -254,7 +260,6 @@ def naver_shop_search(session: requests.Session, cfg: NaverConfig, query: str) -
         params["exclude"] = cfg.exclude
 
     r = session.get(NAVER_SHOP_ENDPOINT, headers=headers, params=params, timeout=25)
-    # 실패 시 본문 일부를 같이 보여주면 Actions에서 원인 확인 쉬움
     if r.status_code != 200:
         raise RuntimeError(f"Naver API failed: {r.status_code} body={r.text[:300]}")
     data = r.json()
@@ -377,10 +382,6 @@ def wp_create_post(cfg: WordPressConfig, title: str, html: str) -> Tuple[int, st
     endpoint = cfg.site_url.rstrip("/") + "/wp-json/wp/v2/posts"
     headers = {**wp_auth_header(cfg.username, cfg.app_password), "Content-Type": "application/json"}
     payload: Dict[str, Any] = {"title": title, "content": html, "status": cfg.status}
-    if cfg.category_ids:
-        payload["categories"] = cfg.category_ids
-    if cfg.tag_ids:
-        payload["tags"] = cfg.tag_ids
 
     r = requests.post(endpoint, headers=headers, json=payload, timeout=30)
     if r.status_code not in (200, 201):
@@ -393,10 +394,6 @@ def wp_update_post(cfg: WordPressConfig, post_id: int, title: str, html: str) ->
     endpoint = cfg.site_url.rstrip("/") + f"/wp-json/wp/v2/posts/{post_id}"
     headers = {**wp_auth_header(cfg.username, cfg.app_password), "Content-Type": "application/json"}
     payload: Dict[str, Any] = {"title": title, "content": html, "status": cfg.status}
-    if cfg.category_ids:
-        payload["categories"] = cfg.category_ids
-    if cfg.tag_ids:
-        payload["tags"] = cfg.tag_ids
 
     r = requests.post(endpoint, headers=headers, json=payload, timeout=30)
     if r.status_code not in (200, 201):
@@ -487,17 +484,15 @@ def debug_test_naver(cfg: AppConfig) -> None:
 def debug_test_wp(cfg: AppConfig) -> None:
     print("[DEBUG] Testing WordPress REST...")
     site = cfg.wordpress.site_url.rstrip("/")
-    # 1) REST 살아있는지
     r = requests.get(site + "/wp-json/", timeout=20)
     print("[DEBUG] wp-json status:", r.status_code)
 
-    # 2) 인증 되는지
     headers = wp_auth_header(cfg.wordpress.username, cfg.wordpress.app_password)
     r2 = requests.get(site + "/wp-json/wp/v2/users/me", headers=headers, timeout=20)
     print("[DEBUG] users/me status:", r2.status_code)
     if r2.status_code != 200:
         print("[DEBUG] users/me body head:", r2.text[:300])
-        raise RuntimeError("WordPress 인증 실패(401/403 가능). username/app_password 또는 보안플러그인 REST 차단 확인 필요.")
+        raise RuntimeError("WordPress 인증 실패(401/403 가능). WP_USER/WP_APP_PASS 또는 REST 차단(보안플러그인) 확인 필요.")
     print("[DEBUG] WordPress auth OK.")
 
 
@@ -564,7 +559,6 @@ def main():
     args = parse_args(sys.argv[1:])
     cfg = load_config_auto(args["config"])
 
-    # CLI 옵션이 env/file보다 우선
     if args["dry_run"]:
         cfg.run.dry_run = True
     if args["debug"]:
