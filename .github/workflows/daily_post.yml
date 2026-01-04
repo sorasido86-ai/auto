@@ -3,15 +3,15 @@ name: run-daily-post
 on:
   workflow_dispatch:
   schedule:
-    - cron: "2-59/5 * * * *"   # 5분마다 테스트(UTC 기준). 00분 혼잡 피하려고 2분부터 시작
+    - cron: "*/5 * * * *"  # 테스트용: 5분마다 (GitHub는 약간 지연될 수 있음)
+
+concurrency:
+  group: run-daily-post
+  cancel-in-progress: true
 
 jobs:
   post:
     runs-on: ubuntu-latest
-    concurrency:
-      group: run-daily-post
-      cancel-in-progress: true
-
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -24,20 +24,18 @@ jobs:
       - name: Install deps
         run: |
           python -m pip install --upgrade pip
-          pip install requests beautifulsoup4 lxml feedparser
+          pip install -r requirements.txt
 
       - name: Create bot_config.json from Secrets
         env:
           WP_BASE_URL: ${{ secrets.WP_BASE_URL }}
           WP_USER: ${{ secrets.WP_USER }}
           WP_APP_PASS: ${{ secrets.WP_APP_PASS }}
-          KAKAO_REST_KEY: ${{ secrets.KAKAO_REST_KEY }}
-          KAKAO_REFRESH_TOKEN: ${{ secrets.KAKAO_REFRESH_TOKEN }}
         run: |
           python - <<'PY'
           import os, json, sys
-          required = ["WP_BASE_URL", "WP_USER", "WP_APP_PASS"]
-          missing = [k for k in required if not os.getenv(k)]
+          req = ["WP_BASE_URL","WP_USER","WP_APP_PASS"]
+          missing = [k for k in req if not os.getenv(k)]
           if missing:
             sys.exit("Missing secrets: " + ", ".join(missing))
 
@@ -46,22 +44,15 @@ jobs:
             "wp_user": os.environ["WP_USER"],
             "wp_app_pass": os.environ["WP_APP_PASS"],
           }
-
-          if os.getenv("KAKAO_REST_KEY") and os.getenv("KAKAO_REFRESH_TOKEN"):
-            cfg["kakao_rest_key"] = os.environ["KAKAO_REST_KEY"]
-            cfg["kakao_refresh_token"] = os.environ["KAKAO_REFRESH_TOKEN"]
-
           with open("bot_config.json","w",encoding="utf-8") as f:
             json.dump(cfg,f,ensure_ascii=False,indent=2)
-
           print("bot_config.json written")
           PY
 
       - name: Run
         env:
           TZ: Asia/Seoul
-          TEST_MODE: "1"
-          RUN_TAG: ${{ github.run_id }}
-          WP_STATUS: "draft"
+          TEST_MODE: "1"      # ✅ 테스트: 매번 새 글 만들기(슬러그/제목에 run_id 붙음)
+          WP_STATUS: "publish" # 원하면 draft로 바꾸면 관리자에서만 보임
         run: |
           python -u daily_post.py
