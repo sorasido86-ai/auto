@@ -1,12 +1,10 @@
 # -*- coding: utf-8 -*-
 """
-naver_fashion_daily_to_wp.py
-- 네이버 쇼핑 검색 API로 남/여 의류 검색 상단 TOP20을 매일 수집
-- SQLite에 날짜별 랭킹 누적 저장
-- 워드프레스 REST API로 데일리 포스트 발행(이미 발행된 날짜면 업데이트)
-
-필요:
-  pip install requests
+naver_fashion_daily_to_wp.py (통합코드)
+- 네이버 쇼핑 검색 API로 남/여 의류 TOP20 수집
+- SQLite 누적 저장(월간 결산용)
+- 워드프레스 REST API로 데일리 포스트 생성/업데이트
+- GitHub Actions에서 bot_config.json 없이 환경변수(Secrets)로 실행 가능
 """
 
 from __future__ import annotations
@@ -14,15 +12,16 @@ from __future__ import annotations
 import base64
 import html as htmlmod
 import json
+import os
 import re
 import sqlite3
 import sys
 from dataclasses import dataclass, field
 from datetime import datetime
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import requests
-from pathlib import Path
 
 
 # -----------------------------
@@ -33,10 +32,11 @@ class NaverConfig:
     client_id: str
     client_secret: str
     display: int = 20
-    sort: str = "sim"              # sim/date/asc/dsc
-    filter: str = ""               # naverpay 등
+    sort: str = "sim"  # sim/date/asc/dsc
+    filter: str = ""
     exclude: str = "used:rental:cbshop"
     queries: Dict[str, str] = field(default_factory=lambda: {"women": "여성의류", "men": "남성의류"})
+
 
 @dataclass
 class WordPressConfig:
@@ -47,19 +47,24 @@ class WordPressConfig:
     category_ids: List[int] = field(default_factory=list)
     tag_ids: List[int] = field(default_factory=list)
 
+
 @dataclass
 class PostConfig:
     title_template: str = "{date} 네이버 쇼핑 남성/여성 의류 TOP20 (데일리)"
     disclosure: str = "※ 이 포스팅은 제휴마케팅 활동의 일환으로, 이에 따른 일정액의 수수료를 제공받을 수 있습니다."
-    note: str = "데이터 출처: 네이버 쇼핑 검색 API(정렬 기준: sim)."
+    note: str = "데이터 출처: 네이버 쇼핑 검색 API(정렬 기준: {sort})."
+
 
 @dataclass
 class StorageConfig:
-    sqlite_path: str = "naver_fashion_rankings.sqlite3"
+    sqlite_path: str = "data/naver_fashion_rankings.sqlite3"
+
 
 @dataclass
 class RunConfig:
     dry_run: bool = False
+    debug: bool = False
+
 
 @dataclass
 class AppConfig:
@@ -70,7 +75,69 @@ class AppConfig:
     run: RunConfig
 
 
-def load_config(path: str) -> AppConfig:
+def _env(name: str, default: str = "") -> str:
+    return str(os.getenv(name, default) or "").strip()
+
+
+def cfg_from_env() -> AppConfig:
+    """
+    GitHub Actions(Secrets → env)용
+    필수 env:
+      NAVER_CLIENT_ID, NAVER_CLIENT_SECRET
+      WP_SITE_URL, WP_USERNAME, WP_APP_PASSWORD
+    선택 env:
+      NAVER_WOMEN_QUERY, NAVER_MEN_QUERY
+      NAVER_SORT, NAVER_EXCLUDE, NAVER_FILTER, NAVER_DISPLAY
+      WP_STATUS
+      SQLITE_PATH
+      DRY_RUN=1, DEBUG=1
+    """
+    naver_client_id = _env("NAVER_CLIENT_ID")
+    naver_client_secret = _env("NAVER_CLIENT_SECRET")
+
+    wp_site_url = _env("WP_SITE_URL").rstrip("/")
+    wp_username = _env("WP_USERNAME")
+    wp_app_password = _env("WP_APP_PASSWORD")
+
+    display = int(_env("NAVER_DISPLAY", "20") or "20")
+    sort = _env("NAVER_SORT", "sim") or "sim"
+    exclude = _env("NAVER_EXCLUDE", "used:rental:cbshop")
+    filt = _env("NAVER_FILTER", "")
+
+    women_q = _env("NAVER_WOMEN_QUERY", "여성의류") or "여성의류"
+    men_q = _env("NAVER_MEN_QUERY", "남성의류") or "남성의류"
+
+    sqlite_path = _env("SQLITE_PATH", "data/naver_fashion_rankings.sqlite3")
+    wp_status = _env("WP_STATUS", "publish") or "publish"
+
+    dry_run = _env("DRY_RUN", "0") in ("1", "true", "True", "YES", "yes")
+    debug = _env("DEBUG", "0") in ("1", "true", "True", "YES", "yes")
+
+    return AppConfig(
+        naver=NaverConfig(
+            client_id=naver_client_id,
+            client_secret=naver_client_secret,
+            display=display,
+            sort=sort,
+            filter=filt,
+            exclude=exclude,
+            queries={"women": women_q, "men": men_q},
+        ),
+        wordpress=WordPressConfig(
+            site_url=wp_site_url,
+            username=wp_username,
+            app_password=wp_app_password,
+            status=wp_status,
+            category_ids=[],
+            tag_ids=[],
+        ),
+        post=PostConfig(),
+        storage=StorageConfig(sqlite_path=sqlite_path),
+        run=RunConfig(dry_run=dry_run, debug=debug),
+    )
+
+
+def load_config_from_file(path: str) -> AppConfig:
     with open(path, "r", encoding="utf-8") as f:
         raw = json.load(f)
 
@@ -99,13 +166,66 @@ def load_config(path: str) -> AppConfig:
             tag_ids=w.get("tag_ids", []),
         ),
         post=PostConfig(
-            title_template=p.get("title_template", "{date} 네이버 쇼핑 남성/여성 의류 TOP20 (데일리)"),
-            disclosure=p.get("disclosure", "※ 이 포스팅은 제휴마케팅 활동의 일환으로, 이에 따른 일정액의 수수료를 제공받을 수 있습니다."),
-            note=p.get("note", "데이터 출처: 네이버 쇼핑 검색 API(정렬 기준: sim)."),
+            title_template=p.get("title_template", PostConfig.title_template),
+            disclosure=p.get("disclosure", PostConfig.disclosure),
+            note=p.get("note", PostConfig.note),
         ),
-        storage=StorageConfig(sqlite_path=s.get("sqlite_path", "naver_fashion_rankings.sqlite3")),
-        run=RunConfig(dry_run=bool(r.get("dry_run", False))),
+        storage=StorageConfig(sqlite_path=s.get("sqlite_path", "data/naver_fashion_rankings.sqlite3")),
+        run=RunConfig(
+            dry_run=bool(r.get("dry_run", False)),
+            debug=bool(r.get("debug", False)),
+        ),
     )
+
+
+def load_config_auto(cli_config_path: Optional[str] = None) -> AppConfig:
+    """
+    우선순위:
+    1) CLI로 --config 지정
+    2) 스크립트 폴더에 bot_config.json 있으면 로드
+    3) 환경변수로 구성(GitHub Actions)
+    """
+    if cli_config_path:
+        return load_config_from_file(cli_config_path)
+
+    script_dir = Path(__file__).resolve().parent
+    local_cfg = script_dir / "bot_config.json"
+    if local_cfg.exists():
+        return load_config_from_file(str(local_cfg))
+
+    return cfg_from_env()
+
+
+def validate_cfg(cfg: AppConfig) -> None:
+    missing = []
+    if not cfg.naver.client_id:
+        missing.append("NAVER_CLIENT_ID (or bot_config.json naver.client_id)")
+    if not cfg.naver.client_secret:
+        missing.append("NAVER_CLIENT_SECRET (or bot_config.json naver.client_secret)")
+    if not cfg.wordpress.site_url:
+        missing.append("WP_SITE_URL (or bot_config.json wordpress.site_url)")
+    if not cfg.wordpress.username:
+        missing.append("WP_USERNAME (or bot_config.json wordpress.username)")
+    if not cfg.wordpress.app_password:
+        missing.append("WP_APP_PASSWORD (or bot_config.json wordpress.app_password)")
+
+    if missing:
+        raise RuntimeError("필수 설정 누락:\n- " + "\n- ".join(missing))
+
+
+def print_safe_settings(cfg: AppConfig) -> None:
+    def ok(v: str) -> str:
+        return f"OK(len={len(v)})" if v else "MISSING"
+
+    print("[CONFIG] NAVER_CLIENT_ID:", ok(cfg.naver.client_id))
+    print("[CONFIG] NAVER_CLIENT_SECRET:", ok(cfg.naver.client_secret))
+    print("[CONFIG] WP_SITE_URL:", cfg.wordpress.site_url or "MISSING")
+    print("[CONFIG] WP_USERNAME:", ok(cfg.wordpress.username))
+    print("[CONFIG] WP_APP_PASSWORD:", ok(cfg.wordpress.app_password))
+    print("[CONFIG] queries:", cfg.naver.queries)
+    print("[CONFIG] sort:", cfg.naver.sort, "display:", cfg.naver.display)
+    print("[CONFIG] sqlite:", cfg.storage.sqlite_path)
+    print("[CONFIG] dry_run:", cfg.run.dry_run, "debug:", cfg.run.debug)
 
 
 # -----------------------------
@@ -113,53 +233,54 @@ def load_config(path: str) -> AppConfig:
 # -----------------------------
 NAVER_SHOP_ENDPOINT = "https://openapi.naver.com/v1/search/shop.json"
 
-def naver_shop_search(session: requests.Session, cfg: NaverConfig, query: str) -> List[Dict[str, Any]]:
-    headers = {
-        "X-Naver-Client-Id": cfg.client_id,
-        "X-Naver-Client-Secret": cfg.client_secret,
-        "User-Agent": "Mozilla/5.0 (compatible; naver-fashion-bot/1.0)",
-    }
-    params: Dict[str, Any] = {
-        "query": query,
-        "display": cfg.display,
-        "start": 1,
-        "sort": cfg.sort,
-    }
-    if cfg.filter:
-        params["filter"] = cfg.filter
-    if cfg.exclude:
-        params["exclude"] = cfg.exclude
-
-    resp = session.get(NAVER_SHOP_ENDPOINT, headers=headers, params=params, timeout=20)
-    resp.raise_for_status()
-    data = resp.json()
-    items = data.get("items", [])
-    return items if isinstance(items, list) else []
-
 
 def clean_title(t: str) -> str:
-    # title에 <b>태그가 들어올 수 있어서 제거
     t = htmlmod.unescape(t or "")
     t = re.sub(r"</?b>", "", t)
     t = re.sub(r"\s+", " ", t).strip()
     return t
 
 
+def naver_shop_search(session: requests.Session, cfg: NaverConfig, query: str) -> List[Dict[str, Any]]:
+    headers = {
+        "X-Naver-Client-Id": cfg.client_id,
+        "X-Naver-Client-Secret": cfg.client_secret,
+        "User-Agent": "Mozilla/5.0 (compatible; naver-fashion-bot/1.0)",
+    }
+    params: Dict[str, Any] = {"query": query, "display": cfg.display, "start": 1, "sort": cfg.sort}
+    if cfg.filter:
+        params["filter"] = cfg.filter
+    if cfg.exclude:
+        params["exclude"] = cfg.exclude
+
+    r = session.get(NAVER_SHOP_ENDPOINT, headers=headers, params=params, timeout=25)
+    # 실패 시 본문 일부를 같이 보여주면 Actions에서 원인 확인 쉬움
+    if r.status_code != 200:
+        raise RuntimeError(f"Naver API failed: {r.status_code} body={r.text[:300]}")
+    data = r.json()
+    items = data.get("items", [])
+    return items if isinstance(items, list) else []
+
+
 # -----------------------------
 # Storage (SQLite)
 # -----------------------------
 def init_db(db_path: str) -> None:
+    Path(db_path).parent.mkdir(parents=True, exist_ok=True)
     con = sqlite3.connect(db_path)
     cur = con.cursor()
-    cur.execute("""
+    cur.execute(
+        """
     CREATE TABLE IF NOT EXISTS daily_posts (
       date TEXT PRIMARY KEY,
       wp_post_id INTEGER,
       wp_link TEXT,
       created_at TEXT
     )
-    """)
-    cur.execute("""
+    """
+    )
+    cur.execute(
+        """
     CREATE TABLE IF NOT EXISTS rankings (
       date TEXT,
       gender TEXT,
@@ -178,7 +299,8 @@ def init_db(db_path: str) -> None:
       category4 TEXT,
       PRIMARY KEY (date, gender, rank)
     )
-    """)
+    """
+    )
     con.commit()
     con.close()
 
@@ -189,27 +311,30 @@ def upsert_rankings(db_path: str, date_str: str, gender: str, items: List[Dict[s
 
     for idx, it in enumerate(items, start=1):
         title = clean_title(str(it.get("title", "")))
-        cur.execute("""
+        cur.execute(
+            """
         INSERT OR REPLACE INTO rankings
         (date, gender, rank, product_id, title, link, image, lprice, mall_name, brand, maker, category1, category2, category3, category4)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, (
-            date_str,
-            gender,
-            idx,
-            str(it.get("productId", "")),
-            title,
-            str(it.get("link", "")),
-            str(it.get("image", "")),
-            int(it.get("lprice", 0) or 0),
-            str(it.get("mallName", "")),
-            str(it.get("brand", "")),
-            str(it.get("maker", "")),
-            str(it.get("category1", "")),
-            str(it.get("category2", "")),
-            str(it.get("category3", "")),
-            str(it.get("category4", "")),
-        ))
+        """,
+            (
+                date_str,
+                gender,
+                idx,
+                str(it.get("productId", "")),
+                title,
+                str(it.get("link", "")),
+                str(it.get("image", "")),
+                int(it.get("lprice", 0) or 0),
+                str(it.get("mallName", "")),
+                str(it.get("brand", "")),
+                str(it.get("maker", "")),
+                str(it.get("category1", "")),
+                str(it.get("category2", "")),
+                str(it.get("category3", "")),
+                str(it.get("category4", "")),
+            ),
+        )
 
     con.commit()
     con.close()
@@ -229,10 +354,13 @@ def get_existing_post(db_path: str, date_str: str) -> Optional[Tuple[int, str]]:
 def save_post_meta(db_path: str, date_str: str, wp_post_id: int, wp_link: str) -> None:
     con = sqlite3.connect(db_path)
     cur = con.cursor()
-    cur.execute("""
+    cur.execute(
+        """
     INSERT OR REPLACE INTO daily_posts(date, wp_post_id, wp_link, created_at)
     VALUES (?, ?, ?, ?)
-    """, (date_str, wp_post_id, wp_link, datetime.utcnow().isoformat()))
+    """,
+        (date_str, wp_post_id, wp_link, datetime.utcnow().isoformat()),
+    )
     con.commit()
     con.close()
 
@@ -242,7 +370,7 @@ def save_post_meta(db_path: str, date_str: str, wp_post_id: int, wp_link: str) -
 # -----------------------------
 def wp_auth_header(username: str, app_password: str) -> Dict[str, str]:
     token = base64.b64encode(f"{username}:{app_password}".encode("utf-8")).decode("utf-8")
-    return {"Authorization": f"Basic {token}"}
+    return {"Authorization": f"Basic {token}", "User-Agent": "naver-fashion-bot/1.0"}
 
 
 def wp_create_post(cfg: WordPressConfig, title: str, html: str) -> Tuple[int, str]:
@@ -255,7 +383,8 @@ def wp_create_post(cfg: WordPressConfig, title: str, html: str) -> Tuple[int, st
         payload["tags"] = cfg.tag_ids
 
     r = requests.post(endpoint, headers=headers, json=payload, timeout=30)
-    r.raise_for_status()
+    if r.status_code not in (200, 201):
+        raise RuntimeError(f"WP create failed: {r.status_code} body={r.text[:300]}")
     data = r.json()
     return int(data["id"]), str(data.get("link") or "")
 
@@ -269,9 +398,9 @@ def wp_update_post(cfg: WordPressConfig, post_id: int, title: str, html: str) ->
     if cfg.tag_ids:
         payload["tags"] = cfg.tag_ids
 
-    # WP는 보통 POST로도 업데이트가 동작함(환경에 따라 PUT도 가능)
     r = requests.post(endpoint, headers=headers, json=payload, timeout=30)
-    r.raise_for_status()
+    if r.status_code not in (200, 201):
+        raise RuntimeError(f"WP update failed: {r.status_code} body={r.text[:300]}")
     data = r.json()
     return int(data["id"]), str(data.get("link") or "")
 
@@ -285,6 +414,7 @@ def fmt_krw(n: int) -> str:
     except Exception:
         return str(n)
 
+
 def build_table(title: str, items: List[Dict[str, Any]]) -> str:
     rows = []
     for i, it in enumerate(items, start=1):
@@ -295,16 +425,25 @@ def build_table(title: str, items: List[Dict[str, Any]]) -> str:
         mall = htmlmod.escape(str(it.get("mallName", "")))
 
         img_html = f'<img src="{img}" alt="{htmlmod.escape(name)}" style="width:72px;height:auto;border-radius:10px;">' if img else ""
-        name_html = f'<a href="{link}" target="_blank" rel="nofollow sponsored noopener">{htmlmod.escape(name)}</a>' if link else htmlmod.escape(name)
+        name_html = (
+            f'<a href="{link}" target="_blank" rel="nofollow sponsored noopener">{htmlmod.escape(name)}</a>'
+            if link
+            else htmlmod.escape(name)
+        )
 
-        rows.append(f"""
+        rows.append(
+            f"""
         <tr>
           <td style="padding:8px;border:1px solid #e5e5e5;text-align:center;">{i}</td>
           <td style="padding:8px;border:1px solid #e5e5e5;">{img_html}</td>
-          <td style="padding:8px;border:1px solid #e5e5e5;">{name_html}<div style="font-size:12px;opacity:.75;margin-top:4px;">{mall}</div></td>
+          <td style="padding:8px;border:1px solid #e5e5e5;">
+            {name_html}
+            <div style="font-size:12px;opacity:.75;margin-top:4px;">{mall}</div>
+          </td>
           <td style="padding:8px;border:1px solid #e5e5e5;text-align:right;">{fmt_krw(lprice)}</td>
         </tr>
-        """)
+        """
+        )
 
     return f"""
     <h2>{htmlmod.escape(title)}</h2>
@@ -323,26 +462,47 @@ def build_table(title: str, items: List[Dict[str, Any]]) -> str:
     </table>
     """
 
+
 def build_post_html(date_str: str, post_cfg: PostConfig, women_items: List[Dict[str, Any]], men_items: List[Dict[str, Any]], sort: str) -> str:
     disclosure = f'<p style="padding:10px;border-left:4px solid #111;background:#f7f7f7;">{htmlmod.escape(post_cfg.disclosure)}</p>'
-    note = f'<p style="font-size:13px;opacity:.8;">{htmlmod.escape(post_cfg.note).replace("sim", sort)}</p>'
     head = f"<p>기준일: <b>{date_str}</b></p>"
+    note = f'<p style="font-size:13px;opacity:.8;">{htmlmod.escape(post_cfg.note.format(sort=sort))}</p>'
 
     women_html = build_table("여성의류 TOP 20", women_items)
     men_html = build_table("남성의류 TOP 20", men_items)
 
-    return f"""
-    {disclosure}
-    {head}
-    {note}
-    {women_html}
-    <hr/>
-    {men_html}
-    """
+    return f"{disclosure}{head}{note}{women_html}<hr/>{men_html}"
 
 
 # -----------------------------
-# Main (Daily)
+# Debug self-test
+# -----------------------------
+def debug_test_naver(cfg: AppConfig) -> None:
+    print("[DEBUG] Testing Naver API...")
+    with requests.Session() as s:
+        items = naver_shop_search(s, cfg.naver, "여성의류")
+    print(f"[DEBUG] Naver OK. items={len(items)}")
+
+
+def debug_test_wp(cfg: AppConfig) -> None:
+    print("[DEBUG] Testing WordPress REST...")
+    site = cfg.wordpress.site_url.rstrip("/")
+    # 1) REST 살아있는지
+    r = requests.get(site + "/wp-json/", timeout=20)
+    print("[DEBUG] wp-json status:", r.status_code)
+
+    # 2) 인증 되는지
+    headers = wp_auth_header(cfg.wordpress.username, cfg.wordpress.app_password)
+    r2 = requests.get(site + "/wp-json/wp/v2/users/me", headers=headers, timeout=20)
+    print("[DEBUG] users/me status:", r2.status_code)
+    if r2.status_code != 200:
+        print("[DEBUG] users/me body head:", r2.text[:300])
+        raise RuntimeError("WordPress 인증 실패(401/403 가능). username/app_password 또는 보안플러그인 REST 차단 확인 필요.")
+    print("[DEBUG] WordPress auth OK.")
+
+
+# -----------------------------
+# Main logic
 # -----------------------------
 def run_daily(cfg: AppConfig) -> None:
     date_str = datetime.now().strftime("%Y-%m-%d")
@@ -356,40 +516,74 @@ def run_daily(cfg: AppConfig) -> None:
         women_items = naver_shop_search(session, cfg.naver, women_q)
         men_items = naver_shop_search(session, cfg.naver, men_q)
 
-    # DB 누적
     upsert_rankings(cfg.storage.sqlite_path, date_str, "women", women_items)
     upsert_rankings(cfg.storage.sqlite_path, date_str, "men", men_items)
 
-    # 포스트 HTML
     title = cfg.post.title_template.format(date=date_str)
     html = build_post_html(date_str, cfg.post, women_items, men_items, cfg.naver.sort)
 
     if cfg.run.dry_run:
+        print("[DRY_RUN] Posting skipped. HTML preview below:\n")
         print(html)
         return
 
     existing = get_existing_post(cfg.storage.sqlite_path, date_str)
     if existing:
-        post_id, _ = existing
+        post_id, old_link = existing
         wp_post_id, wp_link = wp_update_post(cfg.wordpress, post_id, title, html)
         save_post_meta(cfg.storage.sqlite_path, date_str, wp_post_id, wp_link)
-        print(f"OK(updated): {wp_post_id} {wp_link}")
+        print(f"OK(updated): {wp_post_id} {wp_link or old_link}")
     else:
         wp_post_id, wp_link = wp_create_post(cfg.wordpress, title, html)
         save_post_meta(cfg.storage.sqlite_path, date_str, wp_post_id, wp_link)
         print(f"OK(created): {wp_post_id} {wp_link}")
 
 
-def main():
-    # 1) 인자 있으면 그걸 쓰고
-    # 2) 없으면 "이 .py 파일이 있는 폴더"의 bot_config.json을 찾음
-    if len(sys.argv) > 1:
-        config_path = sys.argv[1]
-    else:
-        config_path = str(Path(__file__).resolve().parent / "bot_config.json")
+def parse_args(argv: List[str]) -> Dict[str, Any]:
+    out = {"config": None, "dry_run": False, "debug": False}
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a in ("--config", "-c") and i + 1 < len(argv):
+            out["config"] = argv[i + 1]
+            i += 2
+            continue
+        if a == "--dry-run":
+            out["dry_run"] = True
+            i += 1
+            continue
+        if a == "--debug":
+            out["debug"] = True
+            i += 1
+            continue
+        i += 1
+    return out
 
-    cfg = load_config(config_path)
+
+def main():
+    args = parse_args(sys.argv[1:])
+    cfg = load_config_auto(args["config"])
+
+    # CLI 옵션이 env/file보다 우선
+    if args["dry_run"]:
+        cfg.run.dry_run = True
+    if args["debug"]:
+        cfg.run.debug = True
+
+    validate_cfg(cfg)
+    print_safe_settings(cfg)
+
+    if cfg.run.debug:
+        debug_test_naver(cfg)
+        debug_test_wp(cfg)
+
     run_daily(cfg)
 
+
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception:
+        import traceback
+        traceback.print_exc()
+        raise
