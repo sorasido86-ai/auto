@@ -1,32 +1,31 @@
 # -*- coding: utf-8 -*-
 """
-daily_issue_keywords_to_wp.py (완전 통합)
-- Google Trends(geo=KR) 트렌딩 검색어 TOP N 수집 (시드 + 보너스)
-- 커뮤니티/뉴스 RSS에서 최근 WINDOW_HOURS 시간 헤드라인 수집
-- 'net/daum' 같은 플랫폼/도메인 토큰 제거 + 제목 꼬리(매체명) 제거
-- "데일리 이슈 키워드 TOP20" 생성
-- WordPress REST API로 오전/오후(am/pm) 글을 별도 생성(슬러그 분리)
+daily_issue_keywords_to_wp.py (완전 통합/최적화)
+- Google Trends(geo=KR) 트렌딩 검색어 수집(시드/가중치)
+- 커뮤니티/뉴스 RSS 다수 수집 (기본: 커뮤니티 RSS + 구글뉴스 RSS 100개 구성)
+- "net/daum/com/kr" 같은 도메인/플랫폼 토큰 제거 + 제목 꼬리(매체명) 제거
+- 최근 WINDOW_HOURS 시간 기준 "데일리 이슈 키워드 TOP N" 집계
+- WordPress REST API로 오전/오후(am/pm) 글을 별도로 생성/업데이트 (slug 분리)
+- GitHub Actions Secrets(환경변수)만으로 실행
 
-✅ Secrets/환경변수(너가 쓰던 WP 이름 그대로)
+✅ 필수 Secrets(너가 쓰는 이름 그대로)
   - WP_BASE_URL
   - WP_USER
   - WP_APP_PASS
 
 ✅ 고정 카테고리
-  - WP_CATEGORY_IDS="4"   (콤마로 여러개 가능)
+  - WP_CATEGORY_IDS="4"
 
-✅ 스케줄용 슬롯
+✅ 오전/오후 분리
   - RUN_SLOT=am 또는 RUN_SLOT=pm
 
-✅ 옵션
-  - LIMIT=20
+✅ 속도/안정 옵션(권장 기본값)
+  - FEEDS_MAX=100
+  - FEED_TIMEOUT=8
+  - MAX_WORKERS=20
   - WINDOW_HOURS=12
-  - GOOGLE_GEO=KR
-  - COMMUNITY_FEEDS= (줄바꿈으로 RSS URL 나열)
-  - NEWS_FEEDS= (줄바꿈으로 RSS URL 나열)  # 원하면 100개 직접 넣기
-  - FEEDS_MAX=100  # NEWS_FEEDS/COMMUNITY_FEEDS 안주면 기본 뉴스 100개 생성
-  - BLOCKLIST=net,daum,naver,com,kr,... (추가 차단어)
-  - DEBUG=1 / DRY_RUN=1
+  - LIMIT=20
+  - DEBUG=1 (로그 자세히)
 """
 
 from __future__ import annotations
@@ -55,15 +54,19 @@ KST = timezone(timedelta(hours=9))
 def _env(name: str, default: str = "") -> str:
     return str(os.getenv(name, default) or "").strip()
 
+
 def _env_int(name: str, default: int) -> int:
+    s = _env(name, str(default))
     try:
-        return int(_env(name, str(default)) or str(default))
+        return int(s)
     except Exception:
         return default
+
 
 def _env_bool(name: str, default: bool = False) -> bool:
     v = (_env(name, "1" if default else "0")).lower()
     return v in ("1", "true", "yes", "y", "on")
+
 
 def _parse_int_list(s: str) -> List[int]:
     out: List[int] = []
@@ -78,6 +81,27 @@ def _parse_int_list(s: str) -> List[int]:
     return out
 
 
+def _split_lines_env(name: str) -> List[str]:
+    raw = _env(name, "")
+    if not raw:
+        return []
+    feeds = []
+    for line in raw.splitlines():
+        u = line.strip()
+        if not u or u.startswith("#"):
+            continue
+        feeds.append(u)
+    # dedup
+    seen = set()
+    out = []
+    for u in feeds:
+        if u in seen:
+            continue
+        seen.add(u)
+        out.append(u)
+    return out
+
+
 # -----------------------------
 # config
 # -----------------------------
@@ -89,17 +113,19 @@ class WordPressConfig:
     status: str = "publish"
     category_ids: List[int] = field(default_factory=lambda: [4])
 
+
 @dataclass
 class RunConfig:
     limit: int = 20
     window_hours: int = 12
     google_geo: str = "KR"
     feeds_max: int = 100
-    max_workers: int = 14
-    feed_timeout: int = 15
+    max_workers: int = 20
+    feed_timeout: int = 8
     dry_run: bool = False
     debug: bool = False
     slot: str = "am"  # am|pm
+
 
 @dataclass
 class AppConfig:
@@ -116,13 +142,14 @@ def load_cfg() -> AppConfig:
         status=_env("WP_STATUS", "publish") or "publish",
         category_ids=_parse_int_list(_env("WP_CATEGORY_IDS", "4")) or [4],
     )
+
     run = RunConfig(
         limit=_env_int("LIMIT", 20),
         window_hours=_env_int("WINDOW_HOURS", 12),
         google_geo=_env("GOOGLE_GEO", "KR") or "KR",
         feeds_max=_env_int("FEEDS_MAX", 100),
-        max_workers=_env_int("MAX_WORKERS", 14),
-        feed_timeout=_env_int("FEED_TIMEOUT", 15),
+        max_workers=_env_int("MAX_WORKERS", 20),
+        feed_timeout=_env_int("FEED_TIMEOUT", 8),
         dry_run=_env_bool("DRY_RUN", False),
         debug=_env_bool("DEBUG", False),
         slot=(_env("RUN_SLOT", "am") or "am").lower(),
@@ -130,13 +157,15 @@ def load_cfg() -> AppConfig:
     if run.slot not in ("am", "pm"):
         run.slot = "am"
 
-    # 강력 블록리스트(도메인/플랫폼/잡토큰)
+    # 강력 블록리스트(플랫폼/도메인/잡토큰)
     base_block = {
         "net", "com", "co", "kr", "www", "m", "amp",
         "daum", "naver", "google", "youtube", "tiktok", "instagram", "facebook",
-        "twitter", "x", "reddit", "blog", "cafe", "post", "news",
+        "twitter", "reddit", "blog", "cafe", "post", "news",
         "기사", "기자", "단독", "속보", "영상", "사진",
+        "breaking", "exclusive",
     }
+
     extra = set()
     raw = _env("BLOCKLIST", "")
     if raw:
@@ -150,15 +179,20 @@ def load_cfg() -> AppConfig:
 
 def validate_cfg(cfg: AppConfig) -> None:
     missing = []
-    if not cfg.wp.base_url: missing.append("WP_BASE_URL")
-    if not cfg.wp.username: missing.append("WP_USER")
-    if not cfg.wp.app_password: missing.append("WP_APP_PASS")
+    if not cfg.wp.base_url:
+        missing.append("WP_BASE_URL")
+    if not cfg.wp.username:
+        missing.append("WP_USER")
+    if not cfg.wp.app_password:
+        missing.append("WP_APP_PASS")
     if missing:
         raise RuntimeError("필수 설정 누락:\n- " + "\n- ".join(missing))
+
 
 def print_safe(cfg: AppConfig) -> None:
     def ok(v: str) -> str:
         return f"OK(len={len(v)})" if v else "MISSING"
+
     print("[CONFIG] WP_BASE_URL:", cfg.wp.base_url)
     print("[CONFIG] WP_USER:", ok(cfg.wp.username))
     print("[CONFIG] WP_APP_PASS:", ok(cfg.wp.app_password))
@@ -166,6 +200,7 @@ def print_safe(cfg: AppConfig) -> None:
     print("[CONFIG] STATUS:", cfg.wp.status)
     print("[CONFIG] LIMIT:", cfg.run.limit, "WINDOW_HOURS:", cfg.run.window_hours, "SLOT:", cfg.run.slot)
     print("[CONFIG] GEO:", cfg.run.google_geo, "FEEDS_MAX:", cfg.run.feeds_max)
+    print("[CONFIG] TIMEOUT:", cfg.run.feed_timeout, "MAX_WORKERS:", cfg.run.max_workers)
     print("[CONFIG] DRY_RUN:", cfg.run.dry_run, "DEBUG:", cfg.run.debug)
     print("[CONFIG] BLOCKLIST size:", len(cfg.blocklist))
 
@@ -198,68 +233,54 @@ def fetch_google_trends(geo: str, limit: int) -> List[Dict[str, Any]]:
 
 
 # -----------------------------
-# Feeds (community/news)
+# Feed builders
 # -----------------------------
-def _split_lines_env(name: str) -> List[str]:
-    raw = _env(name, "")
-    if not raw:
-        return []
-    feeds = []
-    for line in raw.splitlines():
-        u = line.strip()
-        if not u or u.startswith("#"):
-            continue
-        feeds.append(u)
-    # dedup
-    seen = set()
-    out = []
-    for u in feeds:
-        if u in seen: continue
-        seen.add(u)
-        out.append(u)
-    return out
-
 def google_news_rss_top() -> str:
     return "https://news.google.com/rss?hl=ko&gl=KR&ceid=KR:ko"
+
 
 def google_news_rss_topic(topic: str) -> str:
     return f"https://news.google.com/rss/headlines/section/topic/{topic}?hl=ko&gl=KR&ceid=KR:ko"
 
+
 def google_news_rss_search(q: str) -> str:
     return f"https://news.google.com/rss/search?q={quote_plus(q)}&hl=ko&gl=KR&ceid=KR:ko"
 
+
 def default_news_keywords() -> List[str]:
-    # 너무 일반 단어를 줄이고, 일상적으로 이슈가 되는 키워드를 섞음
+    # 너무 일반어 줄이고, 실제 이슈에 자주 걸리는 키워드
     return [
-        "정치", "국회", "검찰", "법원", "선거",
-        "환율", "금리", "물가", "부동산", "코스피", "비트코인",
+        "선거", "국회", "검찰", "법원", "대통령",
+        "환율", "금리", "물가", "부동산", "전세", "코스피", "비트코인",
         "삼성전자", "네이버", "카카오", "테슬라", "엔비디아",
-        "AI", "반도체", "전기차", "배터리",
+        "AI", "반도체", "전기차", "배터리", "로봇",
         "사고", "화재", "산불", "지진", "태풍",
         "독감", "백신", "의료",
         "축구", "야구", "손흥민",
         "드라마", "영화", "넷플릭스", "K팝",
+        "해킹", "개인정보", "보안",
     ]
+
 
 def build_default_news_feeds(max_n: int) -> List[str]:
     urls: List[str] = [google_news_rss_top()]
-    for t in ["WORLD","NATION","BUSINESS","TECHNOLOGY","ENTERTAINMENT","SCIENCE","SPORTS","HEALTH"]:
+    for t in ["WORLD", "NATION", "BUSINESS", "TECHNOLOGY", "ENTERTAINMENT", "SCIENCE", "SPORTS", "HEALTH"]:
         urls.append(google_news_rss_topic(t))
     for kw in default_news_keywords():
         urls.append(google_news_rss_search(kw))
 
-    # dedup + fill until max_n
     seen = set()
     out: List[str] = []
     for u in urls:
-        if u in seen: continue
+        if u in seen:
+            continue
         seen.add(u)
         out.append(u)
         if len(out) >= max_n:
             break
 
-    # 부족하면 검색 키워드에 “속보/긴급”류로 채움(그래도 블록리스트로 매체 꼬리 제거됨)
-    filler = ["속보", "긴급", "논란", "사망", "구속", "파면", "사퇴", "폭설", "홍수", "정전"]
+    # 부족분 채우기
+    filler = ["논란", "구속", "사퇴", "파면", "폭설", "홍수", "정전", "사망", "실종", "감염"]
     i = 0
     while len(out) < max_n:
         u = google_news_rss_search(filler[i % len(filler)])
@@ -269,9 +290,10 @@ def build_default_news_feeds(max_n: int) -> List[str]:
         i += 1
     return out
 
+
 def default_community_feeds() -> List[str]:
-    # “커뮤니티”는 RSS 제공이 되는 곳만 기본으로 넣음(안 되는 곳은 사용자가 COMMUNITY_FEEDS로 추가)
-    # Reddit는 .rss가 안정적이라 기본 탑재
+    # RSS가 안정적으로 있는 커뮤니티(기본)
+    # 한국 커뮤니티는 RSS가 없는 곳이 많아, 가능한 곳은 COMMUNITY_FEEDS로 추가하는 방식 권장
     return [
         "https://www.reddit.com/r/korea/.rss",
         "https://www.reddit.com/r/southkorea/.rss",
@@ -279,6 +301,32 @@ def default_community_feeds() -> List[str]:
     ]
 
 
+def build_feed_list(cfg: AppConfig) -> List[str]:
+    community = _split_lines_env("COMMUNITY_FEEDS")
+    if not community:
+        community = default_community_feeds()
+
+    news = _split_lines_env("NEWS_FEEDS")
+    if not news:
+        news = build_default_news_feeds(cfg.run.feeds_max)
+
+    urls = community + news
+    seen = set()
+    out = []
+    for u in urls:
+        u = u.strip()
+        if not u:
+            continue
+        if u in seen:
+            continue
+        seen.add(u)
+        out.append(u)
+    return out
+
+
+# -----------------------------
+# RSS fetching (최적화 포함)
+# -----------------------------
 @dataclass
 class FeedItem:
     title: str
@@ -299,13 +347,32 @@ def _entry_dt(e: Any) -> Optional[datetime]:
 
 
 def fetch_feed(session: requests.Session, url: str, timeout: int) -> Tuple[str, List[FeedItem], Optional[str]]:
+    """
+    ✅ 빠른 실패 처리:
+      - HEAD를 짧게(3초) 시도해 '완전 죽은' URL을 빠르게 컷
+      - HEAD가 405(미지원)면 그냥 GET 진행
+      - GET은 FEED_TIMEOUT 적용
+    """
     try:
+        # 짧은 HEAD 체크(타임아웃만 걸면 컷)
+        try:
+            h = session.head(url, timeout=3, allow_redirects=True, headers={"User-Agent": "daily-issue-bot/1.0"})
+            if h.status_code == 405:
+                pass  # HEAD 미지원 → GET 진행
+        except requests.exceptions.Timeout:
+            return url, [], "HEAD timeout"
+        except requests.exceptions.RequestException:
+            # 연결 오류는 컷(느린/죽은 피드 가능성)
+            return url, [], "HEAD failed"
+
         r = session.get(url, timeout=timeout, headers={"User-Agent": "daily-issue-bot/1.0"})
         if r.status_code != 200:
             return url, [], f"HTTP {r.status_code}"
+
         parsed = feedparser.parse(r.content)
         src = (parsed.feed.get("title") or "").strip() or re.sub(r"^https?://", "", url).split("/")[0]
         now = datetime.now(KST)
+
         items: List[FeedItem] = []
         for e in parsed.entries[:40]:
             t = (getattr(e, "title", "") or "").strip()
@@ -315,6 +382,7 @@ def fetch_feed(session: requests.Session, url: str, timeout: int) -> Tuple[str, 
             dt = _entry_dt(e) or now
             items.append(FeedItem(title=t, link=link, source=src, published=dt))
         return url, items, None
+
     except Exception as ex:
         return url, [], f"{type(ex).__name__}: {ex}"
 
@@ -322,44 +390,64 @@ def fetch_feed(session: requests.Session, url: str, timeout: int) -> Tuple[str, 
 def fetch_all(cfg: AppConfig, urls: List[str]) -> Tuple[List[FeedItem], Dict[str, str]]:
     errors: Dict[str, str] = {}
     items: List[FeedItem] = []
+
+    t0 = datetime.now(KST)
+    total = len(urls)
+    print(f"[FETCH] start feeds={total} workers={cfg.run.max_workers} timeout={cfg.run.feed_timeout}s")
+
     with requests.Session() as session:
         with ThreadPoolExecutor(max_workers=cfg.run.max_workers) as ex:
             futs = [ex.submit(fetch_feed, session, u, cfg.run.feed_timeout) for u in urls]
+            done = 0
+
             for f in as_completed(futs):
                 u, got, err = f.result()
+                done += 1
+
+                # 진행 로그(10개마다)
+                if cfg.run.debug or done % 10 == 0:
+                    print(f"[FETCH] {done}/{total} got={len(got)} err={'Y' if err else 'N'}")
+
                 if err:
                     errors[u] = err
                 else:
                     items.extend(got)
+
+    t1 = datetime.now(KST)
+    print(f"[FETCH] done in {(t1 - t0).total_seconds():.1f}s items={len(items)} errors={len(errors)}")
     return items, errors
 
 
 # -----------------------------
-# Keyword extraction (핵심 개선)
+# Keyword extraction (net/daum 제거 강화 + 꼬리 제거)
 # -----------------------------
 TAIL_PATTERNS = [
-    r"\s+[-–—]\s+[^-–—]{1,20}$",         # "제목 - 매체명" 꼬리
-    r"\s+\|\s+[^|]{1,20}$",              # "제목 | 매체명"
-    r"\s+:\s*네이버\s*뉴스$",            # "... : 네이버 뉴스"
-    r"\s+:\s*Daum$",                     # "... : Daum"
+    r"\s+[-–—]\s+[^-–—]{1,30}$",           # "제목 - 매체명"
+    r"\s+\|\s+[^|]{1,30}$",                # "제목 | 매체명"
+    r"\s+:\s*네이버\s*뉴스$",              # "... : 네이버 뉴스"
+    r"\s+:\s*Daum$",                       # "... : Daum"
+    r"\s+\(\s*네이버\s*뉴스\s*\)\s*$",
+    r"\s+\(\s*다음\s*\)\s*$",
 ]
+
 
 def normalize_title(title: str) -> str:
     t = htmlmod.unescape(title or "").strip()
     t = re.sub(r"\s+", " ", t)
-    # 꼬리 제거(매체/플랫폼)
     for pat in TAIL_PATTERNS:
         t = re.sub(pat, "", t, flags=re.IGNORECASE)
     t = re.sub(r"\s+", " ", t).strip()
     return t
 
+
 def is_domainy(tok: str) -> bool:
-    # 도메인처럼 생긴 토큰 제거
+    # 도메인/URL 조각 제거
     if "." in tok:
         return True
     if re.fullmatch(r"(co|com|net|org|kr|tv|io|me|ai)", tok.lower() or ""):
         return True
     return False
+
 
 def tokenize(cfg: AppConfig, title: str) -> List[str]:
     t = normalize_title(title)
@@ -371,6 +459,7 @@ def tokenize(cfg: AppConfig, title: str) -> List[str]:
         tok = tok.strip()
         if not tok:
             continue
+
         low = tok.lower()
 
         if low in cfg.blocklist:
@@ -378,32 +467,29 @@ def tokenize(cfg: AppConfig, title: str) -> List[str]:
         if is_domainy(low):
             continue
 
-        # 숫자만 토큰은 이슈로 잘 안 쓰이므로 강하게 제한
+        # 숫자만 토큰은 이슈로 약해서 제외
         if re.fullmatch(r"[0-9]{2,}", low):
             continue
 
-        # 너무 짧은 영문(2글자)은 일부만 허용(AI/US/EU 등)
+        # 2글자 영문은 AI/US/EU 정도만 허용
         if re.fullmatch(r"[a-z]{2}", low) and low not in ("ai", "us", "eu"):
             continue
 
         out.append(tok if re.search(r"[가-힣]", tok) else low)
     return out
 
+
 def phrases_from_tokens(tokens: List[str]) -> List[str]:
     # bigram 중심 + unigram 보조
     unigrams = tokens
     bigrams: List[str] = []
     for i in range(len(tokens) - 1):
-        a, b = tokens[i], tokens[i+1]
+        a, b = tokens[i], tokens[i + 1]
         bigrams.append(f"{a} {b}")
-    # bigram 우선(이슈 라벨로 더 자연스러움)
     return bigrams + unigrams
 
-def score_keywords(
-    cfg: AppConfig,
-    items: List[FeedItem],
-    trends: List[str],
-) -> List[Dict[str, Any]]:
+
+def score_keywords(cfg: AppConfig, items: List[FeedItem], trends: List[str]) -> List[Dict[str, Any]]:
     now = datetime.now(KST)
     cutoff = now - timedelta(hours=cfg.run.window_hours)
 
@@ -414,7 +500,6 @@ def score_keywords(
     sources: Dict[str, Set[str]] = {}
     examples: Dict[str, List[FeedItem]] = {}
 
-    # 최근만
     recent = [it for it in items if it.published >= cutoff]
 
     for it in recent:
@@ -422,6 +507,7 @@ def score_keywords(
         if not toks:
             continue
         phs = phrases_from_tokens(toks)
+
         seen = set()
         for ph in phs:
             key = ph.lower().strip()
@@ -429,7 +515,7 @@ def score_keywords(
                 continue
             seen.add(key)
 
-            # 블록리스트가 포함된 phrase 제거(예: "daum 뭔가")
+            # phrase 내부에 블록리스트 포함되면 제거
             bad = False
             for w in key.split():
                 if w.lower() in cfg.blocklist:
@@ -447,52 +533,58 @@ def score_keywords(
     scored: List[Tuple[float, str]] = []
     for k, cnt in counts.items():
         src = len(sources.get(k, set()))
+
+        # 트렌드에 걸린 키워드는 1회라도 남겨주고, 아니면 최소 2회 이상
         if cnt < 2 and k not in trend_set:
             continue
 
-        # 트렌드 보너스(구글에서 실제로 많이 검색된 키워드는 강하게)
+        # 트렌드 보너스(실제 사람들이 검색 중인 키워드를 우선)
         trend_bonus = 0.0
         if k in trend_set:
-            trend_bonus += 6.0
+            trend_bonus += 7.0
         else:
-            # 부분일치(이슈 키워드가 트렌드 키워드를 포함/포함됨)
+            # 부분 매칭 보너스
             for tk in trend_set:
                 if tk and (tk in k or k in tk):
-                    trend_bonus += 2.5
+                    trend_bonus += 3.0
                     break
 
-        score = cnt * 1.0 + max(0, src - 1) * 1.5 + trend_bonus
+        # 점수: 언급수 + 출처 다양성 + 트렌드 보너스
+        score = cnt * 1.0 + max(0, src - 1) * 1.8 + trend_bonus
         scored.append((score, k))
 
     scored.sort(reverse=True, key=lambda x: x[0])
 
-    # 중복 라벨 방지(유사한 것 많이 뜨는 걸 억제)
-    final: List[Dict[str, Any]] = []
-    used: Set[str] = set()
-
+    # 유사 키워드 중복 방지
     def jacc(a: Set[str], b: Set[str]) -> float:
-        if not a or not b: return 0.0
+        if not a or not b:
+            return 0.0
         return len(a & b) / max(1, len(a | b))
+
+    final: List[Dict[str, Any]] = []
+    used: List[Set[str]] = []
 
     for score, k in scored:
         toks = set(k.split())
         dup = False
-        for u in list(used):
-            if jacc(toks, set(u.split())) >= 0.6:
+        for ut in used:
+            if jacc(toks, ut) >= 0.6:
                 dup = True
                 break
         if dup:
             continue
 
-        used.add(k)
-        final.append({
-            "keyword": k,
-            "score": round(score, 2),
-            "mentions": counts.get(k, 0),
-            "sources": len(sources.get(k, set())),
-            "examples": examples.get(k, [])[:3],
-            "is_trend": (k in trend_set),
-        })
+        used.append(toks)
+        final.append(
+            {
+                "keyword": k,
+                "score": round(score, 2),
+                "mentions": counts.get(k, 0),
+                "sources": len(sources.get(k, set())),
+                "examples": examples.get(k, [])[:3],
+                "is_trend": (k in trend_set),
+            }
+        )
         if len(final) >= cfg.run.limit:
             break
 
@@ -506,15 +598,18 @@ def wp_auth_header(user: str, app_pass: str) -> Dict[str, str]:
     token = base64.b64encode(f"{user}:{app_pass}".encode("utf-8")).decode("utf-8")
     return {"Authorization": f"Basic {token}", "User-Agent": "daily-issue-bot/1.0"}
 
+
 def wp_find_post_by_slug(cfg: WordPressConfig, slug: str) -> Optional[Tuple[int, str]]:
     url = cfg.base_url.rstrip("/") + "/wp-json/wp/v2/posts"
-    r = requests.get(url, params={"slug": slug, "per_page": 1}, timeout=25)
+    headers = wp_auth_header(cfg.username, cfg.app_password)
+    r = requests.get(url, headers=headers, params={"slug": slug, "per_page": 1}, timeout=25)
     if r.status_code != 200:
         return None
     arr = r.json()
     if not arr:
         return None
     return int(arr[0]["id"]), str(arr[0].get("link") or "")
+
 
 def wp_create_post(cfg: WordPressConfig, title: str, slug: str, html: str) -> Tuple[int, str]:
     url = cfg.base_url.rstrip("/") + "/wp-json/wp/v2/posts"
@@ -531,6 +626,7 @@ def wp_create_post(cfg: WordPressConfig, title: str, slug: str, html: str) -> Tu
         raise RuntimeError(f"WP create failed: {r.status_code} body={r.text[:400]}")
     data = r.json()
     return int(data["id"]), str(data.get("link") or "")
+
 
 def wp_update_post(cfg: WordPressConfig, post_id: int, title: str, slug: str, html: str) -> Tuple[int, str]:
     url = cfg.base_url.rstrip("/") + f"/wp-json/wp/v2/posts/{post_id}"
@@ -555,8 +651,10 @@ def wp_update_post(cfg: WordPressConfig, post_id: int, title: str, slug: str, ht
 def esc(s: str) -> str:
     return htmlmod.escape(s or "")
 
+
 def slot_label(slot: str) -> str:
     return "오전" if slot == "am" else "오후"
+
 
 def build_html(
     cfg: AppConfig,
@@ -572,15 +670,15 @@ def build_html(
     )
     head = (
         f"<p>기준일: <b>{esc(date_str)}</b> / 구분: <b>{esc(slot_label(cfg.run.slot))}</b><br/>"
-        f"집계범위: 최근 <b>{cfg.run.window_hours}시간</b> / 수집헤드라인: <b>{stats.get('items',0)}</b>개</p>"
+        f"집계범위: 최근 <b>{cfg.run.window_hours}시간</b> / 수집헤드라인: <b>{stats.get('items',0)}</b>개 / "
+        f"피드성공: <b>{stats.get('ok_feeds',0)}</b> / 실패: <b>{stats.get('err_feeds',0)}</b></p>"
     )
 
-    # Trends block
     tr_rows = []
     for i, t in enumerate(trends[:cfg.run.limit], start=1):
-        kw = esc(t.get("keyword",""))
-        link = esc(t.get("link",""))
-        traffic = esc(t.get("traffic",""))
+        kw = esc(t.get("keyword", ""))
+        link = esc(t.get("link", ""))
+        traffic = esc(t.get("traffic", ""))
         kw_html = f'<a href="{link}" target="_blank" rel="nofollow noopener">{kw}</a>' if link else kw
         tr_rows.append(
             f"<tr>"
@@ -589,6 +687,7 @@ def build_html(
             f"<td style='padding:8px;border:1px solid #e5e5e5;text-align:right;white-space:nowrap;'>{traffic}</td>"
             f"</tr>"
         )
+
     trends_html = f"""
     <h2>Google 트렌딩 검색어</h2>
     <table style="border-collapse:collapse;width:100%;font-size:14px;">
@@ -603,7 +702,6 @@ def build_html(
     </table>
     """
 
-    # Keyword block
     rows = []
     for i, k in enumerate(keywords, start=1):
         label = esc(k["keyword"])
@@ -643,43 +741,18 @@ def build_html(
           <th style="padding:8px;border:1px solid #e5e5e5;">대표 링크</th>
         </tr>
       </thead>
-      <tbody>{''.join(rows) if rows else "<tr><td colspan='5' style='padding:8px;border:1px solid #e5e5e5;'>키워드 부족(소스 확대 필요)</td></tr>"}</tbody>
+      <tbody>{''.join(rows) if rows else "<tr><td colspan='5' style='padding:8px;border:1px solid #e5e5e5;'>키워드 부족(피드/커뮤니티 소스 확대 필요)</td></tr>"}</tbody>
     </table>
     """
 
-    return disclosure + head + trends_html + "<hr/>" + kw_html
+    return disclosure + head + trends_html + "<hr/>" + kw_html + "<hr/><p style='font-size:12px;opacity:.7;'>자동 포스팅 봇</p>"
 
 
 # -----------------------------
-# feeds composition
-# -----------------------------
-def build_feed_list(cfg: AppConfig) -> List[str]:
-    community = _split_lines_env("COMMUNITY_FEEDS")
-    if not community:
-        community = default_community_feeds()
-
-    news = _split_lines_env("NEWS_FEEDS")
-    if not news:
-        news = build_default_news_feeds(cfg.run.feeds_max)
-
-    # 합치되 중복 제거
-    urls = community + news
-    seen = set()
-    out = []
-    for u in urls:
-        u = u.strip()
-        if not u: continue
-        if u in seen: continue
-        seen.add(u)
-        out.append(u)
-    return out
-
-
-# -----------------------------
-# args / main
+# Main
 # -----------------------------
 def parse_args(argv: List[str]) -> Dict[str, Any]:
-    out = {"dry_run": False, "debug": False}
+    out = {"dry_run": False, "debug": False, "slot": None}
     i = 0
     while i < len(argv):
         a = argv[i]
@@ -691,16 +764,24 @@ def parse_args(argv: List[str]) -> Dict[str, Any]:
             out["debug"] = True
             i += 1
             continue
+        if a == "--slot" and i + 1 < len(argv):
+            out["slot"] = argv[i + 1].strip().lower()
+            i += 2
+            continue
         i += 1
     return out
+
 
 def main() -> None:
     args = parse_args(sys.argv[1:])
     cfg = load_cfg()
+
     if args["dry_run"]:
         cfg.run.dry_run = True
     if args["debug"]:
         cfg.run.debug = True
+    if args["slot"] in ("am", "pm"):
+        cfg.run.slot = args["slot"]
 
     validate_cfg(cfg)
     print_safe(cfg)
@@ -715,27 +796,30 @@ def main() -> None:
     # 1) Google Trends
     try:
         trends = fetch_google_trends(cfg.run.google_geo, cfg.run.limit)
+        print(f"[TRENDS] ok {len(trends)} items")
     except Exception as ex:
         trends = []
-        if cfg.run.debug:
-            print("[DEBUG] Google Trends error:", ex)
+        print("[TRENDS] failed:", ex)
 
-    trend_keywords = [t.get("keyword","") for t in trends if t.get("keyword")]
+    trend_keywords = [t.get("keyword", "") for t in trends if t.get("keyword")]
 
-    # 2) community/news feeds
+    # 2) feeds
     feeds = build_feed_list(cfg)
+    print(f"[FEEDS] total urls={len(feeds)} (community+news)")
     items, errors = fetch_all(cfg, feeds)
 
-    if cfg.run.debug:
-        print("[DEBUG] feeds:", len(feeds), "items:", len(items), "errors:", len(errors))
-        # 필요하면 에러 일부 확인
-        for u, e in list(errors.items())[:10]:
-            print("[DEBUG] feed error:", u, e)
+    ok_feeds = len(feeds) - len(errors)
+    err_feeds = len(errors)
+    if cfg.run.debug and errors:
+        print("[FEEDS] sample errors:")
+        for u, e in list(errors.items())[:15]:
+            print(" -", u, "=>", e)
 
-    # 3) keyword scoring
+    # 3) scoring
     keywords = score_keywords(cfg, items, trend_keywords)
+    print(f"[SCORE] keywords={len(keywords)}")
 
-    stats = {"items": len(items), "feeds": len(feeds), "errors": len(errors)}
+    stats = {"items": len(items), "ok_feeds": ok_feeds, "err_feeds": err_feeds}
     html = build_html(cfg, date_str, trends, keywords, stats)
 
     if cfg.run.dry_run:
@@ -743,6 +827,7 @@ def main() -> None:
         print(html)
         return
 
+    # 4) WP upsert by slug
     existing = wp_find_post_by_slug(cfg.wp, slug)
     if existing:
         post_id, old_link = existing
@@ -751,6 +836,7 @@ def main() -> None:
     else:
         new_id, new_link = wp_create_post(cfg.wp, title, slug, html)
         print(f"OK(created): {new_id} {new_link}")
+
 
 if __name__ == "__main__":
     try:
