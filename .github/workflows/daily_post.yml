@@ -3,7 +3,7 @@ name: run-daily-post
 on:
   workflow_dispatch:
   schedule:
-    - cron: "2-59/5 * * * *"   # ✅ 테스트: 5분마다 (UTC 기준, 00분 혼잡 회피)
+    - cron: "2-59/5 * * * *"   # 5분마다 테스트(UTC 기준). 00분 혼잡 피하려고 2분부터 시작
 
 jobs:
   post:
@@ -20,12 +20,11 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-          cache: "pip"
 
       - name: Install deps
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          pip install requests beautifulsoup4 lxml feedparser
 
       - name: Create bot_config.json from Secrets
         env:
@@ -37,7 +36,6 @@ jobs:
         run: |
           python - <<'PY'
           import os, json, sys
-
           required = ["WP_BASE_URL", "WP_USER", "WP_APP_PASS"]
           missing = [k for k in required if not os.getenv(k)]
           if missing:
@@ -49,7 +47,6 @@ jobs:
             "wp_app_pass": os.environ["WP_APP_PASS"],
           }
 
-          # 카카오는 선택(Secrets 비워두면 스킵)
           if os.getenv("KAKAO_REST_KEY") and os.getenv("KAKAO_REFRESH_TOKEN"):
             cfg["kakao_rest_key"] = os.environ["KAKAO_REST_KEY"]
             cfg["kakao_refresh_token"] = os.environ["KAKAO_REFRESH_TOKEN"]
@@ -60,12 +57,11 @@ jobs:
           print("bot_config.json written")
           PY
 
-      - name: Run (test mode: new draft every run)
+      - name: Run
         env:
           TZ: Asia/Seoul
           TEST_MODE: "1"
-          RUN_TAG: ${{ github.run_id }}   # ✅ 매 실행마다 고유 값(새 글 생성용)
-          WP_STATUS: "draft"              # ✅ 테스트는 초안으로
+          RUN_TAG: ${{ github.run_id }}
+          WP_STATUS: "draft"
         run: |
-          echo "event=${{ github.event_name }}"
           python -u daily_post.py
