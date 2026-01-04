@@ -1,0 +1,68 @@
+name: Community Hotdeal TOP20 -> WordPress (AM/PM)
+
+on:
+  schedule:
+    - cron: "0 0,9 * * *"   # 00:00 UTC(09:00 KST), 09:00 UTC(18:00 KST)
+  workflow_dispatch:
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests feedparser beautifulsoup4
+
+      - name: Cache sqlite
+        uses: actions/cache@v4
+        with:
+          path: data
+          key: community-hotdeal-sqlite-${{ runner.os }}-${{ github.ref_name }}
+          restore-keys: |
+            community-hotdeal-sqlite-${{ runner.os }}-
+
+      - name: Decide RUN_SLOT (am/pm)
+        shell: bash
+        run: |
+          HOUR_UTC=$(date -u +%H)
+          echo "UTC hour=$HOUR_UTC"
+          if [ "$HOUR_UTC" = "00" ]; then
+            echo "RUN_SLOT=am" >> $GITHUB_ENV
+          else
+            echo "RUN_SLOT=pm" >> $GITHUB_ENV
+          fi
+
+      - name: Run bot
+        env:
+          WP_BASE_URL: ${{ secrets.WP_BASE_URL }}
+          WP_USER: ${{ secrets.WP_USER }}
+          WP_APP_PASS: ${{ secrets.WP_APP_PASS }}
+
+          # ✅ 기본 카테고리 4번 (원하면 여기 숫자만 바꾸면 끝)
+          WP_CATEGORY_IDS: "4"
+
+          # 선택: 태그 ID들(쉼표)
+          # WP_TAG_IDS: "1,2,3"
+
+          RUN_SLOT: ${{ env.RUN_SLOT }}
+          SQLITE_PATH: "data/community_hotdeal.sqlite3"
+
+          # 수집 범위/갯수
+          WINDOW_HOURS: "18"
+          LIMIT: "20"
+
+          # 문제 추적용
+          DEBUG: "0"
+          DRY_RUN: "0"
+        run: |
+          set -e
+          python community_hotdeal_top20_to_wp.py
