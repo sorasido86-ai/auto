@@ -1,20 +1,24 @@
 # -*- coding: utf-8 -*-
 """
-trend_keywords_daily_to_wp.py (통합)
+trend_keywords_daily_to_wp.py (통합, 네이버 안정화)
 - Google Trends Trending RSS(geo=KR)에서 트렌딩 키워드 TOP N 수집
-- Naver DataLab 검색어트렌드 API로 (키워드 후보 풀 내) 전일 대비 상승폭 TOP N 산출
+- Naver DataLab Search Trend API:
+    NAVER_KEYWORD_POOL(후보 키워드) 내에서
+    "전일(어제) vs 전전일" 상대지수 상승폭(delta) 기준 TOP N 산출
+  * DataLab은 실시간이 아니라 집계 지연이 있을 수 있어 '어제 기준'으로 계산해야 안정적
 - WordPress REST API로 데일리 포스트 생성/업데이트 (slug 기준)
+- GitHub Actions Secrets(환경변수)로 실행
 
-✅ WordPress Secrets (그대로)
+✅ WordPress Secrets
   - WP_BASE_URL
   - WP_USER
   - WP_APP_PASS
 
-✅ Naver Secrets (네가 바꾼 이름 그대로)
+✅ Naver Secrets (네가 쓰는 이름 그대로)
   - XNAVERCLIENT_ID
   - XNAVERCLIENT_SECRET
 
-✅ 네이버 랭킹용 키워드 풀(필수)
+✅ 네이버 후보 키워드 풀(필수)
   - NAVER_KEYWORD_POOL: 콤마로 구분된 후보 키워드들
 
 ✅ 카테고리
@@ -25,7 +29,6 @@ from __future__ import annotations
 
 import base64
 import html as htmlmod
-import json
 import os
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -36,6 +39,8 @@ import requests
 import xml.etree.ElementTree as ET
 
 KST = timezone(timedelta(hours=9))
+
+NAVER_DATALAB_ENDPOINT = "https://openapi.naver.com/v1/datalab/search"
 
 
 # -------------------------
@@ -55,6 +60,10 @@ def _env_int(name: str, default: int) -> int:
 
 def now_kst() -> datetime:
     return datetime.now(tz=KST)
+
+
+def _safe_len(s: str) -> str:
+    return f"OK(len={len(s)})" if s else "MISSING"
 
 
 # -------------------------
@@ -83,6 +92,7 @@ class NaverCfg:
     client_secret: str
     keyword_pool: List[str]
     pool_limit: int = 50
+    lookback_days: int = 7  # 어제 기준으로 최근 n일 요청
 
 
 def load_configs() -> Tuple[WPConfig, RunConfig, NaverCfg]:
@@ -101,7 +111,7 @@ def load_configs() -> Tuple[WPConfig, RunConfig, NaverCfg]:
         debug=_env("DEBUG", "0").lower() in ("1", "true", "yes"),
     )
 
-    # ✅ 네가 바꾼 이름 우선
+    # ✅ 네가 쓰는 이름 우선
     naver_id = _env("XNAVERCLIENT_ID") or _env("NAVER_CLIENT_ID")
     naver_secret = _env("XNAVERCLIENT_SECRET") or _env("NAVER_CLIENT_SECRET")
 
@@ -121,6 +131,7 @@ def load_configs() -> Tuple[WPConfig, RunConfig, NaverCfg]:
         client_secret=naver_secret,
         keyword_pool=pool2,
         pool_limit=_env_int("NAVER_POOL_LIMIT", 50),
+        lookback_days=_env_int("NAVER_LOOKBACK_DAYS", 7),
     )
     return wp, run, naver
 
@@ -135,10 +146,6 @@ def validate_wp(wp: WPConfig) -> None:
         missing.append("WP_APP_PASS")
     if missing:
         raise RuntimeError("필수 WP 설정 누락: " + ", ".join(missing))
-
-
-def _safe_len(s: str) -> str:
-    return f"OK(len={len(s)})" if s else "MISSING"
 
 
 # -------------------------
@@ -217,33 +224,12 @@ def fetch_google_trending(geo: str, limit: int) -> List[Dict[str, Any]]:
         pub = _xml_text(it.find("pubDate"))
 
         approx_traffic = ""
-        news_list: List[Dict[str, str]] = []
-
         for child in list(it):
-            tag = child.tag.lower()
-            if tag.endswith("approx_traffic"):
+            if child.tag.lower().endswith("approx_traffic"):
                 approx_traffic = _xml_text(child)
-            if tag.endswith("news_item"):
-                news: Dict[str, str] = {}
-                for c2 in list(child):
-                    t2 = c2.tag.lower()
-                    if t2.endswith("news_item_title"):
-                        news["title"] = _xml_text(c2)
-                    elif t2.endswith("news_item_url"):
-                        news["url"] = _xml_text(c2)
-                    elif t2.endswith("news_item_source"):
-                        news["source"] = _xml_text(c2)
-                if news.get("title") and news.get("url"):
-                    news_list.append(news)
 
         out.append(
-            {
-                "keyword": title,
-                "link": link,
-                "pubDate": pub,
-                "traffic": approx_traffic,
-                "news": news_list[:3],
-            }
+            {"keyword": title, "link": link, "pubDate": pub, "traffic": approx_traffic}
         )
     return out
 
@@ -251,15 +237,10 @@ def fetch_google_trending(geo: str, limit: int) -> List[Dict[str, Any]]:
 # -------------------------
 # Naver DataLab (Search Trend)
 # -------------------------
-NAVER_DATALAB_ENDPOINT = "https://openapi.naver.com/v1/datalab/search"
-
-
 def fetch_naver_datalab_rank(nc: NaverCfg, limit: int) -> List[Dict[str, Any]]:
     """
-    NAVER_KEYWORD_POOL(후보 키워드) 내에서
-    전일 대비 상승폭(상대지수 delta) 기준 TOP 계산.
-
-    ✅ 네이버가 401/권한문제여도 전체 실패시키지 않고 "스킵 안내"로 진행
+    NAVER_KEYWORD_POOL 내에서 '어제 vs 그 전날' 상승폭(delta) TOP.
+    ✅ 네이버가 실패해도 전체 실패시키지 않고 note로 대체.
     """
     if not nc.client_id or not nc.client_secret:
         return [{"note": "XNAVERCLIENT_ID / XNAVERCLIENT_SECRET 미설정 → 네이버 섹션 스킵"}]
@@ -268,8 +249,9 @@ def fetch_naver_datalab_rank(nc: NaverCfg, limit: int) -> List[Dict[str, Any]]:
     if not pool:
         return [{"note": "NAVER_KEYWORD_POOL 미설정 → 네이버 섹션 스킵"}]
 
-    end = now_kst().date()
-    start = end - timedelta(days=1)  # 전일/당일 2일치 확보
+    # ✅ 오늘 데이터 지연 가능 → '어제'를 끝으로 잡고 최근 n일 요청
+    end = (now_kst().date() - timedelta(days=1))
+    start = end - timedelta(days=max(2, nc.lookback_days))
     start_s = start.strftime("%Y-%m-%d")
     end_s = end.strftime("%Y-%m-%d")
 
@@ -300,8 +282,8 @@ def fetch_naver_datalab_rank(nc: NaverCfg, limit: int) -> List[Dict[str, Any]]:
                 return [{
                     "note": (
                         "네이버 DataLab 인증 실패(401). "
-                        "1) GitHub Secrets의 XNAVERCLIENT_ID / XNAVERCLIENT_SECRET 값이 맞는지 "
-                        "2) 네이버 개발자센터에서 해당 애플리케이션에 DataLab Search API 권한이 추가되어 있는지 확인 필요"
+                        "Secrets의 XNAVERCLIENT_ID/XNAVERCLIENT_SECRET가 맞는지, "
+                        "네이버 개발자센터에서 'DataLab 검색어트렌드 API' 사용 설정이 되어있는지 확인 필요."
                     )
                 }]
 
@@ -315,9 +297,12 @@ def fetch_naver_datalab_rank(nc: NaverCfg, limit: int) -> List[Dict[str, Any]]:
                 series = res.get("data", []) or []
                 if len(series) < 2:
                     continue
+
+                # ✅ 마지막 2포인트로 delta 계산(어제 vs 전전일이 보통 됨)
                 prev = float(series[-2].get("ratio", 0) or 0)
                 last = float(series[-1].get("ratio", 0) or 0)
                 delta = last - prev
+
                 ranked.append(
                     {
                         "keyword": kw,
@@ -327,6 +312,9 @@ def fetch_naver_datalab_rank(nc: NaverCfg, limit: int) -> List[Dict[str, Any]]:
                         "link": f"https://search.naver.com/search.naver?query={quote(kw)}",
                     }
                 )
+
+    if not ranked:
+        return [{"note": f"네이버 DataLab 응답은 받았지만 랭킹 계산용 데이터(2일치)가 부족합니다. 기간: {start_s}~{end_s}"}]
 
     ranked.sort(key=lambda x: (x["delta"], x["last"]), reverse=True)
     return ranked[: max(1, limit)]
@@ -345,35 +333,17 @@ def build_google_table(items: List[Dict[str, Any]]) -> str:
         kw = esc(it.get("keyword", ""))
         link = it.get("link", "")
         traffic = esc(it.get("traffic", ""))
-        news = it.get("news", []) or []
 
         kw_html = f'<a href="{esc(link)}" target="_blank" rel="nofollow noopener">{kw}</a>' if link else kw
-        news_html = ""
-        if news:
-            li = []
-            for n in news[:2]:
-                nt = esc(n.get("title", ""))
-                nu = esc(n.get("url", ""))
-                ns = esc(n.get("source", ""))
-                li.append(
-                    f'<li><a href="{nu}" target="_blank" rel="nofollow noopener">{nt}</a> '
-                    f'<span style="opacity:.7;">({ns})</span></li>'
-                )
-            news_html = "<ul style='margin:6px 0 0 18px; padding:0; font-size:13px;'>" + "".join(li) + "</ul>"
-
         rows.append(
             f"""
             <tr>
               <td style="padding:8px;border:1px solid #e5e5e5;text-align:center;">{i}</td>
-              <td style="padding:8px;border:1px solid #e5e5e5;">
-                <div style="font-weight:600;">{kw_html}</div>
-                {news_html}
-              </td>
+              <td style="padding:8px;border:1px solid #e5e5e5;">{kw_html}</td>
               <td style="padding:8px;border:1px solid #e5e5e5;text-align:right;white-space:nowrap;">{traffic}</td>
             </tr>
             """
         )
-
     return f"""
     <h2>Google 트렌딩 키워드 TOP {len(items)}</h2>
     <table style="border-collapse:collapse;width:100%;font-size:14px;">
@@ -384,18 +354,16 @@ def build_google_table(items: List[Dict[str, Any]]) -> str:
           <th style="padding:8px;border:1px solid #e5e5e5;">대략 트래픽</th>
         </tr>
       </thead>
-      <tbody>
-        {''.join(rows)}
-      </tbody>
+      <tbody>{''.join(rows)}</tbody>
     </table>
     """
 
 
-def build_naver_table(items: List[Dict[str, Any]]) -> str:
+def build_naver_table(items: List[Dict[str, Any]], end_date_str: str) -> str:
     if items and "note" in items[0]:
         return f"""
         <h2>네이버 트렌드 TOP</h2>
-        <p style="opacity:.8;">{esc(items[0]["note"])}</p>
+        <p style="opacity:.85;">{esc(items[0]["note"])}</p>
         """
 
     rows = []
@@ -404,8 +372,8 @@ def build_naver_table(items: List[Dict[str, Any]]) -> str:
         link = it.get("link", "")
         delta = float(it.get("delta", 0.0) or 0.0)
         last = float(it.get("last", 0.0) or 0.0)
-
         kw_html = f'<a href="{esc(link)}" target="_blank" rel="nofollow noopener">{kw}</a>' if link else kw
+
         rows.append(
             f"""
             <tr>
@@ -420,28 +388,26 @@ def build_naver_table(items: List[Dict[str, Any]]) -> str:
     return f"""
     <h2>네이버 트렌드 TOP {len(items)}</h2>
     <p style="font-size:13px;opacity:.75;margin-top:-6px;">
-      ※ NAVER_KEYWORD_POOL(후보 키워드) 내에서 데이터랩 상대지수의 전일 대비 상승폭 기준으로 랭킹을 계산합니다.
+      기준일: <b>{esc(end_date_str)}</b> (DataLab은 실시간이 아니라 집계 기반이어서 '어제 기준'으로 계산합니다)
     </p>
     <table style="border-collapse:collapse;width:100%;font-size:14px;">
       <thead>
         <tr>
           <th style="padding:8px;border:1px solid #e5e5e5;">순위</th>
           <th style="padding:8px;border:1px solid #e5e5e5;">키워드</th>
-          <th style="padding:8px;border:1px solid #e5e5e5;">전일 대비 변화</th>
-          <th style="padding:8px;border:1px solid #e5e5e5;">오늘 지수</th>
+          <th style="padding:8px;border:1px solid #e5e5e5;">상승폭(Δ)</th>
+          <th style="padding:8px;border:1px solid #e5e5e5;">지수</th>
         </tr>
       </thead>
-      <tbody>
-        {''.join(rows)}
-      </tbody>
+      <tbody>{''.join(rows)}</tbody>
     </table>
     """
 
 
-def build_post_html(date_str: str, google_items: List[Dict[str, Any]], naver_items: List[Dict[str, Any]]) -> str:
+def build_post_html(date_str: str, google_items: List[Dict[str, Any]], naver_items: List[Dict[str, Any]], naver_end: str) -> str:
     disclosure = (
         '<p style="padding:10px;border-left:4px solid #111;background:#f7f7f7;">'
-        "※ 출처별 산정 방식이 다를 수 있으며, 네이버 섹션은 후보 키워드 풀 기반 비교입니다."
+        "※ 네이버 섹션은 NAVER_KEYWORD_POOL(후보 키워드 풀) 내에서 DataLab 상대지수 기반으로 계산됩니다."
         "</p>"
     )
     head = f"<p>기준일: <b>{esc(date_str)}</b></p>"
@@ -450,7 +416,7 @@ def build_post_html(date_str: str, google_items: List[Dict[str, Any]], naver_ite
     {head}
     {build_google_table(google_items)}
     <hr/>
-    {build_naver_table(naver_items)}
+    {build_naver_table(naver_items, naver_end)}
     """
 
 
@@ -474,11 +440,15 @@ def main():
         print("[DEBUG] XNAVERCLIENT_ID:", _safe_len(naver.client_id))
         print("[DEBUG] XNAVERCLIENT_SECRET:", _safe_len(naver.client_secret))
         print("[DEBUG] NAVER_KEYWORD_POOL size:", len(naver.keyword_pool), "POOL_LIMIT:", naver.pool_limit)
+        print("[DEBUG] NAVER_LOOKBACK_DAYS:", naver.lookback_days)
 
     google_items = fetch_google_trending(run.google_geo, run.limit)
+
+    # 네이버 기준일(어제)
+    naver_end_date = (now_kst().date() - timedelta(days=1)).strftime("%Y-%m-%d")
     naver_items = fetch_naver_datalab_rank(naver, run.limit)
 
-    html = build_post_html(date_str, google_items, naver_items)
+    html = build_post_html(date_str, google_items, naver_items, naver_end_date)
 
     if run.dry_run:
         print("[DRY_RUN] 아래 HTML을 WP에 올리지 않고 출력만 합니다.\n")
@@ -500,6 +470,5 @@ if __name__ == "__main__":
         main()
     except Exception:
         import traceback
-
         traceback.print_exc()
         raise
