@@ -11,7 +11,7 @@ naver_fashion_daily_to_wp.py (완전 통합)
   - WP_USER
   - WP_APP_PASS
 
-(호환용 fallback도 포함)
+✅ 워드프레스 카테고리 기본값: ID 30
 """
 
 from __future__ import annotations
@@ -51,14 +51,15 @@ class WordPressConfig:
     username: str
     app_password: str
     status: str = "publish"
-    category_ids: List[int] = field(default_factory=list)
+    # ✅ 기본 카테고리 ID 30
+    category_ids: List[int] = field(default_factory=lambda: [30])
     tag_ids: List[int] = field(default_factory=list)
 
 
 @dataclass
 class PostConfig:
-    title_template: str = "{date} 네이버 쇼핑 남성/여성 의류 인기 순위 TOP20 (데일리)"
-    disclosure: str = "※ 이 포스팅은 자료를 보여주기 위한 데이터입니다."
+    title_template: str = "{date} 네이버 쇼핑 남성/여성 의류 TOP20 (데일리)"
+    disclosure: str = "※ 이 포스팅은 제휴마케팅 활동의 일환으로, 이에 따른 일정액의 수수료를 제공받을 수 있습니다."
     note: str = "데이터 출처: 네이버 쇼핑 검색 API(정렬 기준: {sort})."
 
 
@@ -132,7 +133,8 @@ def cfg_from_env() -> AppConfig:
             username=wp_username,
             app_password=wp_app_password,
             status=wp_status,
-            category_ids=[],
+            # ✅ 카테고리 30 고정
+            category_ids=[30],
             tag_ids=[],
         ),
         post=PostConfig(),
@@ -166,7 +168,8 @@ def load_config_from_file(path: str) -> AppConfig:
             username=w["username"],
             app_password=w["app_password"],
             status=w.get("status", "publish"),
-            category_ids=w.get("category_ids", []),
+            # ✅ 파일에 category_ids가 있으면 그걸 쓰고, 없으면 기본값([30])
+            category_ids=w.get("category_ids", [30]),
             tag_ids=w.get("tag_ids", []),
         ),
         post=PostConfig(
@@ -207,7 +210,6 @@ def validate_cfg(cfg: AppConfig) -> None:
     if not cfg.naver.client_secret:
         missing.append("NAVER_CLIENT_SECRET")
 
-    # ✅ 너의 Secrets 이름으로 안내
     if not cfg.wordpress.site_url:
         missing.append("WP_BASE_URL (또는 WP_SITE_URL / bot_config.json wordpress.site_url)")
     if not cfg.wordpress.username:
@@ -228,6 +230,7 @@ def print_safe_settings(cfg: AppConfig) -> None:
     print("[CONFIG] WP_BASE_URL:", cfg.wordpress.site_url or "MISSING")
     print("[CONFIG] WP_USER:", ok(cfg.wordpress.username))
     print("[CONFIG] WP_APP_PASS:", ok(cfg.wordpress.app_password))
+    print("[CONFIG] WP category_ids:", cfg.wordpress.category_ids)
     print("[CONFIG] queries:", cfg.naver.queries)
     print("[CONFIG] sort:", cfg.naver.sort, "display:", cfg.naver.display)
     print("[CONFIG] sqlite:", cfg.storage.sqlite_path)
@@ -381,7 +384,13 @@ def wp_auth_header(username: str, app_password: str) -> Dict[str, str]:
 def wp_create_post(cfg: WordPressConfig, title: str, html: str) -> Tuple[int, str]:
     endpoint = cfg.site_url.rstrip("/") + "/wp-json/wp/v2/posts"
     headers = {**wp_auth_header(cfg.username, cfg.app_password), "Content-Type": "application/json"}
+
     payload: Dict[str, Any] = {"title": title, "content": html, "status": cfg.status}
+    # ✅ 카테고리/태그 적용
+    if cfg.category_ids:
+        payload["categories"] = cfg.category_ids
+    if cfg.tag_ids:
+        payload["tags"] = cfg.tag_ids
 
     r = requests.post(endpoint, headers=headers, json=payload, timeout=30)
     if r.status_code not in (200, 201):
@@ -393,7 +402,13 @@ def wp_create_post(cfg: WordPressConfig, title: str, html: str) -> Tuple[int, st
 def wp_update_post(cfg: WordPressConfig, post_id: int, title: str, html: str) -> Tuple[int, str]:
     endpoint = cfg.site_url.rstrip("/") + f"/wp-json/wp/v2/posts/{post_id}"
     headers = {**wp_auth_header(cfg.username, cfg.app_password), "Content-Type": "application/json"}
+
     payload: Dict[str, Any] = {"title": title, "content": html, "status": cfg.status}
+    # ✅ 카테고리/태그 적용(업데이트에도 반영)
+    if cfg.category_ids:
+        payload["categories"] = cfg.category_ids
+    if cfg.tag_ids:
+        payload["tags"] = cfg.tag_ids
 
     r = requests.post(endpoint, headers=headers, json=payload, timeout=30)
     if r.status_code not in (200, 201):
