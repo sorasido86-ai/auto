@@ -2,8 +2,7 @@ name: Daily Trend Keywords to WordPress (Google + Naver)
 
 on:
   schedule:
-    # ✅ GitHub Actions cron은 UTC 기준
-    # 예시: 매일 00:10 KST(한국시간) = 전날 15:10 UTC
+    # 매일 00:10 KST = 전날 15:10 UTC
     - cron: "10 15 * * *"
   workflow_dispatch:
 
@@ -24,7 +23,7 @@ jobs:
           python -m pip install --upgrade pip
           pip install requests
 
-      # ✅ 값은 노출하지 않고 len만 확인(문제 생길 때만 켜도 됨)
+      # 필요할 때만 수동 실행(workflow_dispatch)에서 len 체크
       - name: Debug env (safe)
         if: ${{ github.event_name == 'workflow_dispatch' }}
         env:
@@ -38,7 +37,7 @@ jobs:
           python - <<'PY'
           import os
           def show(k):
-              v = os.getenv(k, "")
+              v=os.getenv(k,"")
               print(f"{k}: {'OK' if v else 'MISSING'} len={len(v)}")
           for k in ["WP_BASE_URL","WP_USER","WP_APP_PASS","XNAVERCLIENT_ID","XNAVERCLIENT_SECRET","NAVER_KEYWORD_POOL"]:
               show(k)
@@ -46,7 +45,7 @@ jobs:
 
       - name: Run bot
         env:
-          # WordPress
+          # WP
           WP_BASE_URL: ${{ secrets.WP_BASE_URL }}
           WP_USER: ${{ secrets.WP_USER }}
           WP_APP_PASS: ${{ secrets.WP_APP_PASS }}
@@ -57,14 +56,15 @@ jobs:
           GOOGLE_GEO: "KR"
           LIMIT: "20"
 
-          # Naver (네가 바꾼 이름 그대로)
+          # Naver (네가 쓰는 이름)
           XNAVERCLIENT_ID: ${{ secrets.XNAVERCLIENT_ID }}
           XNAVERCLIENT_SECRET: ${{ secrets.XNAVERCLIENT_SECRET }}
           NAVER_KEYWORD_POOL: ${{ secrets.NAVER_KEYWORD_POOL }}
           NAVER_POOL_LIMIT: "50"
+          NAVER_LOOKBACK_DAYS: "7"
 
-          # 옵션
-          # DRY_RUN: "1"
+          # 필요할 때만 켜
           # DEBUG: "1"
+          # DRY_RUN: "1"
         run: |
           python trend_keywords_daily_to_wp.py
