@@ -1,0 +1,489 @@
+# -*- coding: utf-8 -*-
+"""
+trend_keywords_daily_to_wp.py (통합)
+- Google Trends Trending RSS(geo=KR)에서 트렌딩 키워드 TOP N 수집
+- Naver DataLab "통합 검색어 트렌드 API"로 (키워드 후보 풀 내) 전일 대비 상승폭 TOP N 산출
+- WordPress REST API로 데일리 포스트 생성/업데이트 (slug로 중복 방지)
+- GitHub Actions Secrets(환경변수)로 실행
+
+✅ WordPress Secrets (너가 쓰는 이름 그대로)
+  - WP_BASE_URL
+  - WP_USER
+  - WP_APP_PASS
+
+✅ Naver DataLab (필요)
+  - NAVER_CLIENT_ID
+  - NAVER_CLIENT_SECRET
+
+✅ 네이버 랭킹용 키워드 풀(중요)
+  - NAVER_KEYWORD_POOL: 콤마로 구분된 후보 키워드들 (예: "날씨,환율,비트코인,아이폰,..." )
+
+✅ 카테고리
+  - WP_CATEGORY_ID 기본 31
+"""
+
+from __future__ import annotations
+
+import base64
+import html as htmlmod
+import json
+import os
+import re
+import sys
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
+from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import quote
+
+import requests
+import xml.etree.ElementTree as ET
+
+
+KST = timezone(timedelta(hours=9))
+
+
+# -------------------------
+# Env helpers
+# -------------------------
+def _env(name: str, default: str = "") -> str:
+    return str(os.getenv(name, default) or "").strip()
+
+
+def _env_int(name: str, default: int) -> int:
+    v = _env(name, str(default))
+    try:
+        return int(v)
+    except Exception:
+        return default
+
+
+def now_kst() -> datetime:
+    return datetime.now(tz=KST)
+
+
+# -------------------------
+# Config
+# -------------------------
+@dataclass
+class WPConfig:
+    base_url: str
+    user: str
+    app_pass: str
+    status: str = "publish"
+    category_id: int = 31
+
+
+@dataclass
+class RunConfig:
+    limit: int = 20
+    google_geo: str = "KR"
+    dry_run: bool = False
+    debug: bool = False
+
+
+@dataclass
+class NaverCfg:
+    client_id: str
+    client_secret: str
+    keyword_pool: List[str]
+    pool_limit: int = 50  # 너무 크면 API 호출량 증가
+
+
+def load_configs() -> Tuple[WPConfig, RunConfig, NaverCfg]:
+    wp = WPConfig(
+        base_url=_env("WP_BASE_URL").rstrip("/"),
+        user=_env("WP_USER"),
+        app_pass=_env("WP_APP_PASS"),
+        status=_env("WP_STATUS", "publish") or "publish",
+        category_id=_env_int("WP_CATEGORY_ID", 31),
+    )
+
+    run = RunConfig(
+        limit=_env_int("LIMIT", 20),
+        google_geo=_env("GOOGLE_GEO", "KR") or "KR",
+        dry_run=_env("DRY_RUN", "0").lower() in ("1", "true", "yes"),
+        debug=_env("DEBUG", "0").lower() in ("1", "true", "yes"),
+    )
+
+    pool_raw = _env("NAVER_KEYWORD_POOL", "")
+    pool = [p.strip() for p in pool_raw.split(",") if p.strip()]
+    # 중복 제거(순서 유지)
+    seen = set()
+    pool2 = []
+    for x in pool:
+        if x not in seen:
+            seen.add(x)
+            pool2.append(x)
+
+    naver = NaverCfg(
+        client_id=_env("NAVER_CLIENT_ID"),
+        client_secret=_env("NAVER_CLIENT_SECRET"),
+        keyword_pool=pool2,
+        pool_limit=_env_int("NAVER_POOL_LIMIT", 50),
+    )
+    return wp, run, naver
+
+
+def validate(wp: WPConfig) -> None:
+    missing = []
+    if not wp.base_url:
+        missing.append("WP_BASE_URL")
+    if not wp.user:
+        missing.append("WP_USER")
+    if not wp.app_pass:
+        missing.append("WP_APP_PASS")
+    if missing:
+        raise RuntimeError("필수 WP 설정 누락: " + ", ".join(missing))
+
+
+# -------------------------
+# WordPress REST
+# -------------------------
+def wp_auth_header(user: str, app_pass: str) -> Dict[str, str]:
+    token = base64.b64encode(f"{user}:{app_pass}".encode("utf-8")).decode("utf-8")
+    return {"Authorization": f"Basic {token}", "User-Agent": "trend-keywords-bot/1.0"}
+
+
+def wp_find_post_by_slug(wp: WPConfig, slug: str) -> Optional[Tuple[int, str]]:
+    url = f"{wp.base_url}/wp-json/wp/v2/posts"
+    r = requests.get(url, params={"slug": slug, "per_page": 1}, timeout=25)
+    if r.status_code != 200:
+        return None
+    arr = r.json()
+    if not arr:
+        return None
+    post = arr[0]
+    return int(post["id"]), str(post.get("link") or "")
+
+
+def wp_create_post(wp: WPConfig, title: str, slug: str, html: str) -> Tuple[int, str]:
+    url = f"{wp.base_url}/wp-json/wp/v2/posts"
+    headers = {**wp_auth_header(wp.user, wp.app_pass), "Content-Type": "application/json"}
+    payload: Dict[str, Any] = {
+        "title": title,
+        "slug": slug,
+        "content": html,
+        "status": wp.status,
+        "categories": [wp.category_id],
+    }
+    r = requests.post(url, headers=headers, json=payload, timeout=35)
+    if r.status_code not in (200, 201):
+        raise RuntimeError(f"WP create failed: {r.status_code} body={r.text[:400]}")
+    data = r.json()
+    return int(data["id"]), str(data.get("link") or "")
+
+
+def wp_update_post(wp: WPConfig, post_id: int, title: str, slug: str, html: str) -> Tuple[int, str]:
+    url = f"{wp.base_url}/wp-json/wp/v2/posts/{post_id}"
+    headers = {**wp_auth_header(wp.user, wp.app_pass), "Content-Type": "application/json"}
+    payload: Dict[str, Any] = {
+        "title": title,
+        "slug": slug,
+        "content": html,
+        "status": wp.status,
+        "categories": [wp.category_id],
+    }
+    r = requests.post(url, headers=headers, json=payload, timeout=35)
+    if r.status_code not in (200, 201):
+        raise RuntimeError(f"WP update failed: {r.status_code} body={r.text[:400]}")
+    data = r.json()
+    return int(data["id"]), str(data.get("link") or "")
+
+
+# -------------------------
+# Google Trends RSS
+# -------------------------
+def _xml_text(el: Optional[ET.Element]) -> str:
+    return (el.text or "").strip() if el is not None else ""
+
+
+def fetch_google_trending(geo: str, limit: int) -> List[Dict[str, Any]]:
+    """
+    Google Trends Trending RSS: https://trends.google.com/trending/rss?geo=KR
+    """
+    url = f"https://trends.google.com/trending/rss?geo={geo}"
+    r = requests.get(url, timeout=30)
+    if r.status_code != 200:
+        raise RuntimeError(f"Google Trends RSS failed: {r.status_code} body={r.text[:200]}")
+    xml = r.content
+
+    root = ET.fromstring(xml)
+    items = root.findall(".//item")
+    out: List[Dict[str, Any]] = []
+
+    for it in items[: max(1, limit)]:
+        title = _xml_text(it.find("title"))
+        link = _xml_text(it.find("link"))
+        pub = _xml_text(it.find("pubDate"))
+
+        approx_traffic = ""
+        news_list: List[Dict[str, str]] = []
+
+        # namespace 모르는 태그는 endswith로 처리
+        for child in list(it):
+            tag = child.tag.lower()
+            if tag.endswith("approx_traffic"):
+                approx_traffic = _xml_text(child)
+            if tag.endswith("news_item"):
+                news: Dict[str, str] = {}
+                for c2 in list(child):
+                    t2 = c2.tag.lower()
+                    if t2.endswith("news_item_title"):
+                        news["title"] = _xml_text(c2)
+                    elif t2.endswith("news_item_url"):
+                        news["url"] = _xml_text(c2)
+                    elif t2.endswith("news_item_source"):
+                        news["source"] = _xml_text(c2)
+                if news.get("title") and news.get("url"):
+                    news_list.append(news)
+
+        out.append(
+            {
+                "keyword": title,
+                "link": link,
+                "pubDate": pub,
+                "traffic": approx_traffic,
+                "news": news_list[:3],
+            }
+        )
+    return out
+
+
+# -------------------------
+# Naver DataLab (Search Trend)
+# -------------------------
+NAVER_DATALAB_ENDPOINT = "https://openapi.naver.com/v1/datalab/search"
+
+
+def fetch_naver_datalab_rank(nc: NaverCfg, limit: int) -> List[Dict[str, Any]]:
+    """
+    네이버는 '실검'이 공식 제공되지 않으므로,
+    NAVER_KEYWORD_POOL(후보 키워드) 내에서 전일 대비 상승폭(상대지수 delta) 기준 TOP을 계산.
+    """
+    if not nc.client_id or not nc.client_secret:
+        return [{"note": "NAVER_CLIENT_ID/NAVER_CLIENT_SECRET 미설정 → 네이버 섹션 스킵"}]
+
+    pool = nc.keyword_pool[: max(0, nc.pool_limit)]
+    if not pool:
+        return [{"note": "NAVER_KEYWORD_POOL 미설정 → 네이버 섹션 스킵"}]
+
+    end = now_kst().date()
+    start = end - timedelta(days=1)  # 2일치(전일/당일) 확보
+    start_s = start.strftime("%Y-%m-%d")
+    end_s = end.strftime("%Y-%m-%d")
+
+    headers = {
+        "X-Naver-Client-Id": nc.client_id,
+        "X-Naver-Client-Secret": nc.client_secret,
+        "Content-Type": "application/json",
+        "User-Agent": "trend-keywords-bot/1.0",
+    }
+
+    def chunks(lst: List[str], n: int) -> List[List[str]]:
+        return [lst[i : i + n] for i in range(0, len(lst), n)]
+
+    ranked: List[Dict[str, Any]] = []
+    with requests.Session() as s:
+        for ch in chunks(pool, 5):  # API는 그룹 여러개를 한번에 보낼 수 있음(여기선 5개씩)
+            payload = {
+                "startDate": start_s,
+                "endDate": end_s,
+                "timeUnit": "date",
+                "keywordGroups": [{"groupName": kw, "keywords": [kw]} for kw in ch],
+            }
+            r = s.post(NAVER_DATALAB_ENDPOINT, headers=headers, data=json.dumps(payload), timeout=30)
+            if r.status_code != 200:
+                raise RuntimeError(f"Naver DataLab failed: {r.status_code} body={r.text[:300]}")
+
+            data = r.json()
+            results = data.get("results", []) or []
+            for res in results:
+                kw = str(res.get("title") or "")
+                series = res.get("data", []) or []
+                if len(series) < 2:
+                    continue
+                # series: [{"period":"YYYY-MM-DD","ratio":...}, ...]
+                prev = float(series[-2].get("ratio", 0) or 0)
+                last = float(series[-1].get("ratio", 0) or 0)
+                delta = last - prev
+                ranked.append(
+                    {
+                        "keyword": kw,
+                        "prev": prev,
+                        "last": last,
+                        "delta": delta,
+                        "link": f"https://search.naver.com/search.naver?query={quote(kw)}",
+                    }
+                )
+
+    ranked.sort(key=lambda x: (x["delta"], x["last"]), reverse=True)
+    return ranked[: max(1, limit)]
+
+
+# -------------------------
+# Render HTML
+# -------------------------
+def esc(s: str) -> str:
+    return htmlmod.escape(s or "")
+
+
+def build_google_table(items: List[Dict[str, Any]]) -> str:
+    rows = []
+    for i, it in enumerate(items, start=1):
+        kw = esc(it.get("keyword", ""))
+        link = it.get("link", "")
+        traffic = esc(it.get("traffic", ""))
+        news = it.get("news", []) or []
+
+        kw_html = f'<a href="{esc(link)}" target="_blank" rel="nofollow noopener">{kw}</a>' if link else kw
+        news_html = ""
+        if news:
+            li = []
+            for n in news[:2]:
+                nt = esc(n.get("title", ""))
+                nu = esc(n.get("url", ""))
+                ns = esc(n.get("source", ""))
+                li.append(f'<li><a href="{nu}" target="_blank" rel="nofollow noopener">{nt}</a> <span style="opacity:.7;">({ns})</span></li>')
+            news_html = "<ul style='margin:6px 0 0 18px; padding:0; font-size:13px;'>" + "".join(li) + "</ul>"
+
+        rows.append(
+            f"""
+            <tr>
+              <td style="padding:8px;border:1px solid #e5e5e5;text-align:center;">{i}</td>
+              <td style="padding:8px;border:1px solid #e5e5e5;">
+                <div style="font-weight:600;">{kw_html}</div>
+                {news_html}
+              </td>
+              <td style="padding:8px;border:1px solid #e5e5e5;text-align:right;white-space:nowrap;">{traffic}</td>
+            </tr>
+            """
+        )
+
+    return f"""
+    <h2>Google 트렌딩 키워드 TOP {len(items)}</h2>
+    <table style="border-collapse:collapse;width:100%;font-size:14px;">
+      <thead>
+        <tr>
+          <th style="padding:8px;border:1px solid #e5e5e5;">순위</th>
+          <th style="padding:8px;border:1px solid #e5e5e5;">키워드</th>
+          <th style="padding:8px;border:1px solid #e5e5e5;">대략 트래픽</th>
+        </tr>
+      </thead>
+      <tbody>
+        {''.join(rows)}
+      </tbody>
+    </table>
+    """
+
+
+def build_naver_table(items: List[Dict[str, Any]]) -> str:
+    # 스킵 노트면 안내만
+    if items and "note" in items[0]:
+        return f"""
+        <h2>네이버 트렌드 TOP</h2>
+        <p style="opacity:.8;">{esc(items[0]["note"])}</p>
+        """
+
+    rows = []
+    for i, it in enumerate(items, start=1):
+        kw = esc(it.get("keyword", ""))
+        link = it.get("link", "")
+        delta = it.get("delta", 0.0)
+        last = it.get("last", 0.0)
+
+        kw_html = f'<a href="{esc(link)}" target="_blank" rel="nofollow noopener">{kw}</a>' if link else kw
+        rows.append(
+            f"""
+            <tr>
+              <td style="padding:8px;border:1px solid #e5e5e5;text-align:center;">{i}</td>
+              <td style="padding:8px;border:1px solid #e5e5e5;">{kw_html}</td>
+              <td style="padding:8px;border:1px solid #e5e5e5;text-align:right;">{delta:.2f}</td>
+              <td style="padding:8px;border:1px solid #e5e5e5;text-align:right;">{last:.2f}</td>
+            </tr>
+            """
+        )
+
+    return f"""
+    <h2>네이버 트렌드 TOP {len(items)}</h2>
+    <p style="font-size:13px;opacity:.75;margin-top:-6px;">
+      ※ 네이버는 '실시간 검색어(실검)'이 공식 제공되지 않아, NAVER_KEYWORD_POOL(후보 키워드) 내에서
+      데이터랩 상대지수의 전일 대비 상승폭 기준으로 랭킹을 계산합니다.
+    </p>
+    <table style="border-collapse:collapse;width:100%;font-size:14px;">
+      <thead>
+        <tr>
+          <th style="padding:8px;border:1px solid #e5e5e5;">순위</th>
+          <th style="padding:8px;border:1px solid #e5e5e5;">키워드</th>
+          <th style="padding:8px;border:1px solid #e5e5e5;">전일 대비 변화</th>
+          <th style="padding:8px;border:1px solid #e5e5e5;">오늘 지수</th>
+        </tr>
+      </thead>
+      <tbody>
+        {''.join(rows)}
+      </tbody>
+    </table>
+    """
+
+
+def build_post_html(date_str: str, google_items: List[Dict[str, Any]], naver_items: List[Dict[str, Any]]) -> str:
+    disclosure = (
+        '<p style="padding:10px;border-left:4px solid #111;background:#f7f7f7;">'
+        "※ 이 포스팅은 정보 제공 목적이며, 외부 링크 클릭 시 제휴마케팅/광고 링크가 포함될 수 있습니다."
+        "</p>"
+    )
+    head = f"<p>기준일: <b>{esc(date_str)}</b></p>"
+    return f"""
+    {disclosure}
+    {head}
+    {build_google_table(google_items)}
+    <hr/>
+    {build_naver_table(naver_items)}
+    """
+
+
+# -------------------------
+# Main
+# -------------------------
+def main():
+    wp, run, naver = load_configs()
+    validate(wp)
+
+    date_str = now_kst().strftime("%Y-%m-%d")
+    slug = f"realtime-keywords-{date_str}".lower()
+    title = f"{date_str} 실시간(트렌딩) 검색어 TOP{run.limit} - 구글/네이버"
+
+    if run.debug:
+        print("[DEBUG] WP_BASE_URL:", wp.base_url)
+        print("[DEBUG] WP_USER len:", len(wp.user))
+        print("[DEBUG] WP_APP_PASS len:", len(wp.app_pass))
+        print("[DEBUG] WP_CATEGORY_ID:", wp.category_id)
+        print("[DEBUG] GOOGLE_GEO:", run.google_geo, "LIMIT:", run.limit)
+        print("[DEBUG] NAVER_POOL size:", len(naver.keyword_pool), "POOL_LIMIT:", naver.pool_limit)
+
+    google_items = fetch_google_trending(run.google_geo, run.limit)
+    naver_items = fetch_naver_datalab_rank(naver, run.limit)
+
+    html = build_post_html(date_str, google_items, naver_items)
+
+    if run.dry_run:
+        print("[DRY_RUN] 아래 HTML을 WP에 올리지 않고 출력만 합니다.\n")
+        print(html)
+        return
+
+    existed = wp_find_post_by_slug(wp, slug)
+    if existed:
+        post_id, old_link = existed
+        new_id, new_link = wp_update_post(wp, post_id, title, slug, html)
+        print(f"OK(updated): {new_id} {new_link or old_link}")
+    else:
+        new_id, new_link = wp_create_post(wp, title, slug, html)
+        print(f"OK(created): {new_id} {new_link}")
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception:
+        import traceback
+        traceback.print_exc()
+        raise
