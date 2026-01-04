@@ -1,0 +1,78 @@
+name: Hot Keywords -> Naver Shop 추천 -> WordPress (AM/PM)
+
+on:
+  schedule:
+    - cron: "0 0,9 * * *"   # 00:00 UTC(09:00 KST), 09:00 UTC(18:00 KST)
+  workflow_dispatch:
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests
+
+      - name: Cache sqlite
+        uses: actions/cache@v4
+        with:
+          path: data
+          key: hot-keyword-shop-sqlite-${{ runner.os }}-${{ github.ref_name }}
+          restore-keys: |
+            hot-keyword-shop-sqlite-${{ runner.os }}-
+
+      - name: Decide RUN_SLOT (am/pm)
+        shell: bash
+        run: |
+          HOUR_UTC=$(date -u +%H)
+          echo "UTC hour=$HOUR_UTC"
+          if [ "$HOUR_UTC" = "00" ]; then
+            echo "RUN_SLOT=am" >> $GITHUB_ENV
+          else
+            echo "RUN_SLOT=pm" >> $GITHUB_ENV
+          fi
+
+      - name: Run bot
+        env:
+          # ✅ WP Secrets
+          WP_BASE_URL: ${{ secrets.WP_BASE_URL }}
+          WP_USER: ${{ secrets.WP_USER }}
+          WP_APP_PASS: ${{ secrets.WP_APP_PASS }}
+
+          # ✅ 네가 쓰는 네이버 키 이름
+          XNAVERCLIENT_ID: ${{ secrets.XNAVERCLIENT_ID }}
+          XNAVERCLIENT_SECRET: ${{ secrets.XNAVERCLIENT_SECRET }}
+
+          # (선택) 일반 이름도 같이 두면 편함
+          NAVER_CLIENT_ID: ${{ secrets.NAVER_CLIENT_ID }}
+          NAVER_CLIENT_SECRET: ${{ secrets.NAVER_CLIENT_SECRET }}
+
+          # ✅ 카테고리 31번
+          WP_CATEGORY_IDS: "31"
+
+          # 실행 슬롯
+          RUN_SLOT: ${{ env.RUN_SLOT }}
+
+          # 수집 설정
+          GOOGLE_TRENDS_GEO: "KR"
+          HOT_KEYWORDS_LIMIT: "20"
+          PRODUCTS_PER_KEYWORD: "5"
+          NAVER_SORT: "sim"
+
+          SQLITE_PATH: "data/hot_keyword_shop.sqlite3"
+
+          DEBUG: "0"
+          DRY_RUN: "0"
+        run: |
+          set -e
+          ls -la
+          python hot_keyword_naver_shop_to_wp.py
