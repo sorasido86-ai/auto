@@ -2,34 +2,15 @@ name: run-daily-post
 
 on:
   workflow_dispatch:
-    inputs:
-      mode:
-        description: "test(매번 새글) / daily(1일 1글)"
-        required: false
-        default: "test"
-      status:
-        description: "draft / publish"
-        required: false
-        default: "draft"
-
-  # ✅ 테스트: 5분마다 (GitHub는 지연될 수 있음)
   schedule:
-    - cron: "*/5 * * * *"
-
-concurrency:
-  group: run-daily-post
-  cancel-in-progress: true
+    - cron: "*/5 * * * *"  # 테스트용: 5분마다(UTC 기준)
 
 jobs:
   post:
     runs-on: ubuntu-latest
-
-    env:
-      TZ: Asia/Seoul
-      # 스케줄이면 무조건 test로(매번 새글) / 수동이면 입력값 반영
-      MODE: ${{ github.event_name == 'schedule' && 'test' || (github.event.inputs.mode || 'test') }}
-      WP_STATUS: ${{ github.event_name == 'schedule' && 'draft' || (github.event.inputs.status || 'draft') }}
-      RUN_ID: ${{ github.run_id }}
+    concurrency:
+      group: run-daily-post
+      cancel-in-progress: true
 
     steps:
       - name: Checkout
@@ -43,39 +24,68 @@ jobs:
       - name: Install deps
         run: |
           python -m pip install --upgrade pip
-          pip install requests beautifulsoup4 lxml feedparser
+          # requirements.txt 있으면 그걸 우선 사용
+          if [ -f requirements.txt ]; then
+            pip install -r requirements.txt
+          else
+            pip install requests beautifulsoup4 lxml feedparser
+          fi
 
-      - name: Create bot_config.json from Secrets
+      - name: Create bot_config.json from Secrets (optional keys allowed)
         env:
           WP_BASE_URL: ${{ secrets.WP_BASE_URL }}
           WP_USER: ${{ secrets.WP_USER }}
           WP_APP_PASS: ${{ secrets.WP_APP_PASS }}
-          # 카카오는 선택(안 쓰면 비워도 됨)
+
           KAKAO_REST_KEY: ${{ secrets.KAKAO_REST_KEY }}
           KAKAO_REFRESH_TOKEN: ${{ secrets.KAKAO_REFRESH_TOKEN }}
+
+          # 없어도 통과시키기(없으면 demo를 넣음)
+          ALPHAVANTAGE_API_KEY: ${{ secrets.ALPHAVANTAGE_API_KEY }}
+
+          # (있으면 사용) 예: EIA 키를 쓰는 코드가 있을 때만
+          EIA_API_KEY: ${{ secrets.EIA_API_KEY }}
         run: |
           python - <<'PY'
           import os, json, sys
-          required = ["WP_BASE_URL", "WP_USER", "WP_APP_PASS"]
-          missing = [k for k in required if not os.getenv(k)]
-          if missing:
-            sys.exit("Missing secrets: " + ", ".join(missing))
+
+          def must(k):
+              v = (os.getenv(k) or "").strip()
+              if not v:
+                  sys.exit(f"Missing secrets: {k}")
+              return v
 
           cfg = {
-            "wp_base_url": os.environ["WP_BASE_URL"],
-            "wp_user": os.environ["WP_USER"],
-            "wp_app_pass": os.environ["WP_APP_PASS"],
+              "wp_base_url": must("WP_BASE_URL"),
+              "wp_user": must("WP_USER"),
+              "wp_app_pass": must("WP_APP_PASS"),
           }
 
-          if os.getenv("KAKAO_REST_KEY") and os.getenv("KAKAO_REFRESH_TOKEN"):
-            cfg["kakao_rest_key"] = os.environ["KAKAO_REST_KEY"]
-            cfg["kakao_refresh_token"] = os.environ["KAKAO_REFRESH_TOKEN"]
+          # Kakao는 선택
+          if (os.getenv("KAKAO_REST_KEY") or "").strip() and (os.getenv("KAKAO_REFRESH_TOKEN") or "").strip():
+              cfg["kakao_rest_key"] = os.environ["KAKAO_REST_KEY"].strip()
+              cfg["kakao_refresh_token"] = os.environ["KAKAO_REFRESH_TOKEN"].strip()
 
-          with open("bot_config.json","w",encoding="utf-8") as f:
-            json.dump(cfg,f,ensure_ascii=False,indent=2)
+          # AlphaVantage 키가 없으면 demo를 주입해서 "필수 설정 누락"으로 죽지 않게 함
+          av = (os.getenv("ALPHAVANTAGE_API_KEY") or "").strip()
+          cfg["alphavantage_api_key"] = av if av else "demo"
 
-          print("bot_config.json written")
+          eia = (os.getenv("EIA_API_KEY") or "").strip()
+          if eia:
+              cfg["eia_api_key"] = eia
+
+          with open("bot_config.json", "w", encoding="utf-8") as f:
+              json.dump(cfg, f, ensure_ascii=False, indent=2)
+
+          print("bot_config.json written. keys =", ", ".join(cfg.keys()))
           PY
 
       - name: Run
-        run: python -u daily_post.py
+        env:
+          TZ: Asia/Seoul
+          # (선택) 당신의 파이썬 코드가 TEST_MODE를 지원하면 5분마다 새 글 만들 때 도움 됨
+          TEST_MODE: "1"
+          RUN_ID: ${{ github.run_id }}
+          RUN_NUMBER: ${{ github.run_number }}
+        run: |
+          python -u daily_post.py
