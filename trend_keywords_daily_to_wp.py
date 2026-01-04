@@ -2,21 +2,20 @@
 """
 trend_keywords_daily_to_wp.py (통합)
 - Google Trends Trending RSS(geo=KR)에서 트렌딩 키워드 TOP N 수집
-- Naver DataLab "통합 검색어 트렌드 API"로 (키워드 후보 풀 내) 전일 대비 상승폭 TOP N 산출
-- WordPress REST API로 데일리 포스트 생성/업데이트 (slug로 중복 방지)
-- GitHub Actions Secrets(환경변수)로 실행
+- Naver DataLab 검색어트렌드 API로 (키워드 후보 풀 내) 전일 대비 상승폭 TOP N 산출
+- WordPress REST API로 데일리 포스트 생성/업데이트 (slug 기준)
 
-✅ WordPress Secrets (너가 쓰는 이름 그대로)
+✅ WordPress Secrets (그대로)
   - WP_BASE_URL
   - WP_USER
   - WP_APP_PASS
 
-✅ Naver DataLab (필요)
-  - NAVER_CLIENT_ID
-  - NAVER_CLIENT_SECRET
+✅ Naver Secrets (네가 바꾼 이름 그대로)
+  - XNAVERCLIENT_ID
+  - XNAVERCLIENT_SECRET
 
-✅ 네이버 랭킹용 키워드 풀(중요)
-  - NAVER_KEYWORD_POOL: 콤마로 구분된 후보 키워드들 (예: "날씨,환율,비트코인,아이폰,..." )
+✅ 네이버 랭킹용 키워드 풀(필수)
+  - NAVER_KEYWORD_POOL: 콤마로 구분된 후보 키워드들
 
 ✅ 카테고리
   - WP_CATEGORY_ID 기본 31
@@ -28,8 +27,6 @@ import base64
 import html as htmlmod
 import json
 import os
-import re
-import sys
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
@@ -37,7 +34,6 @@ from urllib.parse import quote
 
 import requests
 import xml.etree.ElementTree as ET
-
 
 KST = timezone(timedelta(hours=9))
 
@@ -86,7 +82,7 @@ class NaverCfg:
     client_id: str
     client_secret: str
     keyword_pool: List[str]
-    pool_limit: int = 50  # 너무 크면 API 호출량 증가
+    pool_limit: int = 50
 
 
 def load_configs() -> Tuple[WPConfig, RunConfig, NaverCfg]:
@@ -105,8 +101,13 @@ def load_configs() -> Tuple[WPConfig, RunConfig, NaverCfg]:
         debug=_env("DEBUG", "0").lower() in ("1", "true", "yes"),
     )
 
+    # ✅ 네가 바꾼 이름 우선
+    naver_id = _env("XNAVERCLIENT_ID") or _env("NAVER_CLIENT_ID")
+    naver_secret = _env("XNAVERCLIENT_SECRET") or _env("NAVER_CLIENT_SECRET")
+
     pool_raw = _env("NAVER_KEYWORD_POOL", "")
     pool = [p.strip() for p in pool_raw.split(",") if p.strip()]
+
     # 중복 제거(순서 유지)
     seen = set()
     pool2 = []
@@ -116,15 +117,15 @@ def load_configs() -> Tuple[WPConfig, RunConfig, NaverCfg]:
             pool2.append(x)
 
     naver = NaverCfg(
-        client_id=_env("NAVER_CLIENT_ID"),
-        client_secret=_env("NAVER_CLIENT_SECRET"),
+        client_id=naver_id,
+        client_secret=naver_secret,
         keyword_pool=pool2,
         pool_limit=_env_int("NAVER_POOL_LIMIT", 50),
     )
     return wp, run, naver
 
 
-def validate(wp: WPConfig) -> None:
+def validate_wp(wp: WPConfig) -> None:
     missing = []
     if not wp.base_url:
         missing.append("WP_BASE_URL")
@@ -134,6 +135,10 @@ def validate(wp: WPConfig) -> None:
         missing.append("WP_APP_PASS")
     if missing:
         raise RuntimeError("필수 WP 설정 누락: " + ", ".join(missing))
+
+
+def _safe_len(s: str) -> str:
+    return f"OK(len={len(s)})" if s else "MISSING"
 
 
 # -------------------------
@@ -198,19 +203,14 @@ def _xml_text(el: Optional[ET.Element]) -> str:
 
 
 def fetch_google_trending(geo: str, limit: int) -> List[Dict[str, Any]]:
-    """
-    Google Trends Trending RSS: https://trends.google.com/trending/rss?geo=KR
-    """
     url = f"https://trends.google.com/trending/rss?geo={geo}"
     r = requests.get(url, timeout=30)
     if r.status_code != 200:
         raise RuntimeError(f"Google Trends RSS failed: {r.status_code} body={r.text[:200]}")
-    xml = r.content
-
-    root = ET.fromstring(xml)
+    root = ET.fromstring(r.content)
     items = root.findall(".//item")
-    out: List[Dict[str, Any]] = []
 
+    out: List[Dict[str, Any]] = []
     for it in items[: max(1, limit)]:
         title = _xml_text(it.find("title"))
         link = _xml_text(it.find("link"))
@@ -219,7 +219,6 @@ def fetch_google_trending(geo: str, limit: int) -> List[Dict[str, Any]]:
         approx_traffic = ""
         news_list: List[Dict[str, str]] = []
 
-        # namespace 모르는 태그는 endswith로 처리
         for child in list(it):
             tag = child.tag.lower()
             if tag.endswith("approx_traffic"):
@@ -257,18 +256,20 @@ NAVER_DATALAB_ENDPOINT = "https://openapi.naver.com/v1/datalab/search"
 
 def fetch_naver_datalab_rank(nc: NaverCfg, limit: int) -> List[Dict[str, Any]]:
     """
-    네이버는 '실검'이 공식 제공되지 않으므로,
-    NAVER_KEYWORD_POOL(후보 키워드) 내에서 전일 대비 상승폭(상대지수 delta) 기준 TOP을 계산.
+    NAVER_KEYWORD_POOL(후보 키워드) 내에서
+    전일 대비 상승폭(상대지수 delta) 기준 TOP 계산.
+
+    ✅ 네이버가 401/권한문제여도 전체 실패시키지 않고 "스킵 안내"로 진행
     """
     if not nc.client_id or not nc.client_secret:
-        return [{"note": "NAVER_CLIENT_ID/NAVER_CLIENT_SECRET 미설정 → 네이버 섹션 스킵"}]
+        return [{"note": "XNAVERCLIENT_ID / XNAVERCLIENT_SECRET 미설정 → 네이버 섹션 스킵"}]
 
     pool = nc.keyword_pool[: max(0, nc.pool_limit)]
     if not pool:
         return [{"note": "NAVER_KEYWORD_POOL 미설정 → 네이버 섹션 스킵"}]
 
     end = now_kst().date()
-    start = end - timedelta(days=1)  # 2일치(전일/당일) 확보
+    start = end - timedelta(days=1)  # 전일/당일 2일치 확보
     start_s = start.strftime("%Y-%m-%d")
     end_s = end.strftime("%Y-%m-%d")
 
@@ -283,17 +284,29 @@ def fetch_naver_datalab_rank(nc: NaverCfg, limit: int) -> List[Dict[str, Any]]:
         return [lst[i : i + n] for i in range(0, len(lst), n)]
 
     ranked: List[Dict[str, Any]] = []
+
     with requests.Session() as s:
-        for ch in chunks(pool, 5):  # API는 그룹 여러개를 한번에 보낼 수 있음(여기선 5개씩)
+        for ch in chunks(pool, 5):
             payload = {
                 "startDate": start_s,
                 "endDate": end_s,
                 "timeUnit": "date",
                 "keywordGroups": [{"groupName": kw, "keywords": [kw]} for kw in ch],
             }
-            r = s.post(NAVER_DATALAB_ENDPOINT, headers=headers, data=json.dumps(payload), timeout=30)
+
+            r = s.post(NAVER_DATALAB_ENDPOINT, headers=headers, json=payload, timeout=30)
+
+            if r.status_code == 401:
+                return [{
+                    "note": (
+                        "네이버 DataLab 인증 실패(401). "
+                        "1) GitHub Secrets의 XNAVERCLIENT_ID / XNAVERCLIENT_SECRET 값이 맞는지 "
+                        "2) 네이버 개발자센터에서 해당 애플리케이션에 DataLab Search API 권한이 추가되어 있는지 확인 필요"
+                    )
+                }]
+
             if r.status_code != 200:
-                raise RuntimeError(f"Naver DataLab failed: {r.status_code} body={r.text[:300]}")
+                return [{"note": f"네이버 DataLab 오류({r.status_code}). 응답: {r.text[:200]}"}]
 
             data = r.json()
             results = data.get("results", []) or []
@@ -302,7 +315,6 @@ def fetch_naver_datalab_rank(nc: NaverCfg, limit: int) -> List[Dict[str, Any]]:
                 series = res.get("data", []) or []
                 if len(series) < 2:
                     continue
-                # series: [{"period":"YYYY-MM-DD","ratio":...}, ...]
                 prev = float(series[-2].get("ratio", 0) or 0)
                 last = float(series[-1].get("ratio", 0) or 0)
                 delta = last - prev
@@ -343,7 +355,10 @@ def build_google_table(items: List[Dict[str, Any]]) -> str:
                 nt = esc(n.get("title", ""))
                 nu = esc(n.get("url", ""))
                 ns = esc(n.get("source", ""))
-                li.append(f'<li><a href="{nu}" target="_blank" rel="nofollow noopener">{nt}</a> <span style="opacity:.7;">({ns})</span></li>')
+                li.append(
+                    f'<li><a href="{nu}" target="_blank" rel="nofollow noopener">{nt}</a> '
+                    f'<span style="opacity:.7;">({ns})</span></li>'
+                )
             news_html = "<ul style='margin:6px 0 0 18px; padding:0; font-size:13px;'>" + "".join(li) + "</ul>"
 
         rows.append(
@@ -377,7 +392,6 @@ def build_google_table(items: List[Dict[str, Any]]) -> str:
 
 
 def build_naver_table(items: List[Dict[str, Any]]) -> str:
-    # 스킵 노트면 안내만
     if items and "note" in items[0]:
         return f"""
         <h2>네이버 트렌드 TOP</h2>
@@ -388,8 +402,8 @@ def build_naver_table(items: List[Dict[str, Any]]) -> str:
     for i, it in enumerate(items, start=1):
         kw = esc(it.get("keyword", ""))
         link = it.get("link", "")
-        delta = it.get("delta", 0.0)
-        last = it.get("last", 0.0)
+        delta = float(it.get("delta", 0.0) or 0.0)
+        last = float(it.get("last", 0.0) or 0.0)
 
         kw_html = f'<a href="{esc(link)}" target="_blank" rel="nofollow noopener">{kw}</a>' if link else kw
         rows.append(
@@ -406,8 +420,7 @@ def build_naver_table(items: List[Dict[str, Any]]) -> str:
     return f"""
     <h2>네이버 트렌드 TOP {len(items)}</h2>
     <p style="font-size:13px;opacity:.75;margin-top:-6px;">
-      ※ 네이버는 '실시간 검색어(실검)'이 공식 제공되지 않아, NAVER_KEYWORD_POOL(후보 키워드) 내에서
-      데이터랩 상대지수의 전일 대비 상승폭 기준으로 랭킹을 계산합니다.
+      ※ NAVER_KEYWORD_POOL(후보 키워드) 내에서 데이터랩 상대지수의 전일 대비 상승폭 기준으로 랭킹을 계산합니다.
     </p>
     <table style="border-collapse:collapse;width:100%;font-size:14px;">
       <thead>
@@ -428,7 +441,7 @@ def build_naver_table(items: List[Dict[str, Any]]) -> str:
 def build_post_html(date_str: str, google_items: List[Dict[str, Any]], naver_items: List[Dict[str, Any]]) -> str:
     disclosure = (
         '<p style="padding:10px;border-left:4px solid #111;background:#f7f7f7;">'
-        "※ 이 포스팅은 정보 제공 목적이며, 외부 링크 클릭 시 제휴마케팅/광고 링크가 포함될 수 있습니다."
+        "※ 출처별 산정 방식이 다를 수 있으며, 네이버 섹션은 후보 키워드 풀 기반 비교입니다."
         "</p>"
     )
     head = f"<p>기준일: <b>{esc(date_str)}</b></p>"
@@ -446,7 +459,7 @@ def build_post_html(date_str: str, google_items: List[Dict[str, Any]], naver_ite
 # -------------------------
 def main():
     wp, run, naver = load_configs()
-    validate(wp)
+    validate_wp(wp)
 
     date_str = now_kst().strftime("%Y-%m-%d")
     slug = f"realtime-keywords-{date_str}".lower()
@@ -454,11 +467,13 @@ def main():
 
     if run.debug:
         print("[DEBUG] WP_BASE_URL:", wp.base_url)
-        print("[DEBUG] WP_USER len:", len(wp.user))
-        print("[DEBUG] WP_APP_PASS len:", len(wp.app_pass))
+        print("[DEBUG] WP_USER:", _safe_len(wp.user))
+        print("[DEBUG] WP_APP_PASS:", _safe_len(wp.app_pass))
         print("[DEBUG] WP_CATEGORY_ID:", wp.category_id)
         print("[DEBUG] GOOGLE_GEO:", run.google_geo, "LIMIT:", run.limit)
-        print("[DEBUG] NAVER_POOL size:", len(naver.keyword_pool), "POOL_LIMIT:", naver.pool_limit)
+        print("[DEBUG] XNAVERCLIENT_ID:", _safe_len(naver.client_id))
+        print("[DEBUG] XNAVERCLIENT_SECRET:", _safe_len(naver.client_secret))
+        print("[DEBUG] NAVER_KEYWORD_POOL size:", len(naver.keyword_pool), "POOL_LIMIT:", naver.pool_limit)
 
     google_items = fetch_google_trending(run.google_geo, run.limit)
     naver_items = fetch_naver_datalab_rank(naver, run.limit)
@@ -485,5 +500,6 @@ if __name__ == "__main__":
         main()
     except Exception:
         import traceback
+
         traceback.print_exc()
         raise
