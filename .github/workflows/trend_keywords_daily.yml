@@ -1,9 +1,12 @@
-name: Daily Trend Keywords to WordPress (Google + Naver)
+name: Daily Trend Keywords to WordPress (AM/PM Separate Posts)
 
 on:
   schedule:
-    # 매일 00:10 KST = 전날 15:10 UTC
-    - cron: "10 15 * * *"
+    # UTC 기준
+    # 09:10 KST = 00:10 UTC
+    - cron: "10 0 * * *"
+    # 18:10 KST = 09:10 UTC
+    - cron: "10 9 * * *"
   workflow_dispatch:
 
 jobs:
@@ -22,26 +25,6 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install requests
-
-      # 필요할 때만 수동 실행(workflow_dispatch)에서 len 체크
-      - name: Debug env (safe)
-        if: ${{ github.event_name == 'workflow_dispatch' }}
-        env:
-          WP_BASE_URL: ${{ secrets.WP_BASE_URL }}
-          WP_USER: ${{ secrets.WP_USER }}
-          WP_APP_PASS: ${{ secrets.WP_APP_PASS }}
-          XNAVERCLIENT_ID: ${{ secrets.XNAVERCLIENT_ID }}
-          XNAVERCLIENT_SECRET: ${{ secrets.XNAVERCLIENT_SECRET }}
-          NAVER_KEYWORD_POOL: ${{ secrets.NAVER_KEYWORD_POOL }}
-        run: |
-          python - <<'PY'
-          import os
-          def show(k):
-              v=os.getenv(k,"")
-              print(f"{k}: {'OK' if v else 'MISSING'} len={len(v)}")
-          for k in ["WP_BASE_URL","WP_USER","WP_APP_PASS","XNAVERCLIENT_ID","XNAVERCLIENT_SECRET","NAVER_KEYWORD_POOL"]:
-              show(k)
-          PY
 
       - name: Run bot
         env:
@@ -63,8 +46,11 @@ jobs:
           NAVER_POOL_LIMIT: "50"
           NAVER_LOOKBACK_DAYS: "7"
 
-          # 필요할 때만 켜
+          # 필요시
           # DEBUG: "1"
           # DRY_RUN: "1"
+
+          # 수동 실행 시 원하는 슬롯 강제하려면(예: workflow_dispatch에서)
+          # RUN_SLOT: "am"
         run: |
           python trend_keywords_daily_to_wp.py
