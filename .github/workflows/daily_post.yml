@@ -3,18 +3,15 @@ name: run-daily-post
 on:
   workflow_dispatch:
   schedule:
-    - cron: "*/5 * * * *"   # 5분마다(UTC 기준이지만 */5는 상관없음)
-
-permissions:
-  contents: read
-
-concurrency:
-  group: run-daily-post
-  cancel-in-progress: true
+    - cron: "*/5 * * * *"   # ✅ 테스트용: 5분마다 (UTC 기준)
 
 jobs:
   post:
     runs-on: ubuntu-latest
+    concurrency:
+      group: run-daily-post
+      cancel-in-progress: true
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -23,30 +20,27 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-
-      - name: Debug trigger info (중요)
-        run: |
-          echo "event_name=${{ github.event_name }}"
-          echo "actor=${{ github.actor }}"
-          echo "ref=${{ github.ref }}"
-          date
+          cache: "pip"
 
       - name: Install deps
         run: |
           python -m pip install --upgrade pip
-          pip install requests beautifulsoup4 lxml feedparser
+          pip install -r requirements.txt
 
       - name: Create bot_config.json from Secrets
         env:
           WP_BASE_URL: ${{ secrets.WP_BASE_URL }}
           WP_USER: ${{ secrets.WP_USER }}
           WP_APP_PASS: ${{ secrets.WP_APP_PASS }}
-          KAKAO_REST_KEY: ${{ secrets.KAKAO_REST_KEY }}
-          KAKAO_REFRESH_TOKEN: ${{ secrets.KAKAO_REFRESH_TOKEN }}
+          ALPHAVANTAGE_API_KEY: ${{ secrets.ALPHAVANTAGE_API_KEY }}
+          WP_STATUS: ${{ secrets.WP_STATUS }}          # optional (publish/draft)
+          TEST_MODE: ${{ secrets.TEST_MODE }}          # optional ("1"이면 매번 새 글)
+          KAKAO_REST_KEY: ${{ secrets.KAKAO_REST_KEY }}        # optional
+          KAKAO_REFRESH_TOKEN: ${{ secrets.KAKAO_REFRESH_TOKEN }}  # optional
         run: |
           python - <<'PY'
           import os, json, sys
-          required = ["WP_BASE_URL", "WP_USER", "WP_APP_PASS"]
+          required = ["WP_BASE_URL","WP_USER","WP_APP_PASS","ALPHAVANTAGE_API_KEY"]
           missing = [k for k in required if not os.getenv(k)]
           if missing:
             sys.exit("Missing secrets: " + ", ".join(missing))
@@ -55,6 +49,9 @@ jobs:
             "wp_base_url": os.environ["WP_BASE_URL"],
             "wp_user": os.environ["WP_USER"],
             "wp_app_pass": os.environ["WP_APP_PASS"],
+            "alphavantage_api_key": os.environ["ALPHAVANTAGE_API_KEY"],
+            "wp_status": (os.getenv("WP_STATUS") or "publish"),
+            "test_mode": (os.getenv("TEST_MODE") or ""),
           }
 
           if os.getenv("KAKAO_REST_KEY") and os.getenv("KAKAO_REFRESH_TOKEN"):
