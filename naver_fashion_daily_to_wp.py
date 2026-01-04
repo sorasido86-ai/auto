@@ -59,7 +59,7 @@ class WordPressConfig:
 @dataclass
 class PostConfig:
     title_template: str = "{date} 네이버 쇼핑 남성/여성 의류 TOP20 (데일리)"
-    disclosure: str = "※ 이 포스팅은 제휴마케팅 활동의 일환으로, 이에 따른 일정액의 수수료를 제공받을 수 있습니다."
+    disclosure: str = "※ 이 포스팅은 데이터 순위를 기록하기 위한 자료입니다."
     note: str = "데이터 출처: 네이버 쇼핑 검색 API(정렬 기준: {sort})."
 
 
