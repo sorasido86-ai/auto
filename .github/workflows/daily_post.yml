@@ -2,17 +2,34 @@ name: run-daily-post
 
 on:
   workflow_dispatch:
+    inputs:
+      mode:
+        description: "test(매번 새글) / daily(1일 1글)"
+        required: false
+        default: "test"
+      status:
+        description: "draft / publish"
+        required: false
+        default: "draft"
+
+  # ✅ 테스트: 5분마다 (GitHub는 지연될 수 있음)
   schedule:
-    - cron: "*/5 * * * *"   # (테스트용) 5분마다 실행
+    - cron: "*/5 * * * *"
+
+concurrency:
+  group: run-daily-post
+  cancel-in-progress: true
 
 jobs:
   post:
     runs-on: ubuntu-latest
 
-    # 5분마다 돌릴 때 겹치면 꼬일 수 있어서 동시실행 방지
-    concurrency:
-      group: run-daily-post
-      cancel-in-progress: true
+    env:
+      TZ: Asia/Seoul
+      # 스케줄이면 무조건 test로(매번 새글) / 수동이면 입력값 반영
+      MODE: ${{ github.event_name == 'schedule' && 'test' || (github.event.inputs.mode || 'test') }}
+      WP_STATUS: ${{ github.event_name == 'schedule' && 'draft' || (github.event.inputs.status || 'draft') }}
+      RUN_ID: ${{ github.run_id }}
 
     steps:
       - name: Checkout
@@ -33,54 +50,32 @@ jobs:
           WP_BASE_URL: ${{ secrets.WP_BASE_URL }}
           WP_USER: ${{ secrets.WP_USER }}
           WP_APP_PASS: ${{ secrets.WP_APP_PASS }}
-
-          # ✅ 선택: 있으면 사용, 없으면 그냥 스킵
-          ALPHAVANTAGE_API_KEY: ${{ secrets.ALPHAVANTAGE_API_KEY }}
-
-          # ✅ 선택: 없으면 기본 publish로 동작 (draft 원하면 Secrets에 "draft" 넣기)
-          WP_STATUS: ${{ secrets.WP_STATUS }}
-
-          # ✅ 선택: 테스트 모드 표시용(원하면 아무 값이나 넣기)
-          TEST_MODE: ${{ secrets.TEST_MODE }}
-
-          # ✅ 선택: 카톡 알림(안 쓰면 비워둬도 됨)
+          # 카카오는 선택(안 쓰면 비워도 됨)
           KAKAO_REST_KEY: ${{ secrets.KAKAO_REST_KEY }}
           KAKAO_REFRESH_TOKEN: ${{ secrets.KAKAO_REFRESH_TOKEN }}
-
         run: |
           python - <<'PY'
           import os, json, sys
-
-          # ✅ 워드프레스 3개만 필수
           required = ["WP_BASE_URL", "WP_USER", "WP_APP_PASS"]
           missing = [k for k in required if not os.getenv(k)]
           if missing:
-              sys.exit("Missing secrets: " + ", ".join(missing))
+            sys.exit("Missing secrets: " + ", ".join(missing))
 
           cfg = {
-              "wp_base_url": os.environ["WP_BASE_URL"],
-              "wp_user": os.environ["WP_USER"],
-              "wp_app_pass": os.environ["WP_APP_PASS"],
-              "wp_status": (os.getenv("WP_STATUS") or "publish"),
-              "test_mode": (os.getenv("TEST_MODE") or ""),
+            "wp_base_url": os.environ["WP_BASE_URL"],
+            "wp_user": os.environ["WP_USER"],
+            "wp_app_pass": os.environ["WP_APP_PASS"],
           }
 
-          # ✅ AlphaVantage 키는 선택(있을 때만 저장)
-          if os.getenv("ALPHAVANTAGE_API_KEY"):
-              cfg["alphavantage_api_key"] = os.environ["ALPHAVANTAGE_API_KEY"]
-
-          # ✅ 카톡도 선택(둘 다 있을 때만 저장)
           if os.getenv("KAKAO_REST_KEY") and os.getenv("KAKAO_REFRESH_TOKEN"):
-              cfg["kakao_rest_key"] = os.environ["KAKAO_REST_KEY"]
-              cfg["kakao_refresh_token"] = os.environ["KAKAO_REFRESH_TOKEN"]
+            cfg["kakao_rest_key"] = os.environ["KAKAO_REST_KEY"]
+            cfg["kakao_refresh_token"] = os.environ["KAKAO_REFRESH_TOKEN"]
 
-          with open("bot_config.json", "w", encoding="utf-8") as f:
-              json.dump(cfg, f, ensure_ascii=False, indent=2)
+          with open("bot_config.json","w",encoding="utf-8") as f:
+            json.dump(cfg,f,ensure_ascii=False,indent=2)
 
           print("bot_config.json written")
           PY
 
       - name: Run
-        env:
-          TZ: Asia/Seoul
         run: python -u daily_post.py
