@@ -12,7 +12,6 @@ permissions:
 jobs:
   run:
     runs-on: ubuntu-latest
-
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -30,7 +29,6 @@ jobs:
       - name: Set RUN_SLOT (am/pm)
         shell: bash
         run: |
-          # github.event.schedule 값으로 어떤 cron이 트리거됐는지 판별
           if [ "${{ github.event_name }}" = "schedule" ]; then
             if [ "${{ github.event.schedule }}" = "5 0 * * *" ]; then
               echo "RUN_SLOT=am" >> $GITHUB_ENV
@@ -38,44 +36,39 @@ jobs:
               echo "RUN_SLOT=pm" >> $GITHUB_ENV
             fi
           else
-            # 수동 실행(workflow_dispatch) 기본 am (원하면 Actions UI에서 env로 override 가능)
             echo "RUN_SLOT=am" >> $GITHUB_ENV
           fi
 
-      - name: Restore SQLite cache
+      - name: Cache sqlite
         uses: actions/cache@v4
         with:
           path: data/hot_keyword_naver_shop.sqlite3
-          key: hotkw-${{ runner.os }}-${{ github.run_id }}
+          key: hotkw-${{ runner.os }}-${{ github.ref_name }}
           restore-keys: |
             hotkw-${{ runner.os }}-
 
-      - name: Sanity check file
-        run: |
-          ls -la
-          test -f hot_keyword_naver_shop_to_wp.py
-
       - name: Run bot
         env:
-          # ✅ 네이버 (너가 쓰는 이름)
-          XNAVERCLIENT_ID: ${{ secrets.XNAVERCLIENT_ID }}
-          XNAVERCLIENT_SECRET: ${{ secrets.XNAVERCLIENT_SECRET }}
+          # ✅ 네이버 (이제 이 이름만 쓰면 됨)
+          NAVER_CLIENT_ID: ${{ secrets.NAVER_CLIENT_ID }}
+          NAVER_CLIENT_SECRET: ${{ secrets.NAVER_CLIENT_SECRET }}
 
-          # ✅ 워드프레스 (너가 쓰는 이름)
+          # ✅ 워드프레스
           WP_BASE_URL: ${{ secrets.WP_BASE_URL }}
           WP_USER: ${{ secrets.WP_USER }}
           WP_APP_PASS: ${{ secrets.WP_APP_PASS }}
 
-          # 옵션(원하면 Secrets 말고 여기서 고정도 가능)
+          # 옵션
+          RUN_SLOT: ${{ env.RUN_SLOT }}
           WP_CATEGORY_IDS: "31"
+
           HOT_KEYWORDS_LIMIT: "20"
           NAVER_PER_KEYWORD: "5"
           TRENDS_GEO: "KR"
           NAVER_SORT: "sim"
 
-          # 디버그 옵션
           DEBUG: "0"
           DRY_RUN: "0"
         run: |
-          echo "RUN_SLOT=$RUN_SLOT"
-          python hot_keyword_naver_shop_to_wp.py --debug
+          ls -la
+          python hot_keyword_naver_shop_to_wp.py
