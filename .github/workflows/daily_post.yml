@@ -3,11 +3,12 @@ name: run-daily-post
 on:
   workflow_dispatch:
   schedule:
-    - cron: "*/5 * * * *"  # 테스트용: 5분마다(UTC 기준)
+    - cron: "*/5 * * * *"   # 테스트용: 5분마다(UTC 기준)
 
 jobs:
   post:
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
