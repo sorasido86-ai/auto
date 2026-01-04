@@ -18,6 +18,13 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Show repo files (debug)
+        run: |
+          echo "PWD=$(pwd)"
+          ls -la
+          echo "---- find *.py ----"
+          find . -maxdepth 3 -type f -name "*.py" -print
+
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
@@ -48,7 +55,7 @@ jobs:
           echo "RUN_SLOT=$SLOT" >> $GITHUB_ENV
           echo "RUN_SLOT decided: $SLOT"
 
-      - name: Run bot
+      - name: Run bot (auto locate)
         env:
           # WordPress
           WP_BASE_URL: ${{ secrets.WP_BASE_URL }}
@@ -63,15 +70,33 @@ jobs:
           GOOGLE_GEO: "KR"
           FEEDS_MAX: "100"
 
-          # (선택) 추가 블록리스트 - 필요할 때만
-          # BLOCKLIST: "daum,net,com,kr,naver,google"
-
-          # (선택) 커뮤니티 RSS 직접 지정하고 싶으면 Secrets로 넣어도 됨
-          # COMMUNITY_FEEDS: ${{ secrets.COMMUNITY_FEEDS }}
-          # NEWS_FEEDS: ${{ secrets.NEWS_FEEDS }}
-
-          # 디버그/드라이런
+          # 필요시
           # DEBUG: "1"
           # DRY_RUN: "1"
+
         run: |
-          python daily_issue_keywords_to_wp.py
+          set -e
+
+          # 1) 루트에 있는지 먼저 확인
+          if [ -f "daily_issue_keywords_to_wp.py" ]; then
+            python daily_issue_keywords_to_wp.py
+            exit 0
+          fi
+
+          # 2) 혹시 scripts/ 폴더에 넣었으면 거기도 탐색
+          if [ -f "scripts/daily_issue_keywords_to_wp.py" ]; then
+            python scripts/daily_issue_keywords_to_wp.py
+            exit 0
+          fi
+
+          # 3) 그래도 없으면 레포에서 이름으로 찾아 실행
+          TARGET=$(find . -maxdepth 5 -type f -name "daily_issue_keywords_to_wp.py" | head -n 1)
+          if [ -n "$TARGET" ]; then
+            python "$TARGET"
+            exit 0
+          fi
+
+          echo "ERROR: daily_issue_keywords_to_wp.py 파일을 레포에서 찾을 수 없습니다."
+          echo "현재 레포의 *.py 목록:"
+          find . -maxdepth 5 -type f -name "*.py" -print
+          exit 1
