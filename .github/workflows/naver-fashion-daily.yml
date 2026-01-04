@@ -3,8 +3,7 @@ name: Naver Fashion Daily to WordPress
 on:
   workflow_dispatch: {}
   schedule:
-    # 00:13 UTC = 09:13 KST (매일)
-    - cron: "13 0 * * *"
+    - cron: "13 0 * * *"  # 09:13 KST
 
 permissions:
   contents: write
@@ -13,116 +12,31 @@ jobs:
   run:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Setup Python
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
           cache: "pip"
 
-      - name: Install dependencies
+      - name: Install deps
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Ensure data dir
-        run: mkdir -p data
-
-      - name: Create bot_config.json (runtime only)
+      - name: Run bot (debug first)
         run: |
-          cat > bot_config.json <<JSON
-          {
-            "naver": {
-              "client_id": "${{ secrets.NAVER_CLIENT_ID }}",
-              "client_secret": "${{ secrets.NAVER_CLIENT_SECRET }}",
-              "display": 20,
-              "sort": "sim",
-              "filter": "",
-              "exclude": "used:rental:cbshop",
-              "queries": {
-                "women": "여성의류",
-                "men": "남성의류"
-              }
-            },
-            "wordpress": {
-              "site_url": "${{ secrets.WP_SITE_URL }}",
-              "username": "${{ secrets.WP_USERNAME }}",
-              "app_password": "${{ secrets.WP_APP_PASSWORD }}",
-              "status": "publish",
-              "category_ids": [],
-              "tag_ids": []
-            },
-            "post": {
-              "title_template": "{date} 네이버 쇼핑 남성/여성 의류 TOP20 (데일리)",
-              "disclosure": "※ 이 포스팅은 제휴마케팅 활동의 일환으로, 이에 따른 일정액의 수수료를 제공받을 수 있습니다.",
-              "note": "데이터 출처: 네이버 쇼핑 검색 API(정렬 기준: sim)."
-            },
-            "storage": {
-              "sqlite_path": "data/naver_fashion_rankings.sqlite3"
-            },
-            "run": {
-              "dry_run": false
-            }
-          }
-          JSON
-            - name: Debug - check secrets exist (safe)
-        run: |
-          python - <<'PY'
-          import os
-          keys = ["NAVER_CLIENT_ID","NAVER_CLIENT_SECRET","WP_SITE_URL","WP_USERNAME","WP_APP_PASSWORD"]
-          for k in keys:
-            v = os.getenv(k, "")
-            print(f"{k}: {'OK' if len(v)>0 else 'MISSING'} (len={len(v)})")
-          PY
+          python naver_fashion_daily_to_wp.py --debug
         env:
           NAVER_CLIENT_ID: ${{ secrets.NAVER_CLIENT_ID }}
           NAVER_CLIENT_SECRET: ${{ secrets.NAVER_CLIENT_SECRET }}
           WP_SITE_URL: ${{ secrets.WP_SITE_URL }}
           WP_USERNAME: ${{ secrets.WP_USERNAME }}
           WP_APP_PASSWORD: ${{ secrets.WP_APP_PASSWORD }}
+          SQLITE_PATH: data/naver_fashion_rankings.sqlite3
+          # DEBUG: "1"  # --debug 대신 이걸 써도 됨
+          # DRY_RUN: "1" # 테스트로 글 발행 없이 HTML만 보고 싶으면
 
-      - name: Debug - test Naver API (status only)
-        run: |
-          python - <<'PY'
-          import requests, os
-          url="https://openapi.naver.com/v1/search/shop.json"
-          headers={"X-Naver-Client-Id": os.environ["NAVER_CLIENT_ID"],
-                   "X-Naver-Client-Secret": os.environ["NAVER_CLIENT_SECRET"]}
-          r=requests.get(url, headers=headers, params={"query":"여성의류","display":1,"start":1,"sort":"sim"}, timeout=20)
-          print("Naver status:", r.status_code)
-          print("Body head:", r.text[:200])
-          PY
-        env:
-          NAVER_CLIENT_ID: ${{ secrets.NAVER_CLIENT_ID }}
-          NAVER_CLIENT_SECRET: ${{ secrets.NAVER_CLIENT_SECRET }}
-
-      - name: Debug - test WordPress REST (status only)
-        run: |
-          python - <<'PY'
-          import requests, os, base64
-          site=os.environ["WP_SITE_URL"].rstrip("/")
-          token=base64.b64encode(f'{os.environ["WP_USERNAME"]}:{os.environ["WP_APP_PASSWORD"]}'.encode()).decode()
-          headers={"Authorization": f"Basic {token}"}
-          # 1) REST가 살아있는지 (인증 불필요)
-          r=requests.get(site+"/wp-json/", timeout=20)
-          print("WP /wp-json status:", r.status_code)
-          # 2) 인증이 되는지 (인증 필요)
-          r2=requests.get(site+"/wp-json/wp/v2/users/me", headers=headers, timeout=20)
-          print("WP auth users/me status:", r2.status_code)
-          print("Body head:", r2.text[:200])
-          PY
-        env:
-          WP_SITE_URL: ${{ secrets.WP_SITE_URL }}
-          WP_USERNAME: ${{ secrets.WP_USERNAME }}
-          WP_APP_PASSWORD: ${{ secrets.WP_APP_PASSWORD }}
-
-      - name: Run bot
-        run: |
-          python naver_fashion_daily_to_wp.py bot_config.json
-
-      # ✅ 한 달치 누적(랭킹 DB)을 GitHub repo에 저장하고 싶으면 아래를 켜둬 (추천)
       - name: Commit DB back to repo (optional)
         run: |
           if [[ -n "$(git status --porcelain data/naver_fashion_rankings.sqlite3)" ]]; then
