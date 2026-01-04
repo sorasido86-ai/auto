@@ -3,25 +3,19 @@ name: run-daily-post
 on:
   workflow_dispatch:
   schedule:
-    # ✅ 테스트용: 5분마다(UTC 기준)
     - cron: "*/5 * * * *"
 
 jobs:
   post:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
-
-    # (선택) 5분 스케줄 테스트 때 작업이 겹치지 않게
     concurrency:
       group: run-daily-post
       cancel-in-progress: true
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Setup Python
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
@@ -40,12 +34,10 @@ jobs:
         run: |
           python - <<'PY'
           import os, json, sys
-
-          # 필수 3개
           required = ["WP_BASE_URL", "WP_USER", "WP_APP_PASS"]
           missing = [k for k in required if not os.getenv(k)]
           if missing:
-            sys.exit("❌ Missing required Secrets: " + ", ".join(missing))
+            sys.exit("Missing secrets: " + ", ".join(missing))
 
           cfg = {
             "wp_base_url": os.environ["WP_BASE_URL"],
@@ -53,19 +45,16 @@ jobs:
             "wp_app_pass": os.environ["WP_APP_PASS"],
           }
 
-          # 카카오는 선택
           if os.getenv("KAKAO_REST_KEY") and os.getenv("KAKAO_REFRESH_TOKEN"):
             cfg["kakao_rest_key"] = os.environ["KAKAO_REST_KEY"]
             cfg["kakao_refresh_token"] = os.environ["KAKAO_REFRESH_TOKEN"]
 
-          with open("bot_config.json", "w", encoding="utf-8") as f:
-            json.dump(cfg, f, ensure_ascii=False, indent=2)
-
-          print("✅ bot_config.json written")
+          with open("bot_config.json","w",encoding="utf-8") as f:
+            json.dump(cfg,f,ensure_ascii=False,indent=2)
+          print("bot_config.json written")
           PY
 
       - name: Run
         env:
           TZ: Asia/Seoul
-        run: |
-          python -u daily_post.py
+        run: python -u daily_post.py
