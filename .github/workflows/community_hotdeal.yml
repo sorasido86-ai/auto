@@ -48,7 +48,7 @@ jobs:
           WP_APP_PASS: ${{ secrets.WP_APP_PASS }}
 
           # ✅ 기본 카테고리 4번 (원하면 여기 숫자만 바꾸면 끝)
-          WP_CATEGORY_IDS: "4"
+          WP_CATEGORY_IDS: "8"
 
           # 선택: 태그 ID들(쉼표)
           # WP_TAG_IDS: "1,2,3"
