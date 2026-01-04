@@ -1,592 +1,564 @@
 # -*- coding: utf-8 -*-
 """
-daily_post.py (WordPress 자동 글 발행)
-- 무료/키 없이 동작하도록 구성 (AlphaVantage 등 API Key 불필요)
-- 지표: USD/KRW, Brent(선물), KOSPI
-- 변동 원인(참고): Google News RSS(한국어) 헤드라인 3개씩
-- TEST_MODE=1 이면 5분 테스트용으로 매번 새 글(슬러그 고유) + draft 발행
+Daily WordPress Post (No paid API key)
+- USD/KRW: Stooq (fallback: exchangerate.host)
+- KOSPI  : Stooq (^kospi)
+- Brent  : EIA HTML table (fallback: Stooq brn.f / cb.f)
+- News   : Google News RSS (ko-KR) + 한글 제목 위주 필터링
 
-필수 환경변수/설정(bot_config.json 또는 GitHub Secrets)
-- WP_BASE_URL: 예) https://rainsow.com
-- WP_USER: 워드프레스 사용자명
-- WP_APP_PASS: 워드프레스 "애플리케이션 비밀번호"
+MODE
+- daily: 같은 날짜 slug면 중복 방지(1일 1회)
+- test : 매 실행마다 새로운 slug 생성 (5분 스케줄 테스트용)
 
-선택
-- KAKAO_REST_KEY, KAKAO_REFRESH_TOKEN (카톡 나에게 보내기 알림)
-- WP_POST_STATUS: publish/draft (TEST_MODE=1이면 draft가 우선)
-- TEST_MODE: "1"이면 테스트 모드
+ENV (Actions에서 주로 사용)
+- MODE=test|daily
+- WP_STATUS=draft|publish
+- RUN_ID=anything (github.run_id 추천)
 """
 
 import os
+import re
 import json
-import time
+import base64
 import csv
-from dataclasses import dataclass
+import io
+import time
+from datetime import datetime
 from pathlib import Path
-from datetime import datetime, timedelta, timezone
+from typing import Dict, Any, List, Tuple, Optional
 from urllib.parse import quote_plus
 
 import requests
+from bs4 import BeautifulSoup
 import feedparser
 
-WP_POSTS_API_SUFFIX = "/wp-json/wp/v2/posts"
 
-DEFAULT_UA = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/120.0.0.0 Safari/537.36"
+WP_POSTS_API_SUFFIX = "/wp-json/wp/v2/posts"
+CONFIG_PATH = Path(__file__).with_name("bot_config.json")
+
+UA = (
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/120.0 Safari/537.36"
 )
 
-KST = timezone(timedelta(hours=9))
+# -----------------------------
+# 공통 유틸
+# -----------------------------
+def now_kst_date_str() -> str:
+    # KST 기준 날짜(서버 TZ에 영향 덜 받게)
+    # Actions에서 TZ=Asia/Seoul도 주지만, 혹시 몰라서 로컬 기준으로만 씀
+    return datetime.now().strftime("%Y-%m-%d")
+
+def is_hangul_text(s: str) -> bool:
+    return bool(re.search(r"[가-힣]", s or ""))
+
+def safe_float(x: Any) -> Optional[float]:
+    try:
+        if x is None:
+            return None
+        s = str(x).strip().replace(",", "")
+        if s in ("", "None", "nan", "NaN", "NA", "-"):
+            return None
+        return float(s)
+    except Exception:
+        return None
+
+def fmt_num(x: Optional[float], digits=2) -> str:
+    if x is None:
+        return "-"
+    return f"{x:,.{digits}f}"
+
+def pct_change(cur: Optional[float], prev: Optional[float]) -> Optional[float]:
+    if cur is None or prev is None or prev == 0:
+        return None
+    return (cur - prev) / prev * 100.0
+
+def http_get(url: str, timeout=25, retries=2) -> requests.Response:
+    last_err = None
+    for i in range(retries + 1):
+        try:
+            r = requests.get(
+                url,
+                timeout=timeout,
+                headers={
+                    "User-Agent": UA,
+                    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,text/plain,*/*;q=0.8",
+                    "Accept-Language": "ko-KR,ko;q=0.9,en;q=0.7",
+                },
+            )
+            r.raise_for_status()
+            return r
+        except Exception as e:
+            last_err = e
+            time.sleep(1.2 * (i + 1))
+    raise last_err
 
 
 # -----------------------------
-# Config
+# 설정 로드 (파일 + ENV 오버라이드)
 # -----------------------------
-def _script_dir() -> Path:
-    return Path(__file__).resolve().parent
+def load_config() -> Dict[str, Any]:
+    cfg: Dict[str, Any] = {}
+    if CONFIG_PATH.exists():
+        with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+            cfg = json.load(f) or {}
 
-
-def load_config() -> dict:
-    """
-    1) bot_config.json(스크립트 옆) 읽고
-    2) 환경변수로 덮어쓰기
-    """
-    cfg: dict = {}
-
-    cfg_path = Path(os.getenv("BOT_CONFIG_PATH", _script_dir() / "bot_config.json"))
-    if cfg_path.exists():
-        cfg.update(json.loads(cfg_path.read_text(encoding="utf-8")))
-
-    # env overlay
-    mapping = {
-        "WP_BASE_URL": "wp_base_url",
-        "WP_USER": "wp_user",
-        "WP_APP_PASS": "wp_app_pass",
-        "WP_POST_STATUS": "wp_post_status",
-        "KAKAO_REST_KEY": "kakao_rest_key",
-        "KAKAO_REFRESH_TOKEN": "kakao_refresh_token",
+    # ENV 오버라이드 지원
+    env_map = {
+        "wp_base_url": os.getenv("WP_BASE_URL"),
+        "wp_user": os.getenv("WP_USER"),
+        "wp_app_pass": os.getenv("WP_APP_PASS"),
+        "kakao_rest_key": os.getenv("KAKAO_REST_KEY"),
+        "kakao_refresh_token": os.getenv("KAKAO_REFRESH_TOKEN"),
     }
-    for env_k, cfg_k in mapping.items():
-        v = os.getenv(env_k)
+    for k, v in env_map.items():
         if v:
-            cfg[cfg_k] = v
-
-    # sanitize
-    if "wp_base_url" in cfg and isinstance(cfg["wp_base_url"], str):
-        cfg["wp_base_url"] = cfg["wp_base_url"].strip().rstrip("/")
-    if "wp_user" in cfg and isinstance(cfg["wp_user"], str):
-        cfg["wp_user"] = cfg["wp_user"].strip()
-    if "wp_app_pass" in cfg and isinstance(cfg["wp_app_pass"], str):
-        # 애플리케이션 비번은 공백이 섞이면 인증 실패함
-        cfg["wp_app_pass"] = cfg["wp_app_pass"].replace(" ", "").strip()
-
+            cfg[k] = v
     return cfg
 
-
-def require_keys(cfg: dict, keys: list[str]) -> None:
-    missing = [k for k in keys if not cfg.get(k)]
-    if missing:
-        raise ValueError("필수 설정 누락: " + ", ".join(missing))
-
-
-def now_kst() -> datetime:
-    return datetime.now(KST)
-
-
-# -----------------------------
-# HTTP helpers
-# -----------------------------
-def http_get(url: str, *, params=None, headers=None, timeout=25) -> requests.Response:
-    h = {"User-Agent": DEFAULT_UA, "Accept": "*/*"}
-    if headers:
-        h.update(headers)
-    r = requests.get(url, params=params, headers=h, timeout=timeout, allow_redirects=True)
-    r.raise_for_status()
-    return r
-
-
-# -----------------------------
-# Kakao (optional)
-# -----------------------------
-def refresh_access_token(cfg: dict) -> str:
-    url = "https://kauth.kakao.com/oauth/token"
-    data = {
-        "grant_type": "refresh_token",
-        "client_id": cfg["kakao_rest_key"],
-        "refresh_token": cfg["kakao_refresh_token"],
-    }
-    r = requests.post(url, data=data, timeout=30)
-    r.raise_for_status()
-    tokens = r.json()
-
-    # 새 refresh_token이 오면 갱신 저장
-    if tokens.get("refresh_token"):
-        cfg["kakao_refresh_token"] = tokens["refresh_token"]
-        # 가능하면 같은 위치에 저장(없으면 무시)
-        try:
-            cfg_path = Path(os.getenv("BOT_CONFIG_PATH", _script_dir() / "bot_config.json"))
-            cfg_path.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
-        except Exception:
-            pass
-
-    return tokens["access_token"]
-
-
-def kakao_send_to_me(cfg: dict, text: str) -> bool:
-    if not (cfg.get("kakao_rest_key") and cfg.get("kakao_refresh_token")):
-        return False
-
-    access_token = refresh_access_token(cfg)
-    url = "https://kapi.kakao.com/v2/api/talk/memo/default/send"
-    headers = {"Authorization": f"Bearer {access_token}"}
-
-    template_object = {
-        "object_type": "text",
-        "text": text[:1000],
-        "link": {"web_url": cfg["wp_base_url"], "mobile_web_url": cfg["wp_base_url"]},
-        "button_title": "사이트 열기",
-    }
-    data = {"template_object": json.dumps(template_object, ensure_ascii=False)}
-    r = requests.post(url, headers=headers, data=data, timeout=30)
-    r.raise_for_status()
-    return True
+def must_get(cfg: Dict[str, Any], key: str) -> str:
+    v = (cfg.get(key) or "").strip()
+    if not v:
+        raise ValueError(f"필수 설정 누락: {key}")
+    return v
 
 
 # -----------------------------
 # WordPress
 # -----------------------------
-def wp_posts_api(cfg: dict) -> str:
-    return cfg["wp_base_url"] + WP_POSTS_API_SUFFIX
+def wp_posts_api(cfg: Dict[str, Any]) -> str:
+    return must_get(cfg, "wp_base_url").rstrip("/") + WP_POSTS_API_SUFFIX
 
+def wp_auth_headers(cfg: Dict[str, Any]) -> Dict[str, str]:
+    user = must_get(cfg, "wp_user").strip()
+    app_pass = must_get(cfg, "wp_app_pass").replace(" ", "").strip()
+    token = base64.b64encode(f"{user}:{app_pass}".encode("utf-8")).decode("utf-8")
+    return {"Authorization": f"Basic {token}"}
 
-def wp_get(cfg: dict, url: str, *, params=None):
-    return requests.get(
-        url,
-        params=params,
-        auth=(cfg["wp_user"], cfg["wp_app_pass"]),
-        headers={"User-Agent": DEFAULT_UA, "Accept": "application/json"},
-        timeout=30,
+def wp_post_exists(cfg: Dict[str, Any], slug: str) -> bool:
+    r = requests.get(
+        wp_posts_api(cfg),
+        params={"slug": slug},
+        headers={**wp_auth_headers(cfg), "User-Agent": UA},
+        timeout=25,
     )
-
-
-def wp_post(cfg: dict, url: str, *, payload: dict):
-    return requests.post(
-        url,
-        json=payload,
-        auth=(cfg["wp_user"], cfg["wp_app_pass"]),
-        headers={"User-Agent": DEFAULT_UA, "Accept": "application/json"},
-        timeout=30,
-    )
-
-
-def wp_post_exists(cfg: dict, slug: str) -> bool:
-    r = wp_get(cfg, wp_posts_api(cfg), params={"slug": slug, "per_page": 1})
     r.raise_for_status()
     return len(r.json()) > 0
 
-
-def wp_create_post(cfg: dict, title: str, slug: str, content_html: str, status: str) -> dict:
-    payload = {"title": title, "slug": slug, "content": content_html, "status": status}
-    r = wp_post(cfg, wp_posts_api(cfg), payload=payload)
+def wp_create_post(cfg: Dict[str, Any], title: str, slug: str, content: str, status: str) -> Dict[str, Any]:
+    payload = {"title": title, "slug": slug, "content": content, "status": status}
+    r = requests.post(
+        wp_posts_api(cfg),
+        headers={**wp_auth_headers(cfg), "Content-Type": "application/json", "User-Agent": UA},
+        data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+        timeout=25,
+    )
     r.raise_for_status()
     return r.json()
 
 
 # -----------------------------
-# Data models
+# 데이터 수집
 # -----------------------------
-@dataclass
-class Indicator:
-    name: str
-    value: float | None
-    prev: float | None
-    date: str | None
-    unit: str = ""
-    source: str = ""
+def fetch_stooq_last_two_closes(symbol: str) -> Tuple[float, float, str]:
+    """
+    returns: (latest, prev, latest_date)
+    """
+    sym = quote_plus(symbol)
+    urls = [
+        f"https://stooq.com/q/d/l/?s={sym}&i=d",
+        f"https://stooq.pl/q/d/l/?s={sym}&i=d",
+    ]
 
-    @property
-    def delta(self) -> float | None:
-        if self.value is None or self.prev is None:
-            return None
-        return self.value - self.prev
+    last_err = None
+    for url in urls:
+        try:
+            r = http_get(url, timeout=25, retries=1)
+            text = (r.text or "").strip()
 
-    @property
-    def pct(self) -> float | None:
-        if self.value is None or self.prev in (None, 0):
-            return None
-        return (self.value - self.prev) / self.prev * 100.0
+            # Stooq가 가끔 HTML/차단 페이지를 줌 -> CSV 아니면 스킵
+            if text.startswith("<") or "Date,Open,High,Low,Close" not in text:
+                raise ValueError("CSV가 아닌 응답(HTML/빈 값) 수신")
 
+            reader = csv.DictReader(io.StringIO(text))
+            rows = []
+            for row in reader:
+                c = safe_float(row.get("Close"))
+                d = (row.get("Date") or "").strip()
+                if c is not None and d:
+                    rows.append((d, c))
 
-# -----------------------------
-# Data fetching (no API keys)
-# -----------------------------
-def _parse_float(x: str) -> float | None:
+            if len(rows) < 2:
+                raise ValueError("데이터가 2개 미만")
+
+            # 마지막 2개
+            d2, c2 = rows[-1]
+            d1, c1 = rows[-2]
+            return c2, c1, d2
+
+        except Exception as e:
+            last_err = e
+
+    raise ValueError(f"Stooq 데이터 수집 실패: {symbol} ({last_err})")
+
+def fetch_usdkrw() -> Tuple[Optional[float], Optional[float], Optional[str], Optional[str]]:
+    """
+    returns (latest, prev, date, error)
+    """
     try:
-        return float(str(x).strip())
-    except Exception:
-        return None
+        latest, prev, d = fetch_stooq_last_two_closes("usdkrw")
+        return latest, prev, d, None
+    except Exception as e:
+        # fallback: exchangerate.host (전일값은 없음)
+        try:
+            r = http_get("https://api.exchangerate.host/latest?base=USD&symbols=KRW", retries=1)
+            j = r.json()
+            val = safe_float(j.get("rates", {}).get("KRW"))
+            if val is None:
+                raise ValueError("fallback 값 파싱 실패")
+            return val, None, now_kst_date_str(), f"Stooq 실패 → fallback 사용 ({e})"
+        except Exception as e2:
+            return None, None, None, f"Stooq+fallback 모두 실패 ({e}) / ({e2})"
 
-
-def fetch_stooq_last_two_closes(symbol: str) -> tuple[float, float, str]:
+def fetch_kospi() -> Tuple[Optional[float], Optional[float], Optional[str], Optional[str]]:
     """
-    Stooq CSV: https://stooq.com/q/d/l/?s=<symbol>&i=d
-    - 반환: (latest_close, prev_close, latest_date)
+    Stooq KOSPI index symbol: ^kospi
     """
-    url = "https://stooq.com/q/d/l/"
-    r = http_get(
-        url,
-        params={"s": symbol, "i": "d"},
-        headers={"Accept": "text/csv,application/csv;q=0.9,*/*;q=0.8"},
-        timeout=30,
-    )
-    text = r.text.strip()
+    try:
+        latest, prev, d = fetch_stooq_last_two_closes("^kospi")
+        return latest, prev, d, None
+    except Exception as e:
+        return None, None, None, f"Stooq 실패 ({e})"
 
-    # 가끔 HTML/빈값이 올 수 있음 (차단/오류)
-    if not text or "<html" in text.lower():
-        raise ValueError(f"Stooq CSV 수집 실패: {symbol} (CSV가 아닌 응답)")
+def fetch_brent_from_eia() -> Tuple[float, float, str]:
+    """
+    EIA Brent Spot Price FOB (RBRTE) HTML table.
+    """
+    url = "https://www.eia.gov/dnav/pet/hist/LeafHandler.ashx?n=PET&s=RBRTE&f=D"
+    r = http_get(url, retries=2)
+    html = r.text or ""
+    soup = BeautifulSoup(html, "lxml")
 
-    reader = csv.DictReader(text.splitlines())
+    # 테이블 찾기(헤더에 Date / Value가 있는 것)
+    tables = soup.find_all("table")
+    target = None
+    for t in tables:
+        th_text = " ".join([th.get_text(" ", strip=True) for th in t.find_all("th")])
+        if "Date" in th_text and ("Value" in th_text or "Prices" in th_text):
+            target = t
+            break
+    if not target:
+        # EIA 페이지 구조가 바뀐 경우
+        raise ValueError("EIA 테이블을 찾지 못했습니다")
+
     rows = []
-    for row in reader:
-        c = _parse_float(row.get("Close"))
-        d = row.get("Date")
-        if c is not None and d:
-            rows.append((d, c))
+    for tr in target.find_all("tr"):
+        tds = [td.get_text(" ", strip=True) for td in tr.find_all("td")]
+        if len(tds) >= 2:
+            d = tds[0].strip()
+            v = safe_float(tds[1])
+            if d and v is not None:
+                rows.append((d, v))
 
     if len(rows) < 2:
-        raise ValueError(f"Stooq 데이터가 부족합니다: {symbol}")
+        raise ValueError("EIA 데이터가 2개 미만입니다")
 
-    latest_d, latest_c = rows[-1]
-    prev_d, prev_c = rows[-2]
-    return latest_c, prev_c, latest_d
+    d2, c2 = rows[-1]
+    d1, c1 = rows[-2]
+    return c2, c1, d2
 
-
-def fetch_usdkrw() -> tuple[float, float, str]:
-    """
-    1) 무료 환율 JSON(날짜 폴더 기반)로 시도
-    2) 실패하면 Stooq(usdkrw)로 폴백
-    """
-    base = "https://cdn.jsdelivr.net/gh/fawazahmed0/currency-api@1"
-    latest_url = f"{base}/latest/currencies/usd/krw.json"
-
+def fetch_brent() -> Tuple[Optional[float], Optional[float], Optional[str], Optional[str]]:
     try:
-        r = http_get(latest_url, timeout=20)
-        data = r.json()
-        latest_date = data.get("date") or data.get("Date")
-        latest_rate = data.get("krw")
-        if latest_rate is None and isinstance(data.get("usd"), dict):
-            latest_rate = data["usd"].get("krw")
-
-        if latest_date and latest_rate is not None:
-            d0 = datetime.fromisoformat(str(latest_date)).date()
-            prev_rate = None
-            prev_date = None
-            for i in range(1, 8):
-                dd = (d0 - timedelta(days=i)).isoformat()
-                url = f"{base}/{dd}/currencies/usd/krw.json"
-                try:
-                    r2 = http_get(url, timeout=20)
-                    data2 = r2.json()
-                    pr = data2.get("krw")
-                    if pr is None and isinstance(data2.get("usd"), dict):
-                        pr = data2["usd"].get("krw")
-                    if pr is not None:
-                        prev_rate = float(pr)
-                        prev_date = dd
-                        break
-                except Exception:
-                    continue
-
-            if prev_rate is None or prev_date is None:
-                raise ValueError("환율 전일 데이터 확보 실패")
-
-            return float(latest_rate), float(prev_rate), str(latest_date)
-
-        raise ValueError("환율 응답 포맷 파싱 실패")
-
-    except Exception:
-        latest, prev, d = fetch_stooq_last_two_closes("usdkrw")
-        return latest, prev, d
-
-
-def fetch_brent() -> tuple[float, float, str, str]:
-    """Brent 선물: stooq에서 cb.f 또는 brn.f 중 성공하는 심볼 사용"""
-    for sym in ("cb.f", "brn.f"):
-        try:
-            latest, prev, d = fetch_stooq_last_two_closes(sym)
-            return latest, prev, d, sym
-        except Exception:
-            pass
-    raise ValueError("Brent 데이터를 가져오지 못했습니다 (cb.f/brn.f 모두 실패)")
-
-
-def fetch_kospi() -> tuple[float, float, str, str]:
-    """KOSPI: stooq에서 ^kospi 우선, 실패 시 kospi 폴백"""
-    for sym in ("^kospi", "kospi"):
-        try:
-            latest, prev, d = fetch_stooq_last_two_closes(sym)
-            return latest, prev, d, sym
-        except Exception:
-            pass
-    raise ValueError("KOSPI 데이터를 가져오지 못했습니다 (^kospi/kospi 모두 실패)")
+        latest, prev, d = fetch_brent_from_eia()
+        return latest, prev, d, None
+    except Exception as e:
+        # fallback: Stooq futures symbols (가끔 되는 경우)
+        for sym in ("brn.f", "cb.f"):
+            try:
+                latest, prev, d = fetch_stooq_last_two_closes(sym)
+                return latest, prev, d, f"EIA 실패 → Stooq({sym}) fallback 사용 ({e})"
+            except Exception:
+                pass
+        return None, None, None, f"Brent 수집 실패 (EIA+fallback 모두 실패: {e})"
 
 
 # -----------------------------
-# News (Google News RSS)
+# 뉴스(RSS)
 # -----------------------------
-def _looks_non_ko(title: str) -> bool:
-    """중국어/일본어 위주 제목을 대충 걸러내기(완벽X)."""
-    if not title:
-        return True
-    s = title.strip()
-    if any("\uac00" <= ch <= "\ud7a3" for ch in s):  # Hangul present
-        return False
-
-    han = sum(1 for ch in s if "\u4e00" <= ch <= "\u9fff")
-    kana = sum(1 for ch in s if "\u3040" <= ch <= "\u30ff")
-    denom = max(len(s), 1)
-    if han / denom > 0.15 or kana / denom > 0.15:
-        return True
-    return False
-
-
-def fetch_google_news(query: str, max_items: int = 3) -> list[dict]:
+def fetch_google_news_rss(query: str, max_items=3) -> List[Tuple[str, str]]:
     url = (
         "https://news.google.com/rss/search?q="
         + quote_plus(query)
         + "&hl=ko&gl=KR&ceid=KR:ko"
     )
     feed = feedparser.parse(url)
-
-    items: list[dict] = []
-    for e in getattr(feed, "entries", [])[:20]:
-        title = getattr(e, "title", "").strip()
-        link = getattr(e, "link", "").strip()
+    out = []
+    for e in feed.entries[:20]:
+        title = (e.get("title") or "").strip()
+        link = (e.get("link") or "").strip()
         if not title or not link:
             continue
-        if _looks_non_ko(title):
-            continue
-        items.append({"title": title, "link": link})
-        if len(items) >= max_items:
+        # 한자/영문만 있는 경우가 섞일 때가 있어서 한글 포함 우선
+        if is_hangul_text(title):
+            out.append((title, link))
+        if len(out) >= max_items:
             break
 
-    if not items:
-        for e in getattr(feed, "entries", [])[:max_items]:
-            title = getattr(e, "title", "").strip()
-            link = getattr(e, "link", "").strip()
-            if title and link:
-                items.append({"title": title, "link": link})
-    return items
+    # 한글이 너무 없으면 그냥 앞에서 채움
+    if len(out) < max_items:
+        for e in feed.entries:
+            title = (e.get("title") or "").strip()
+            link = (e.get("link") or "").strip()
+            if not title or not link:
+                continue
+            if (title, link) not in out:
+                out.append((title, link))
+            if len(out) >= max_items:
+                break
+
+    return out[:max_items]
 
 
-def extract_keywords(titles: list[str]) -> list[str]:
-    dict_terms = [
-        "연준", "금리", "CPI", "물가", "고용", "달러", "환율", "위험자산", "안전자산",
-        "OPEC", "재고", "감산", "증산", "중동", "러시아", "중국", "경기", "침체",
-        "외국인", "수급", "반도체", "실적", "채권", "국채", "유가", "원화"
+# -----------------------------
+# 콘텐츠 생성(디자인 개선)
+# -----------------------------
+def reason_template(name: str, delta: Optional[float]) -> List[str]:
+    """
+    기사 없이도 쓸 수 있는 '일반론' 템플릿(헤드라인 기반 참고용)
+    """
+    if delta is None:
+        return ["오늘은 휴장/데이터 공백 등으로 전일대비 해석이 제한됩니다."]
+
+    up = delta > 0
+    if name == "USD/KRW":
+        return [
+            "달러 강세(미국 금리/지표/연준 발언)나 위험회피 심리가 커지면 원/달러가 오르는 경향이 있습니다." if up
+            else "위험선호(주식 강세)나 달러 약세(금리 기대 완화) 국면이면 원/달러가 내려가는 경향이 있습니다.",
+            "한국/미국의 물가·고용·금리 관련 일정, 외국인 자금 흐름이 단기 변동에 영향을 줄 수 있습니다.",
+        ]
+    if name == "Brent Oil":
+        return [
+            "공급(OPEC+ 정책, 지정학 이슈)과 수요(경기 전망, 중국/미국 지표)가 유가 방향을 좌우합니다.",
+            "재고 지표(EIA/IEA)나 달러 강세는 유가에 압력으로 작용하는 경우가 있습니다." if not up else
+            "재고 감소, 공급 차질, 수요 기대가 커지면 유가가 반등하는 경우가 있습니다.",
+        ]
+    if name == "KOSPI":
+        return [
+            "미국 증시 흐름, 외국인 수급, 환율이 동반되면 지수 변동이 커질 수 있습니다.",
+            "반도체·2차전지 등 대형 업종 뉴스가 지수에 직접 영향을 주는 경우가 많습니다.",
+        ]
+    return ["관련 이슈(금리/경기/수급/정책)를 함께 보면 이해가 쉬워집니다."]
+
+def build_html_report(today: str, mode: str, run_id: str) -> Tuple[str, str, List[str]]:
+    errors: List[str] = []
+
+    usd, usd_prev, usd_date, usd_err = fetch_usdkrw()
+    if usd_err:
+        errors.append(f"USD/KRW: {usd_err}")
+
+    brent, brent_prev, brent_date, brent_err = fetch_brent()
+    if brent_err:
+        errors.append(f"Brent: {brent_err}")
+
+    kospi, kospi_prev, kospi_date, kospi_err = fetch_kospi()
+    if kospi_err:
+        errors.append(f"KOSPI: {kospi_err}")
+
+    usd_delta = None if (usd is None or usd_prev is None) else (usd - usd_prev)
+    brent_delta = None if (brent is None or brent_prev is None) else (brent - brent_prev)
+    kospi_delta = None if (kospi is None or kospi_prev is None) else (kospi - kospi_prev)
+
+    usd_pct = pct_change(usd, usd_prev)
+    brent_pct = pct_change(brent, brent_prev)
+    kospi_pct = pct_change(kospi, kospi_prev)
+
+    # 뉴스(헤드라인)
+    usd_news = fetch_google_news_rss("원달러 환율 변동 원인", 3)
+    brent_news = fetch_google_news_rss("브렌트유 유가 하락 원인", 3)
+    kospi_news = fetch_google_news_rss("코스피 상승 하락 원인", 3)
+
+    test_badge = ""
+    if mode == "test":
+        test_badge = f"""<span style="display:inline-block;margin-left:10px;padding:4px 10px;border-radius:999px;background:#eef2ff;color:#3730a3;font-size:12px;font-weight:700;">
+        TEST {run_id}
+        </span>"""
+
+    # 상단 요약 문장
+    summary_lines = [
+        "원/달러(USD/KRW), 브렌트유, 코스피의 최근 거래일 기준 변동을 한 번에 정리했습니다.",
+        "변동 원인 참고용으로 관련 뉴스 헤드라인을 함께 첨부했습니다(헤드라인 기반 참고).",
     ]
-    found = []
-    joined = " / ".join(titles)
-    for t in dict_terms:
-        if t.lower() in joined.lower():
-            found.append(t)
-    return found[:10]
 
-
-# -----------------------------
-# Content builder (HTML)
-# -----------------------------
-def fmt_num(x: float | None, digits: int = 2) -> str:
-    if x is None:
-        return "-"
-    return f"{x:,.{digits}f}"
-
-
-def fmt_delta(x: float | None, digits: int = 2) -> str:
-    if x is None:
-        return "-"
-    sign = "+" if x >= 0 else ""
-    return f"{sign}{x:,.{digits}f}"
-
-
-def fmt_pct(x: float | None, digits: int = 2) -> str:
-    if x is None:
-        return "-"
-    sign = "+" if x >= 0 else ""
-    return f"{sign}{x:.{digits}f}%"
-
-
-def build_post_html(today: str, indicators: list[Indicator], news_map: dict, errors: list[str], test_tag: str | None) -> str:
-    gen_time = now_kst().strftime("%Y-%m-%d %H:%M KST")
-
-    html = []
-    html.append(f"<h2>오늘의 지표 리포트 ({today})</h2>")
-    if test_tag:
-        html.append(
-            "<p><span style='display:inline-block;padding:4px 10px;border-radius:999px;"
-            "background:#eef2ff;color:#3730a3;font-weight:700;'>"
-            f"TEST {test_tag}</span></p>"
-        )
-
+    # 에러 박스
+    err_box = ""
     if errors:
-        items = "".join(f"<li>{e}</li>" for e in errors)
-        html.append(
-            "<div style='border:1px solid #fecaca;background:#fff1f2;padding:14px;border-radius:12px;margin:12px 0;'>"
-            "<b>⚠ 일부 데이터 수집 실패</b>"
-            f"<ul style='margin:10px 0 0 18px;'>{items}</ul>"
-            "</div>"
-        )
+        li = "\n".join([f"<li><b>{e}</b></li>" for e in errors])
+        err_box = f"""
+        <div style="border:1px solid #fecaca;background:#fff1f2;padding:14px 16px;border-radius:12px;margin:14px 0;">
+          <div style="font-weight:800;margin-bottom:6px;">⚠️ 일부 데이터 수집 실패</div>
+          <ul style="margin:0 0 0 18px; padding:0;">{li}</ul>
+          <div style="margin-top:8px;color:#6b7280;font-size:12px;">
+            ※ 주말/휴장/해외사이트 차단 등으로 값이 비어 있을 수 있어요. 가능한 한 fallback을 적용했습니다.
+          </div>
+        </div>
+        """
 
-    html.append("<h3>핵심 요약</h3>")
-    html.append("<ul>")
-    html.append("<li>원/달러(USD/KRW), 브렌트유, 코스피의 <b>최근 거래일 기준</b> 변동을 한 번에 정리했습니다.</li>")
-    html.append("<li>변동 원인(참고용)으로 관련 뉴스 헤드라인을 함께 첨부했습니다.</li>")
-    html.append("</ul>")
+    def row(name, cur, prev, pct, d):
+        cur_txt = "수집 실패" if cur is None else fmt_num(cur)
+        prev_txt = "-" if prev is None else (f"{prev:+,.2f}" if name == "USD/KRW" else fmt_num(prev))
+        # 전일대비는 값이 있을 때만
+        delta_txt = "-"
+        if cur is not None and prev is not None:
+            delta = cur - prev
+            sign = "+" if delta >= 0 else ""
+            delta_txt = f"{sign}{delta:,.2f}"
+        pct_txt = "-" if pct is None else (f"{pct:+.2f}%")
+        d_txt = d or "-"
+        return f"""
+        <tr>
+          <td style="padding:14px 12px;border-top:1px solid #e5e7eb;font-weight:700;">{name}</td>
+          <td style="padding:14px 12px;border-top:1px solid #e5e7eb;text-align:right;">{cur_txt}</td>
+          <td style="padding:14px 12px;border-top:1px solid #e5e7eb;text-align:right;">{delta_txt}</td>
+          <td style="padding:14px 12px;border-top:1px solid #e5e7eb;text-align:right;">{pct_txt}</td>
+          <td style="padding:14px 12px;border-top:1px solid #e5e7eb;text-align:center;color:#374151;">{d_txt}</td>
+        </tr>
+        """
 
-    html.append("<h3>주요 지표</h3>")
-    html.append(
-        "<table style='width:100%;border-collapse:collapse;border:1px solid #e5e7eb;border-radius:12px;overflow:hidden;'>"
-        "<thead>"
-        "<tr style='background:#0f172a;color:#fff;'>"
-        "<th style='padding:12px;text-align:left;'>지표</th>"
-        "<th style='padding:12px;text-align:right;'>현재</th>"
-        "<th style='padding:12px;text-align:right;'>전일대비</th>"
-        "<th style='padding:12px;text-align:right;'>변동률</th>"
-        "<th style='padding:12px;text-align:center;'>기준일(데이터)</th>"
-        "</tr>"
-        "</thead><tbody>"
-    )
-    for ind in indicators:
-        val = fmt_num(ind.value, 2) + (f" {ind.unit}" if ind.unit else "")
-        delta = fmt_delta(ind.delta, 2)
-        pct = fmt_pct(ind.pct, 2)
-        d = ind.date or "-"
-        html.append(
-            "<tr>"
-            f"<td style='padding:12px;border-top:1px solid #e5e7eb;'><b>{ind.name}</b></td>"
-            f"<td style='padding:12px;border-top:1px solid #e5e7eb;text-align:right;'>{val}</td>"
-            f"<td style='padding:12px;border-top:1px solid #e5e7eb;text-align:right;'>{delta}</td>"
-            f"<td style='padding:12px;border-top:1px solid #e5e7eb;text-align:right;'>{pct}</td>"
-            f"<td style='padding:12px;border-top:1px solid #e5e7eb;text-align:center;'>{d}</td>"
-            "</tr>"
-        )
-    html.append("</tbody></table>")
+    def news_block(title, items):
+        if not items:
+            return "<div style='color:#6b7280;'>- 관련 뉴스 수집 실패(또는 결과 없음)</div>"
+        lis = "\n".join([f"<li style='margin:6px 0;'><a href='{link}' target='_blank' rel='noopener noreferrer'>{t}</a></li>"
+                         for t, link in items])
+        return f"<ul style='margin:8px 0 0 18px;padding:0;'>{lis}</ul>"
 
-    html.append("<h3 style='margin-top:22px;'>왜 움직였나? (원인 참고)</h3>")
-    html.append("<p style='color:#475569;margin-top:-8px;'><b>헤드라인 기반 참고</b>입니다. 실제 원인은 복합적일 수 있어요.</p>")
+    def reason_block(name, delta):
+        pts = reason_template(name, delta)
+        lis = "\n".join([f"<li style='margin:6px 0;'>{p}</li>" for p in pts])
+        return f"<ul style='margin:8px 0 0 18px;padding:0;'>{lis}</ul>"
 
-    for _, block in news_map.items():
-        title = block.get("title", "")
-        headlines = block.get("items", [])
-        keywords = block.get("keywords", [])
+    html = f"""
+<div style="max-width:860px;margin:0 auto;font-family:ui-sans-serif,system-ui,-apple-system,'Segoe UI',Roboto,'Apple SD Gothic Neo','Noto Sans KR',sans-serif;line-height:1.6;">
+  <h1 style="font-size:28px;margin:0 0 10px 0;">오늘의 지표 리포트 ({today}){test_badge}</h1>
 
-        html.append(
-            "<div style='border:1px solid #e5e7eb;border-radius:12px;padding:14px;margin:12px 0;'>"
-            f"<h4 style='margin:0 0 8px 0;'>{title}</h4>"
-        )
-        if keywords:
-            html.append(
-                f"<div style='font-size:13px;color:#334155;margin-bottom:8px;'>"
-                f"오늘 키워드(참고): <b>{', '.join(keywords)}</b></div>"
-            )
-        if headlines:
-            html.append("<ul style='margin:0 0 0 18px;'>")
-            for it in headlines:
-                html.append(f"<li><a href='{it['link']}' target='_blank' rel='noopener'>{it['title']}</a></li>")
-            html.append("</ul>")
-        else:
-            html.append("<div style='color:#64748b;'>- 관련 뉴스가 없거나 수집에 실패했습니다.</div>")
-        html.append("</div>")
+  {err_box}
 
-    html.append("<h3>내일 체크포인트</h3>")
-    html.append("<ul>")
-    html.append("<li>미국 CPI/고용 등 주요 지표 발표 일정</li>")
-    html.append("<li>유가: OPEC+ 발언/재고 발표/지정학 이슈</li>")
-    html.append("<li>환율/주식: 달러 강세 여부, 외국인 수급</li>")
-    html.append("</ul>")
+  <h2 style="font-size:20px;margin:18px 0 8px 0;">핵심 요약</h2>
+  <ul style="margin:0 0 0 18px;padding:0;">
+    {''.join([f"<li style='margin:6px 0;'>{s}</li>" for s in summary_lines])}
+  </ul>
 
-    html.append("<hr/>")
-    html.append(f"<div style='color:#64748b;font-size:12px;'>생성 시각: {gen_time}</div>")
-    html.append("<div style='color:#64748b;font-size:12px;'>데이터: Stooq / Currency-api(환율) · 뉴스: Google News RSS</div>")
-    return "\n".join(html)
+  <h2 style="font-size:20px;margin:22px 0 10px 0;">주요 지표</h2>
+  <div style="border:1px solid #e5e7eb;border-radius:14px;overflow:hidden;">
+    <table style="width:100%;border-collapse:collapse;">
+      <thead>
+        <tr style="background:#0f172a;color:#fff;">
+          <th style="padding:14px 12px;text-align:left;">지표</th>
+          <th style="padding:14px 12px;text-align:right;">현재</th>
+          <th style="padding:14px 12px;text-align:right;">전일대비</th>
+          <th style="padding:14px 12px;text-align:right;">변동률</th>
+          <th style="padding:14px 12px;text-align:center;">기준일(데이터)</th>
+        </tr>
+      </thead>
+      <tbody style="background:#fff;">
+        {row("USD/KRW", usd, usd_prev, usd_pct, usd_date)}
+        {row("Brent Oil", brent, brent_prev, brent_pct, brent_date)}
+        {row("KOSPI", kospi, kospi_prev, kospi_pct, kospi_date)}
+      </tbody>
+    </table>
+  </div>
 
+  <h2 style="font-size:20px;margin:24px 0 8px 0;">왜 움직였나? (원인 참고)</h2>
+  <div style="color:#6b7280;font-size:13px;margin-bottom:10px;">
+    헤드라인 기반 참고입니다. 실제 원인은 복합적일 수 있어요.
+  </div>
 
-# -----------------------------
-# Main
-# -----------------------------
-def fetch_indicators_and_news() -> tuple[list[Indicator], dict, list[str]]:
-    errors: list[str] = []
-    indicators: list[Indicator] = []
+  <div style="border:1px solid #e5e7eb;border-radius:14px;padding:14px 16px;margin:10px 0;">
+    <div style="font-size:18px;font-weight:800;margin-bottom:6px;">USD/KRW 변동 원인(뉴스)</div>
+    {news_block("USD/KRW", usd_news)}
+    <div style="margin-top:12px;font-weight:800;">가능한 요인(일반론)</div>
+    {reason_block("USD/KRW", usd_delta)}
+  </div>
 
-    try:
-        v, p, d = fetch_usdkrw()
-        indicators.append(Indicator(name="USD/KRW", value=v, prev=p, date=d))
-    except Exception as e:
-        errors.append(f"USD/KRW 수집 실패: {type(e).__name__}: {e}")
-        indicators.append(Indicator(name="USD/KRW", value=None, prev=None, date=None))
+  <div style="border:1px solid #e5e7eb;border-radius:14px;padding:14px 16px;margin:10px 0;">
+    <div style="font-size:18px;font-weight:800;margin-bottom:6px;">Brent 유가 변동 원인(뉴스)</div>
+    {news_block("Brent", brent_news)}
+    <div style="margin-top:12px;font-weight:800;">가능한 요인(일반론)</div>
+    {reason_block("Brent Oil", brent_delta)}
+  </div>
 
-    try:
-        v, p, d, sym = fetch_brent()
-        indicators.append(Indicator(name="Brent Oil", value=v, prev=p, date=d, unit="USD", source=f"stooq:{sym}"))
-    except Exception as e:
-        errors.append(f"Brent 수집 실패: {type(e).__name__}: {e}")
-        indicators.append(Indicator(name="Brent Oil", value=None, prev=None, date=None))
+  <div style="border:1px solid #e5e7eb;border-radius:14px;padding:14px 16px;margin:10px 0;">
+    <div style="font-size:18px;font-weight:800;margin-bottom:6px;">KOSPI 변동 원인(뉴스)</div>
+    {news_block("KOSPI", kospi_news)}
+    <div style="margin-top:12px;font-weight:800;">가능한 요인(일반론)</div>
+    {reason_block("KOSPI", kospi_delta)}
+  </div>
 
-    try:
-        v, p, d, sym = fetch_kospi()
-        indicators.append(Indicator(name="KOSPI", value=v, prev=p, date=d, source=f"stooq:{sym}"))
-    except Exception as e:
-        errors.append(f"KOSPI 수집 실패: {type(e).__name__}: {e}")
-        indicators.append(Indicator(name="KOSPI", value=None, prev=None, date=None))
+  <h2 style="font-size:20px;margin:24px 0 8px 0;">내일 체크포인트</h2>
+  <ul style="margin:0 0 0 18px;padding:0;">
+    <li style="margin:6px 0;">미국 CPI/고용/연준 발언 등 주요 일정</li>
+    <li style="margin:6px 0;">유가: OPEC/재고/지정학 헤드라인</li>
+    <li style="margin:6px 0;">환율: 위험자산 선호/달러 강세 여부</li>
+  </ul>
 
-    news_map = {}
+  <div style="margin-top:18px;color:#6b7280;font-size:12px;">
+    ※ 데이터는 각 소스의 “최신 거래일” 기준입니다. 주말/휴장일에는 기준일이 이전 날짜로 표시될 수 있습니다.
+  </div>
+</div>
+"""
 
-    def add_news(block_key: str, title: str, query: str):
-        try:
-            items = fetch_google_news(query, max_items=3)
-            titles = [it["title"] for it in items]
-            news_map[block_key] = {"title": title, "items": items, "keywords": extract_keywords(titles)}
-        except Exception:
-            news_map[block_key] = {"title": title, "items": [], "keywords": []}
+    # test 모드면 제목/슬러그에 run_id를 붙여 매번 새 글 생성
+    if mode == "test":
+        title = f"오늘의 지표 리포트 ({today}) - {run_id}"
+        slug = f"daily-indicator-report-{today}-{run_id}"
+    else:
+        title = f"오늘의 지표 리포트 ({today})"
+        slug = f"daily-indicator-report-{today}"
 
-    add_news("usdkrw", "USD/KRW 변동 원인(뉴스)", "원달러 환율 변동 원인")
-    add_news("brent", "Brent 유가 변동 원인(뉴스)", "브렌트유 유가 하락 상승 원인")
-    add_news("kospi", "KOSPI 변동 원인(뉴스)", "코스피 상승 하락 원인")
-
-    return indicators, news_map, errors
+    return title, slug, errors, html
 
 
 def main():
     cfg = load_config()
-    require_keys(cfg, ["wp_base_url", "wp_user", "wp_app_pass"])
 
-    test_mode = os.getenv("TEST_MODE", "").strip() == "1" or str(cfg.get("test_mode", "")).strip() == "1"
+    # 실행 모드
+    mode = (os.getenv("MODE") or "daily").strip().lower()
+    if mode not in ("daily", "test"):
+        mode = "daily"
 
-    today = now_kst().strftime("%Y-%m-%d")
-    run_tag = str(int(time.time())) if test_mode else None
+    # WP 상태
+    wp_status = (os.getenv("WP_STATUS") or ("draft" if mode == "test" else "publish")).strip().lower()
+    if wp_status not in ("draft", "publish", "private", "pending"):
+        wp_status = "draft" if mode == "test" else "publish"
 
-    title = f"오늘의 지표 리포트 ({today})" + (f" - {run_tag}" if run_tag else "")
-    slug = f"daily-indicator-report-{today}" + (f"-{run_tag}" if run_tag else "")
+    run_id = (os.getenv("RUN_ID") or str(int(time.time()))).strip()
+    today = now_kst_date_str()
 
-    status = (cfg.get("wp_post_status") or "publish").strip().lower()
-    if test_mode:
-        status = "draft"
+    # 필수 설정 체크
+    must_get(cfg, "wp_base_url")
+    must_get(cfg, "wp_user")
+    must_get(cfg, "wp_app_pass")
 
-    if not test_mode and wp_post_exists(cfg, slug):
-        msg = f"✅ 이미 오늘 글이 있어요 ({today}) → 중복 발행 안 함"
-        print(msg)
-        kakao_send_to_me(cfg, msg)
-        return
+    title, slug, errors, html = build_html_report(today=today, mode=mode, run_id=run_id)
 
-    indicators, news_map, errors = fetch_indicators_and_news()
-    content_html = build_post_html(today, indicators, news_map, errors, run_tag)
+    # daily 모드만 중복 방지
+    if mode == "daily":
+        if wp_post_exists(cfg, slug):
+            print(f"[SKIP] 이미 오늘 글이 존재합니다: {slug}")
+            return
 
-    post = wp_create_post(cfg, title, slug, content_html, status=status)
-    link = post.get("link", cfg["wp_base_url"])
-    msg = f"✅ 글 작성 성공!\n날짜: {today}\n상태: {status}\n링크: {link}"
-    print(msg)
-    kakao_send_to_me(cfg, msg)
+    post = wp_create_post(cfg, title=title, slug=slug, content=html, status=wp_status)
+    link = post.get("link") or (must_get(cfg, "wp_base_url").rstrip("/") + "/" + slug + "/")
+
+    print("✅ 글 생성 완료")
+    print(" - mode:", mode)
+    print(" - status:", wp_status)
+    print(" - slug:", slug)
+    print(" - link:", link)
+
+    if errors:
+        print("⚠️ 일부 데이터 수집 실패:")
+        for e in errors:
+            print(" -", e)
 
 
 if __name__ == "__main__":
