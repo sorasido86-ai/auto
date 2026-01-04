@@ -3,11 +3,18 @@ name: run-daily-post
 on:
   workflow_dispatch:
   schedule:
-    - cron: "*/5 * * * *"   # 테스트용: 5분마다(UTC 기준)
+    # ✅ 테스트용: 5분마다(UTC 기준)
+    - cron: "*/5 * * * *"
 
 jobs:
   post:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    # (선택) 5분 스케줄 테스트 때 작업이 겹치지 않게
+    concurrency:
+      group: run-daily-post
+      cancel-in-progress: true
 
     steps:
       - name: Checkout
@@ -21,7 +28,7 @@ jobs:
       - name: Install deps
         run: |
           python -m pip install --upgrade pip
-          pip install requests beautifulsoup4 lxml
+          pip install requests beautifulsoup4 lxml feedparser
 
       - name: Create bot_config.json from Secrets
         env:
@@ -32,20 +39,33 @@ jobs:
           KAKAO_REFRESH_TOKEN: ${{ secrets.KAKAO_REFRESH_TOKEN }}
         run: |
           python - <<'PY'
-          import os, json
+          import os, json, sys
+
+          # 필수 3개
+          required = ["WP_BASE_URL", "WP_USER", "WP_APP_PASS"]
+          missing = [k for k in required if not os.getenv(k)]
+          if missing:
+            sys.exit("❌ Missing required Secrets: " + ", ".join(missing))
+
           cfg = {
             "wp_base_url": os.environ["WP_BASE_URL"],
             "wp_user": os.environ["WP_USER"],
             "wp_app_pass": os.environ["WP_APP_PASS"],
           }
+
+          # 카카오는 선택
           if os.getenv("KAKAO_REST_KEY") and os.getenv("KAKAO_REFRESH_TOKEN"):
             cfg["kakao_rest_key"] = os.environ["KAKAO_REST_KEY"]
             cfg["kakao_refresh_token"] = os.environ["KAKAO_REFRESH_TOKEN"]
 
-          with open("bot_config.json","w",encoding="utf-8") as f:
-            json.dump(cfg,f,ensure_ascii=False,indent=2)
-          print("bot_config.json written")
+          with open("bot_config.json", "w", encoding="utf-8") as f:
+            json.dump(cfg, f, ensure_ascii=False, indent=2)
+
+          print("✅ bot_config.json written")
           PY
 
       - name: Run
-        run: python daily_post.py
+        env:
+          TZ: Asia/Seoul
+        run: |
+          python -u daily_post.py
