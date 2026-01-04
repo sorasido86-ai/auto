@@ -3,15 +3,15 @@ name: run-daily-post
 on:
   workflow_dispatch:
   schedule:
-    - cron: "*/5 * * * *"   # ✅ 테스트용: 5분마다 (GitHub 스케줄은 약간 지연될 수 있어요)
+    - cron: "*/5 * * * *"   # ✅ 테스트(5분). 안정화 후 하루 1회로 바꾸면 됨.
+
+concurrency:
+  group: run-daily-post
+  cancel-in-progress: true
 
 jobs:
   post:
     runs-on: ubuntu-latest
-    concurrency:
-      group: run-daily-post
-      cancel-in-progress: true
-
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -24,41 +24,40 @@ jobs:
       - name: Install deps
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          pip install requests feedparser
 
+      # (선택) Secrets를 bot_config.json으로 만들어두면 로컬/러너 둘 다 동일하게 돌아감
       - name: Create bot_config.json from Secrets
         env:
           WP_BASE_URL: ${{ secrets.WP_BASE_URL }}
           WP_USER: ${{ secrets.WP_USER }}
           WP_APP_PASS: ${{ secrets.WP_APP_PASS }}
-          # 카카오는 선택(없으면 비워도 됨)
           KAKAO_REST_KEY: ${{ secrets.KAKAO_REST_KEY }}
           KAKAO_REFRESH_TOKEN: ${{ secrets.KAKAO_REFRESH_TOKEN }}
         run: |
           python - <<'PY'
-          import os, json, sys
-          required = ["WP_BASE_URL", "WP_USER", "WP_APP_PASS"]
-          missing = [k for k in required if not os.getenv(k)]
-          if missing:
-              sys.exit("Missing secrets: " + ", ".join(missing))
-
-          cfg = {
-              "wp_base_url": os.environ["WP_BASE_URL"],
-              "wp_user": os.environ["WP_USER"],
-              "wp_app_pass": os.environ["WP_APP_PASS"],
+          import os, json
+          cfg = {}
+          mapping = {
+            "wp_base_url": "WP_BASE_URL",
+            "wp_user": "WP_USER",
+            "wp_app_pass": "WP_APP_PASS",
+            "kakao_rest_key": "KAKAO_REST_KEY",
+            "kakao_refresh_token": "KAKAO_REFRESH_TOKEN",
           }
-
-          if os.getenv("KAKAO_REST_KEY") and os.getenv("KAKAO_REFRESH_TOKEN"):
-              cfg["kakao_rest_key"] = os.environ["KAKAO_REST_KEY"]
-              cfg["kakao_refresh_token"] = os.environ["KAKAO_REFRESH_TOKEN"]
-
-          with open("bot_config.json","w",encoding="utf-8") as f:
-              json.dump(cfg, f, ensure_ascii=False, indent=2)
-          print("bot_config.json written")
+          for k, env in mapping.items():
+            v = os.getenv(env)
+            if v:
+              cfg[k] = v
+          with open("bot_config.json", "w", encoding="utf-8") as f:
+            json.dump(cfg, f, ensure_ascii=False, indent=2)
+          print("bot_config.json keys:", list(cfg.keys()))
           PY
 
       - name: Run
         env:
           TZ: Asia/Seoul
-          TEST_MODE: "1"   # ✅ 테스트용: 매 실행마다 새 글 생성(슬러그에 runid)
-        run: python -u daily_post.py
+          TEST_MODE: "1"          # ✅ 5분 테스트 중에는 1 (매번 새 글). 안정화 후 0 또는 제거
+          WP_POST_STATUS: "publish"  # 원치 않으면 "draft"로 바꿔서 테스트
+        run: |
+          python -u daily_post.py
