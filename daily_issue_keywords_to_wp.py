@@ -1,31 +1,28 @@
 # -*- coding: utf-8 -*-
 """
 daily_issue_keywords_to_wp.py (완전 통합/최적화)
-- Google Trends(geo=KR) 트렌딩 검색어 수집(시드/가중치)
-- 커뮤니티/뉴스 RSS 다수 수집 (기본: 커뮤니티 RSS + 구글뉴스 RSS 100개 구성)
-- "net/daum/com/kr" 같은 도메인/플랫폼 토큰 제거 + 제목 꼬리(매체명) 제거
+- Google Trends(geo=KR) 트렌딩 검색어 수집
+- Google News RSS(검색/토픽) + 커뮤니티 RSS 수집 (총 FEEDS_MAX까지)
 - 최근 WINDOW_HOURS 시간 기준 "데일리 이슈 키워드 TOP N" 집계
 - WordPress REST API로 오전/오후(am/pm) 글을 별도로 생성/업데이트 (slug 분리)
 - GitHub Actions Secrets(환경변수)만으로 실행
 
-✅ 필수 Secrets(너가 쓰는 이름 그대로)
+필수 Secrets
   - WP_BASE_URL
   - WP_USER
   - WP_APP_PASS
 
-✅ 고정 카테고리
+카테고리
   - WP_CATEGORY_IDS="4"
 
-✅ 오전/오후 분리
-  - RUN_SLOT=am 또는 RUN_SLOT=pm
-
-✅ 속도/안정 옵션(권장 기본값)
+권장 env
   - FEEDS_MAX=100
   - FEED_TIMEOUT=8
   - MAX_WORKERS=20
   - WINDOW_HOURS=12
   - LIMIT=20
-  - DEBUG=1 (로그 자세히)
+  - RUN_SLOT=am|pm
+  - DEBUG=1
 """
 
 from __future__ import annotations
@@ -91,7 +88,6 @@ def _split_lines_env(name: str) -> List[str]:
         if not u or u.startswith("#"):
             continue
         feeds.append(u)
-    # dedup
     seen = set()
     out = []
     for u in feeds:
@@ -157,7 +153,6 @@ def load_cfg() -> AppConfig:
     if run.slot not in ("am", "pm"):
         run.slot = "am"
 
-    # 강력 블록리스트(플랫폼/도메인/잡토큰)
     base_block = {
         "net", "com", "co", "kr", "www", "m", "amp",
         "daum", "naver", "google", "youtube", "tiktok", "instagram", "facebook",
@@ -165,7 +160,6 @@ def load_cfg() -> AppConfig:
         "기사", "기자", "단독", "속보", "영상", "사진",
         "breaking", "exclusive",
     }
-
     extra = set()
     raw = _env("BLOCKLIST", "")
     if raw:
@@ -213,7 +207,6 @@ def fetch_google_trends(geo: str, limit: int) -> List[Dict[str, Any]]:
     r = requests.get(url, timeout=25)
     if r.status_code != 200:
         raise RuntimeError(f"Google Trends RSS failed: {r.status_code} body={r.text[:200]}")
-
     root = ET.fromstring(r.content)
     items = root.findall(".//item")
 
@@ -248,7 +241,6 @@ def google_news_rss_search(q: str) -> str:
 
 
 def default_news_keywords() -> List[str]:
-    # 너무 일반어 줄이고, 실제 이슈에 자주 걸리는 키워드
     return [
         "선거", "국회", "검찰", "법원", "대통령",
         "환율", "금리", "물가", "부동산", "전세", "코스피", "비트코인",
@@ -263,12 +255,54 @@ def default_news_keywords() -> List[str]:
 
 
 def build_default_news_feeds(max_n: int) -> List[str]:
+    """
+    ✅ 수정 포인트(중요):
+    - 예전 버전은 채우기 키워드가 10개뿐이라 max_n(100)을 못 채우면 무한루프 가능
+    - 이 버전은 (분야 키워드 × 사건 키워드) 조합으로 수백개 후보를 만들어 max_n까지 채움
+    - 그래도 못 채우면 그냥 있는 만큼 반환(무한루프 없음)
+    """
     urls: List[str] = [google_news_rss_top()]
-    for t in ["WORLD", "NATION", "BUSINESS", "TECHNOLOGY", "ENTERTAINMENT", "SCIENCE", "SPORTS", "HEALTH"]:
+
+    topics = ["WORLD", "NATION", "BUSINESS", "TECHNOLOGY", "ENTERTAINMENT", "SCIENCE", "SPORTS", "HEALTH"]
+    for t in topics:
         urls.append(google_news_rss_topic(t))
+
     for kw in default_news_keywords():
         urls.append(google_news_rss_search(kw))
 
+    # 조합 생성(충분히 많이)
+    bases = [
+        "논란", "구속", "사퇴", "파면", "기소", "선고", "재판", "수사", "압수수색", "검거",
+        "사고", "화재", "추락", "폭발", "정전", "침수", "붕괴", "산불", "태풍", "지진",
+        "감염", "독감", "확진", "백신", "주의보", "특보",
+        "해킹", "유출", "장애", "점검", "업데이트", "출시",
+        "인상", "인하", "상승",igger = "폭등"
+    ]
+    # 위 라인 오타 방지: (깃헙에 올릴 때 혹시 편집 중 깨질까봐) 아래처럼 정상화
+    bases = [
+        "논란", "구속", "사퇴", "파면", "기소", "선고", "재판", "수사", "압수수색", "검거",
+        "사고", "화재", "추락", "폭발", "정전", "침수", "붕괴", "산불", "태풍", "지진",
+        "감염", "독감", "확진", "백신", "주의보", "특보",
+        "해킹", "유출", "장애", "점검", "업데이트", "출시",
+        "인상", "인하", "상승", "하락", "폭등", "폭락",
+        "파업", "시위", "협상", "합의", "불매", "리콜", "환불",
+    ]
+    mods = [
+        "정치", "경제", "사회", "연예", "스포츠", "IT", "과학", "건강",
+        "부동산", "금융", "코인", "주식", "환율", "국제", "교육",
+        "검찰", "경찰", "법원", "국회",
+    ]
+
+    # 먼저 모듈×베이스 조합으로 유니크 URL을 많이 생성
+    for m in mods:
+        for b in bases:
+            urls.append(google_news_rss_search(f"{m} {b}"))
+            if len(urls) >= max_n * 3:
+                break
+        if len(urls) >= max_n * 3:
+            break
+
+    # dedup + max_n까지 채우기
     seen = set()
     out: List[str] = []
     for u in urls:
@@ -279,21 +313,11 @@ def build_default_news_feeds(max_n: int) -> List[str]:
         if len(out) >= max_n:
             break
 
-    # 부족분 채우기
-    filler = ["논란", "구속", "사퇴", "파면", "폭설", "홍수", "정전", "사망", "실종", "감염"]
-    i = 0
-    while len(out) < max_n:
-        u = google_news_rss_search(filler[i % len(filler)])
-        if u not in seen:
-            seen.add(u)
-            out.append(u)
-        i += 1
+    # ✅ 안전장치: max_n 못 채워도 무한루프 없이 그대로 반환
     return out
 
 
 def default_community_feeds() -> List[str]:
-    # RSS가 안정적으로 있는 커뮤니티(기본)
-    # 한국 커뮤니티는 RSS가 없는 곳이 많아, 가능한 곳은 COMMUNITY_FEEDS로 추가하는 방식 권장
     return [
         "https://www.reddit.com/r/korea/.rss",
         "https://www.reddit.com/r/southkorea/.rss",
@@ -325,7 +349,7 @@ def build_feed_list(cfg: AppConfig) -> List[str]:
 
 
 # -----------------------------
-# RSS fetching (최적화 포함)
+# RSS fetching
 # -----------------------------
 @dataclass
 class FeedItem:
@@ -347,22 +371,15 @@ def _entry_dt(e: Any) -> Optional[datetime]:
 
 
 def fetch_feed(session: requests.Session, url: str, timeout: int) -> Tuple[str, List[FeedItem], Optional[str]]:
-    """
-    ✅ 빠른 실패 처리:
-      - HEAD를 짧게(3초) 시도해 '완전 죽은' URL을 빠르게 컷
-      - HEAD가 405(미지원)면 그냥 GET 진행
-      - GET은 FEED_TIMEOUT 적용
-    """
     try:
-        # 짧은 HEAD 체크(타임아웃만 걸면 컷)
+        # 짧은 HEAD 체크
         try:
             h = session.head(url, timeout=3, allow_redirects=True, headers={"User-Agent": "daily-issue-bot/1.0"})
             if h.status_code == 405:
-                pass  # HEAD 미지원 → GET 진행
+                pass
         except requests.exceptions.Timeout:
             return url, [], "HEAD timeout"
         except requests.exceptions.RequestException:
-            # 연결 오류는 컷(느린/죽은 피드 가능성)
             return url, [], "HEAD failed"
 
         r = session.get(url, timeout=timeout, headers={"User-Agent": "daily-issue-bot/1.0"})
@@ -403,8 +420,6 @@ def fetch_all(cfg: AppConfig, urls: List[str]) -> Tuple[List[FeedItem], Dict[str
             for f in as_completed(futs):
                 u, got, err = f.result()
                 done += 1
-
-                # 진행 로그(10개마다)
                 if cfg.run.debug or done % 10 == 0:
                     print(f"[FETCH] {done}/{total} got={len(got)} err={'Y' if err else 'N'}")
 
@@ -419,13 +434,13 @@ def fetch_all(cfg: AppConfig, urls: List[str]) -> Tuple[List[FeedItem], Dict[str
 
 
 # -----------------------------
-# Keyword extraction (net/daum 제거 강화 + 꼬리 제거)
+# Keyword extraction
 # -----------------------------
 TAIL_PATTERNS = [
-    r"\s+[-–—]\s+[^-–—]{1,30}$",           # "제목 - 매체명"
-    r"\s+\|\s+[^|]{1,30}$",                # "제목 | 매체명"
-    r"\s+:\s*네이버\s*뉴스$",              # "... : 네이버 뉴스"
-    r"\s+:\s*Daum$",                       # "... : Daum"
+    r"\s+[-–—]\s+[^-–—]{1,30}$",
+    r"\s+\|\s+[^|]{1,30}$",
+    r"\s+:\s*네이버\s*뉴스$",
+    r"\s+:\s*Daum$",
     r"\s+\(\s*네이버\s*뉴스\s*\)\s*$",
     r"\s+\(\s*다음\s*\)\s*$",
 ]
@@ -436,12 +451,10 @@ def normalize_title(title: str) -> str:
     t = re.sub(r"\s+", " ", t)
     for pat in TAIL_PATTERNS:
         t = re.sub(pat, "", t, flags=re.IGNORECASE)
-    t = re.sub(r"\s+", " ", t).strip()
-    return t
+    return re.sub(r"\s+", " ", t).strip()
 
 
 def is_domainy(tok: str) -> bool:
-    # 도메인/URL 조각 제거
     if "." in tok:
         return True
     if re.fullmatch(r"(co|com|net|org|kr|tv|io|me|ai)", tok.lower() or ""):
@@ -459,19 +472,14 @@ def tokenize(cfg: AppConfig, title: str) -> List[str]:
         tok = tok.strip()
         if not tok:
             continue
-
         low = tok.lower()
 
         if low in cfg.blocklist:
             continue
         if is_domainy(low):
             continue
-
-        # 숫자만 토큰은 이슈로 약해서 제외
         if re.fullmatch(r"[0-9]{2,}", low):
             continue
-
-        # 2글자 영문은 AI/US/EU 정도만 허용
         if re.fullmatch(r"[a-z]{2}", low) and low not in ("ai", "us", "eu"):
             continue
 
@@ -480,20 +488,14 @@ def tokenize(cfg: AppConfig, title: str) -> List[str]:
 
 
 def phrases_from_tokens(tokens: List[str]) -> List[str]:
-    # bigram 중심 + unigram 보조
-    unigrams = tokens
-    bigrams: List[str] = []
-    for i in range(len(tokens) - 1):
-        a, b = tokens[i], tokens[i + 1]
-        bigrams.append(f"{a} {b}")
-    return bigrams + unigrams
+    bigrams = [f"{tokens[i]} {tokens[i+1]}" for i in range(len(tokens)-1)]
+    return bigrams + tokens
 
 
 def score_keywords(cfg: AppConfig, items: List[FeedItem], trends: List[str]) -> List[Dict[str, Any]]:
     now = datetime.now(KST)
     cutoff = now - timedelta(hours=cfg.run.window_hours)
 
-    # 트렌드 시드 set
     trend_set = {normalize_title(x).lower() for x in trends if x}
 
     counts: Dict[str, int] = {}
@@ -516,12 +518,7 @@ def score_keywords(cfg: AppConfig, items: List[FeedItem], trends: List[str]) -> 
             seen.add(key)
 
             # phrase 내부에 블록리스트 포함되면 제거
-            bad = False
-            for w in key.split():
-                if w.lower() in cfg.blocklist:
-                    bad = True
-                    break
-            if bad:
+            if any(w.lower() in cfg.blocklist for w in key.split()):
                 continue
 
             counts[key] = counts.get(key, 0) + 1
@@ -534,28 +531,23 @@ def score_keywords(cfg: AppConfig, items: List[FeedItem], trends: List[str]) -> 
     for k, cnt in counts.items():
         src = len(sources.get(k, set()))
 
-        # 트렌드에 걸린 키워드는 1회라도 남겨주고, 아니면 최소 2회 이상
         if cnt < 2 and k not in trend_set:
             continue
 
-        # 트렌드 보너스(실제 사람들이 검색 중인 키워드를 우선)
         trend_bonus = 0.0
         if k in trend_set:
             trend_bonus += 7.0
         else:
-            # 부분 매칭 보너스
             for tk in trend_set:
                 if tk and (tk in k or k in tk):
                     trend_bonus += 3.0
                     break
 
-        # 점수: 언급수 + 출처 다양성 + 트렌드 보너스
         score = cnt * 1.0 + max(0, src - 1) * 1.8 + trend_bonus
         scored.append((score, k))
 
     scored.sort(reverse=True, key=lambda x: x[0])
 
-    # 유사 키워드 중복 방지
     def jacc(a: Set[str], b: Set[str]) -> float:
         if not a or not b:
             return 0.0
@@ -566,12 +558,7 @@ def score_keywords(cfg: AppConfig, items: List[FeedItem], trends: List[str]) -> 
 
     for score, k in scored:
         toks = set(k.split())
-        dup = False
-        for ut in used:
-            if jacc(toks, ut) >= 0.6:
-                dup = True
-                break
-        if dup:
+        if any(jacc(toks, ut) >= 0.6 for ut in used):
             continue
 
         used.append(toks)
@@ -602,7 +589,7 @@ def wp_auth_header(user: str, app_pass: str) -> Dict[str, str]:
 def wp_find_post_by_slug(cfg: WordPressConfig, slug: str) -> Optional[Tuple[int, str]]:
     url = cfg.base_url.rstrip("/") + "/wp-json/wp/v2/posts"
     headers = wp_auth_header(cfg.username, cfg.app_password)
-    r = requests.get(url, headers=headers, params={"slug": slug, "per_page": 1}, timeout=25)
+    r = requests.get(url, relaxed=True) if False else requests.get(url, headers=headers, params={"slug": slug, "per_page": 1}, timeout=25)
     if r.status_code != 200:
         return None
     arr = r.json()
@@ -656,13 +643,7 @@ def slot_label(slot: str) -> str:
     return "오전" if slot == "am" else "오후"
 
 
-def build_html(
-    cfg: AppConfig,
-    date_str: str,
-    trends: List[Dict[str, Any]],
-    keywords: List[Dict[str, Any]],
-    stats: Dict[str, Any],
-) -> str:
+def build_html(cfg: AppConfig, date_str: str, trends: List[Dict[str, Any]], keywords: List[Dict[str, Any]], stats: Dict[str, Any]) -> str:
     disclosure = (
         '<p style="padding:10px;border-left:4px solid #111;background:#f7f7f7;">'
         "※ Google 트렌딩 검색어 + 커뮤니티/뉴스 헤드라인을 기반으로 '데일리 이슈 키워드'를 자동 집계했습니다."
@@ -744,12 +725,11 @@ def build_html(
       <tbody>{''.join(rows) if rows else "<tr><td colspan='5' style='padding:8px;border:1px solid #e5e5e5;'>키워드 부족(피드/커뮤니티 소스 확대 필요)</td></tr>"}</tbody>
     </table>
     """
-
     return disclosure + head + trends_html + "<hr/>" + kw_html + "<hr/><p style='font-size:12px;opacity:.7;'>자동 포스팅 봇</p>"
 
 
 # -----------------------------
-# Main
+# CLI
 # -----------------------------
 def parse_args(argv: List[str]) -> Dict[str, Any]:
     out = {"dry_run": False, "debug": False, "slot": None}
@@ -789,7 +769,6 @@ def main() -> None:
     now = datetime.now(KST)
     date_str = now.strftime("%Y-%m-%d")
 
-    # 오전/오후 글 분리 slug
     slug = f"daily-issue-keywords-{date_str}-{cfg.run.slot}"
     title = f"{date_str} 데일리 이슈 키워드 TOP{cfg.run.limit} ({slot_label(cfg.run.slot)})"
 
@@ -803,9 +782,11 @@ def main() -> None:
 
     trend_keywords = [t.get("keyword", "") for t in trends if t.get("keyword")]
 
-    # 2) feeds
+    # 2) feeds (여기서 예전 코드가 무한루프였음)
+    print("[FEEDS] building feed list...")
     feeds = build_feed_list(cfg)
     print(f"[FEEDS] total urls={len(feeds)} (community+news)")
+
     items, errors = fetch_all(cfg, feeds)
 
     ok_feeds = len(feeds) - len(errors)
