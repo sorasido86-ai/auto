@@ -1,0 +1,76 @@
+name: Hot Issue Ranking to WordPress (AM/PM)
+
+on:
+  workflow_dispatch:
+    inputs:
+      slot:
+        description: "am or pm"
+        required: false
+        default: "am"
+  schedule:
+    - cron: "5 0 * * *"   # 09:05 KST
+    - cron: "5 9 * * *"   # 18:05 KST
+
+jobs:
+  post:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests feedparser
+
+      - name: Decide AM/PM slot
+        shell: bash
+        run: |
+          # 기본값
+          SLOT="am"
+
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            SLOT="${{ inputs.slot }}"
+          fi
+
+          # schedule 이벤트면 cron 문자열로 구분
+          if [ "${{ github.event_name }}" = "schedule" ]; then
+            if [ "${{ github.event.schedule }}" = "5 0 * * *" ]; then
+              SLOT="am"
+            elif [ "${{ github.event.schedule }}" = "5 9 * * *" ]; then
+              SLOT="pm"
+            fi
+          fi
+
+          echo "RUN_SLOT=$SLOT" >> $GITHUB_ENV
+          echo "RUN_SLOT decided: $SLOT"
+
+      - name: Run bot
+        env:
+          # ✅ 워드프레스(너가 이미 쓰던 이름 그대로)
+          WP_BASE_URL: ${{ secrets.WP_BASE_URL }}
+          WP_USER: ${{ secrets.WP_USER }}
+          WP_APP_PASS: ${{ secrets.WP_APP_PASS }}
+
+          # ✅ 카테고리 4번 고정
+          WP_CATEGORY_IDS: "4"
+
+          # 옵션(필요시 조절)
+          LIMIT: "20"
+          WINDOW_HOURS: "12"
+          FEEDS_MAX: "100"
+          MAX_WORKERS: "12"
+          FEED_TIMEOUT: "15"
+
+          # 필요하면 디버그/드라이런 켜기
+          # DEBUG: "1"
+          # DRY_RUN: "1"
+
+        run: |
+          python hot_issue_ranking_daily_to_wp.py --slot "${RUN_SLOT}"
