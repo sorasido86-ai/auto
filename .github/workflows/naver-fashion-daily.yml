@@ -1,0 +1,86 @@
+name: Naver Fashion Daily to WordPress
+
+on:
+  workflow_dispatch: {}
+  schedule:
+    # 00:13 UTC = 09:13 KST (매일)
+    - cron: "13 0 * * *"
+
+permissions:
+  contents: write
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Ensure data dir
+        run: mkdir -p data
+
+      - name: Create bot_config.json (runtime only)
+        run: |
+          cat > bot_config.json <<JSON
+          {
+            "naver": {
+              "client_id": "${{ secrets.NAVER_CLIENT_ID }}",
+              "client_secret": "${{ secrets.NAVER_CLIENT_SECRET }}",
+              "display": 20,
+              "sort": "sim",
+              "filter": "",
+              "exclude": "used:rental:cbshop",
+              "queries": {
+                "women": "여성의류",
+                "men": "남성의류"
+              }
+            },
+            "wordpress": {
+              "site_url": "${{ secrets.WP_SITE_URL }}",
+              "username": "${{ secrets.WP_USERNAME }}",
+              "app_password": "${{ secrets.WP_APP_PASSWORD }}",
+              "status": "publish",
+              "category_ids": [],
+              "tag_ids": []
+            },
+            "post": {
+              "title_template": "{date} 네이버 쇼핑 남성/여성 의류 TOP20 (데일리)",
+              "disclosure": "※ 이 포스팅은 제휴마케팅 활동의 일환으로, 이에 따른 일정액의 수수료를 제공받을 수 있습니다.",
+              "note": "데이터 출처: 네이버 쇼핑 검색 API(정렬 기준: sim)."
+            },
+            "storage": {
+              "sqlite_path": "data/naver_fashion_rankings.sqlite3"
+            },
+            "run": {
+              "dry_run": false
+            }
+          }
+          JSON
+
+      - name: Run bot
+        run: |
+          python naver_fashion_daily_to_wp.py bot_config.json
+
+      # ✅ 한 달치 누적(랭킹 DB)을 GitHub repo에 저장하고 싶으면 아래를 켜둬 (추천)
+      - name: Commit DB back to repo (optional)
+        run: |
+          if [[ -n "$(git status --porcelain data/naver_fashion_rankings.sqlite3)" ]]; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add data/naver_fashion_rankings.sqlite3
+            git commit -m "Update rankings db (UTC $(date -u +%F))"
+            git push
+          else
+            echo "No DB changes"
+          fi
