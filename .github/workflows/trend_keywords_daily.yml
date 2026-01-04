@@ -1,16 +1,15 @@
-name: Daily Trend Keywords to WordPress
+name: Daily Trend Keywords to WordPress (Google + Naver)
 
 on:
   schedule:
-    # GitHub Actions cron은 UTC 기준
-    # 매일 00:10 KST(한국시간) = 전날 15:10 UTC
+    # ✅ GitHub Actions cron은 UTC 기준
+    # 예시: 매일 00:10 KST(한국시간) = 전날 15:10 UTC
     - cron: "10 15 * * *"
   workflow_dispatch:
 
 jobs:
   run:
     runs-on: ubuntu-latest
-
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -25,23 +24,42 @@ jobs:
           python -m pip install --upgrade pip
           pip install requests
 
-      - name: Run bot
+      # ✅ 값은 노출하지 않고 len만 확인(문제 생길 때만 켜도 됨)
+      - name: Debug env (safe)
+        if: ${{ github.event_name == 'workflow_dispatch' }}
         env:
           WP_BASE_URL: ${{ secrets.WP_BASE_URL }}
           WP_USER: ${{ secrets.WP_USER }}
           WP_APP_PASS: ${{ secrets.WP_APP_PASS }}
+          XNAVERCLIENT_ID: ${{ secrets.XNAVERCLIENT_ID }}
+          XNAVERCLIENT_SECRET: ${{ secrets.XNAVERCLIENT_SECRET }}
+          NAVER_KEYWORD_POOL: ${{ secrets.NAVER_KEYWORD_POOL }}
+        run: |
+          python - <<'PY'
+          import os
+          def show(k):
+              v = os.getenv(k, "")
+              print(f"{k}: {'OK' if v else 'MISSING'} len={len(v)}")
+          for k in ["WP_BASE_URL","WP_USER","WP_APP_PASS","XNAVERCLIENT_ID","XNAVERCLIENT_SECRET","NAVER_KEYWORD_POOL"]:
+              show(k)
+          PY
 
-          # 카테고리 31 고정
+      - name: Run bot
+        env:
+          # WordPress
+          WP_BASE_URL: ${{ secrets.WP_BASE_URL }}
+          WP_USER: ${{ secrets.WP_USER }}
+          WP_APP_PASS: ${{ secrets.WP_APP_PASS }}
           WP_CATEGORY_ID: "31"
           WP_STATUS: "publish"
 
-          # Google Trends
+          # Google
           GOOGLE_GEO: "KR"
           LIMIT: "20"
 
-          # Naver DataLab
-          NAVER_CLIENT_ID: ${{ secrets.NAVER_CLIENT_ID }}
-          NAVER_CLIENT_SECRET: ${{ secrets.NAVER_CLIENT_SECRET }}
+          # Naver (네가 바꾼 이름 그대로)
+          XNAVERCLIENT_ID: ${{ secrets.XNAVERCLIENT_ID }}
+          XNAVERCLIENT_SECRET: ${{ secrets.XNAVERCLIENT_SECRET }}
           NAVER_KEYWORD_POOL: ${{ secrets.NAVER_KEYWORD_POOL }}
           NAVER_POOL_LIMIT: "50"
 
