@@ -5,10 +5,10 @@ on:
   schedule:
     # KST 기준 오전 9시 / 오후 6시
     # GitHub Actions는 UTC로 돌아감
-    # 09:00 KST = 00:00 UTC
-    # 18:00 KST = 09:00 UTC
-    - cron: "0 0 * * *"
-    - cron: "0 9 * * *"
+    # 09:07 KST = 00:07 UTC
+    # 18:07 KST = 09:07 UTC
+    - cron: "7 0 * * *"
+    - cron: "7 9 * * *"
 
 jobs:
   post:
