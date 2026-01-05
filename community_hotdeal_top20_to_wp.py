@@ -1,7 +1,11 @@
 # -*- coding: utf-8 -*-
 """
-community_hotdeal_top20_to_wp.py (완전 통합)
-- 커뮤니티 핫딜(루리웹/뽐뿌RSS/FM코리아) 수집 → TOP20 스코어링
+community_hotdeal_top20_to_wp.py (완전 통합/하루 2번 슬롯 지원)
+
+- 커뮤니티 핫딜(루리웹/뽐뿌RSS/FM코리아) 수집 → TOP N 스코어링
+- RUN_SLOT(am/pm/auto/both) 지원
+  - auto: KST 기준 12시 이전 am, 이후 pm
+  - both: 한 번 실행으로 am/pm 글을 각각 따로 생성/업데이트(같은 시각 기준이라 내용은 유사할 수 있음)
 - 오전/오후 RUN_SLOT 별로 글을 "따로" 생성(슬롯별 slug 고정)
 - WordPress REST API로 생성/업데이트
 - SQLite로 발행 이력 저장(같은 슬롯은 업데이트)
@@ -13,14 +17,15 @@ community_hotdeal_top20_to_wp.py (완전 통합)
 
 ✅ 옵션 환경변수:
   - WP_STATUS: publish (기본 publish)
-  - WP_CATEGORY_IDS: "4" (기본 4)  ← 여기서 카테고리 번호 바꾸면 됨
+  - WP_CATEGORY_IDS: "4" (기본 4)
   - WP_TAG_IDS: "1,2,3" (선택)
   - SQLITE_PATH: data/community_hotdeal.sqlite3
   - WINDOW_HOURS: 18 (기본 18시간 내 글만)
   - LIMIT: 20 (기본 20)
-  - RUN_SLOT: am / pm (yml에서 자동 세팅)
+  - RUN_SLOT: am / pm / auto / both (기본 auto)
   - DRY_RUN: 1이면 워드프레스 발행 안하고 미리보기 출력
   - DEBUG: 1이면 상세 로그/테스트 출력
+  - SOURCES_JSON: {"key":"url"} 형태로 소스 교체 가능
 """
 
 from __future__ import annotations
@@ -32,7 +37,6 @@ import json
 import os
 import re
 import sqlite3
-import sys
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -48,7 +52,6 @@ KST = timezone(timedelta(hours=9))
 
 DEFAULT_SOURCES = {
     "ruliweb_hotdeal": "https://bbs.ruliweb.com/market/board/1020",
-    # 뽐뿌 RSS: 게시판 id를 rss.php?id= 뒤에 붙이는 형태가 널리 사용됨(예: ppomppu, ppomppu4 등) :contentReference[oaicite:3]{index=3}
     "ppomppu_rss_domestic": "http://www.ppomppu.co.kr/rss.php?id=ppomppu",
     "ppomppu_rss_oversea": "http://www.ppomppu.co.kr/rss.php?id=ppomppu4",
     "fmkorea_hotdeal": "https://m.fmkorea.com/hotdeal",
@@ -100,7 +103,7 @@ class WordPressConfig:
 
 @dataclass
 class RunConfig:
-    run_slot: str = "am"     # am / pm
+    run_slot: str = "auto"  # am / pm / auto / both
     window_hours: int = 18
     limit: int = 20
     dry_run: bool = False
@@ -121,13 +124,12 @@ def load_cfg() -> AppConfig:
     wp_pass = _env("WP_APP_PASS")
     wp_status = _env("WP_STATUS", "publish") or "publish"
 
-    # 기본 카테고리: 4 (원하면 yml에서 WP_CATEGORY_IDS만 바꾸면 끝)
     cat_ids = _parse_int_list(_env("WP_CATEGORY_IDS", "4"))
     tag_ids = _parse_int_list(_env("WP_TAG_IDS", ""))
 
-    run_slot = (_env("RUN_SLOT", "am") or "am").lower()
-    if run_slot not in ("am", "pm"):
-        run_slot = "am"
+    run_slot = (_env("RUN_SLOT", "auto") or "auto").lower()
+    if run_slot not in ("am", "pm", "auto", "both"):
+        run_slot = "auto"
 
     window_hours = _env_int("WINDOW_HOURS", 18)
     limit = _env_int("LIMIT", 20)
@@ -136,7 +138,6 @@ def load_cfg() -> AppConfig:
     dry_run = _env_bool("DRY_RUN", False)
     debug = _env_bool("DEBUG", False)
 
-    # (확장용) SOURCES_JSON 환경변수로 소스 교체 가능
     sources_json = _env("SOURCES_JSON", "")
     sources = DEFAULT_SOURCES.copy()
     if sources_json:
@@ -193,6 +194,7 @@ def print_safe_cfg(cfg: AppConfig) -> None:
     print("[CFG] WP_CATEGORY_IDS:", cfg.wp.category_ids)
     print("[CFG] WP_TAG_IDS:", cfg.wp.tag_ids)
     print("[CFG] RUN_SLOT:", cfg.run.run_slot, "| WINDOW_HOURS:", cfg.run.window_hours, "| LIMIT:", cfg.run.limit)
+    print("[CFG] DRY_RUN:", cfg.run.dry_run, "| DEBUG:", cfg.run.debug)
     print("[CFG] SQLITE_PATH:", cfg.sqlite_path)
     print("[CFG] SOURCES:", list(cfg.sources.keys()))
 
@@ -339,7 +341,6 @@ def parse_shop_and_price(title: str) -> Tuple[str, str]:
     if m:
         shop = clean_text(m.group(1))
 
-    # 가격 후보
     price = ""
     m2 = re.search(r"([0-9]{1,3}(?:,[0-9]{3})+)\s*원", t)
     if m2:
@@ -355,12 +356,10 @@ def parse_shop_and_price(title: str) -> Tuple[str, str]:
 def compute_score(d: Deal, now: datetime, window_hours: int) -> float:
     age_h = max(0.0, (now - d.created_at).total_seconds() / 3600.0)
     recency = max(0.0, (window_hours - age_h) / window_hours)  # 0~1
-    # 루리웹은 추천/조회가 있어서 가중치 줌
     s = 0.0
     s += recency * 10.0
     s += min(d.reco, 300) * 0.25
     s += min(d.comments, 300) * 0.10
-    # 조회수는 로그 형태 느낌만 주려고 루트로 완화
     s += (min(d.views, 300000) ** 0.5) * 0.02
     return s
 
@@ -376,10 +375,8 @@ def _requests_session() -> requests.Session:
 
 def fetch_ppomppu_rss(url: str, now: datetime, window_hours: int, source_name: str) -> List[Deal]:
     deals: List[Deal] = []
-    # feedparser는 자체적으로 requests를 쓰지 않아서, 타임아웃/차단 시 오래 걸릴 수 있음 → 최대한 빠르게
     feed = feedparser.parse(url)
     if getattr(feed, "bozo", 0) and not feed.entries:
-        # 실패해도 전체 중단하지 않기
         return deals
 
     for e in feed.entries[:80]:
@@ -422,8 +419,6 @@ def fetch_ruliweb_hotdeal(url: str, now: datetime, window_hours: int) -> List[De
             return deals
 
     soup = BeautifulSoup(r.text, "html.parser")
-
-    # 게시글 링크 패턴: /market/board/1020/read/...
     anchors = soup.find_all("a", href=True)
     seen = set()
 
@@ -449,7 +444,6 @@ def fetch_ruliweb_hotdeal(url: str, now: datetime, window_hours: int) -> List[De
 
         tr_text = clean_text(tr.get_text(" ", strip=True))
 
-        # 댓글수: (16) 같은 패턴
         comments = 0
         m_c = re.search(r"\((\d{1,4})\)", tr_text)
         if m_c:
@@ -458,8 +452,6 @@ def fetch_ruliweb_hotdeal(url: str, now: datetime, window_hours: int) -> List[De
             except Exception:
                 comments = 0
 
-        # 추천/조회: 행 안에 숫자들 중, 보통 추천/조회 컬럼이 있음
-        # 가장 안정적으로는 td를 순회해서 숫자만 있는 td를 수집
         reco = 0
         views = 0
         date_token = ""
@@ -473,15 +465,12 @@ def fetch_ruliweb_hotdeal(url: str, now: datetime, window_hours: int) -> List[De
                     nums.append(int(tx))
                 except Exception:
                     pass
-            # 날짜/시간 후보
             if re.fullmatch(r"\d{4}\.\d{2}\.\d{2}", tx) or re.fullmatch(r"\d{2}:\d{2}", tx):
                 date_token = tx
 
-        # 루리웹 구조상 nums 중 앞쪽이 추천, 다음이 조회인 경우가 많음(공지 제외)
         if len(nums) >= 2:
             reco, views = nums[0], nums[1]
 
-        # 날짜 파싱
         created_at = now
         if date_token:
             try:
@@ -532,7 +521,6 @@ def fetch_fmkorea_hotdeal(url: str, now: datetime, window_hours: int) -> List[De
         if not href or not title:
             continue
 
-        # 핫딜 글 링크는 보통 /index.php?mid=hotdeal&document_srl=... 또는 /hotdeal/... 형태가 섞임
         if "document_srl=" not in href and "/hotdeal" not in href:
             continue
 
@@ -541,8 +529,7 @@ def fetch_fmkorea_hotdeal(url: str, now: datetime, window_hours: int) -> List[De
             continue
         seen.add(link)
 
-        # 목록에서 시간/날짜 정확히 못 뽑을 수 있어서: "일단 지금"으로 넣되, window 필터는 느슨하게(=항상 포함)
-        created_at = now
+        created_at = now  # 목록에서 정확 시간 추출이 어려워 현재 시각 처리
 
         shop, price = parse_shop_and_price(title)
         deals.append(
@@ -570,9 +557,9 @@ def fmt_dt(dt: datetime) -> str:
     return dt.astimezone(KST).strftime("%Y-%m-%d %H:%M")
 
 
-def build_html(date_slot_label: str, now: datetime, deals: List[Deal]) -> str:
+def build_html(slot_label: str, now: datetime, deals: List[Deal]) -> str:
     disclosure = f'<p style="padding:10px;border-left:4px solid #111;background:#f7f7f7;">{htmlmod.escape(DISCLOSURE)}</p>'
-    head = f"<p>기준시각: <b>{htmlmod.escape(fmt_dt(now))}</b> / 슬롯: <b>{htmlmod.escape(date_slot_label)}</b></p>"
+    head = f"<p>기준시각: <b>{htmlmod.escape(fmt_dt(now))}</b> / 슬롯: <b>{htmlmod.escape(slot_label)}</b></p>"
     note = f'<p style="font-size:13px;opacity:.8;">{htmlmod.escape(POST_NOTE)}</p>'
 
     rows = []
@@ -621,20 +608,22 @@ def build_html(date_slot_label: str, now: datetime, deals: List[Deal]) -> str:
 
 
 # -----------------------------
-# Main
+# Main logic
 # -----------------------------
-def run(cfg: AppConfig) -> None:
-    now = datetime.now(tz=KST)
-    date_str = now.strftime("%Y-%m-%d")
-    slot = cfg.run.run_slot
-    slot_label = "오전" if slot == "am" else "오후"
-    date_slot = f"{date_str}_{slot}"
+def resolve_slots(now: datetime, run_slot: str) -> List[str]:
+    rs = (run_slot or "auto").lower()
+    if rs == "both":
+        return ["am", "pm"]
+    if rs == "auto":
+        return ["am" if now.hour < 12 else "pm"]
+    if rs in ("am", "pm"):
+        return [rs]
+    return ["am" if now.hour < 12 else "pm"]
 
-    init_db(cfg.sqlite_path)
 
+def collect_deals(cfg: AppConfig, now: datetime) -> List[Deal]:
     deals_all: List[Deal] = []
 
-    # 각 소스는 실패해도 스킵 (멈춤 방지)
     try:
         deals_all += fetch_ruliweb_hotdeal(cfg.sources["ruliweb_hotdeal"], now, cfg.run.window_hours)
     except Exception as e:
@@ -659,7 +648,6 @@ def run(cfg: AppConfig) -> None:
         if cfg.run.debug:
             print("[WARN] fmkorea failed:", repr(e))
 
-    # dedupe by link
     uniq: Dict[str, Deal] = {}
     for d in deals_all:
         if not d.link:
@@ -672,15 +660,22 @@ def run(cfg: AppConfig) -> None:
         d.score = compute_score(d, now, cfg.run.window_hours)
 
     deals.sort(key=lambda x: x.score, reverse=True)
-    deals = deals[: cfg.run.limit]
+    return deals[: cfg.run.limit]
+
+
+def publish_one_slot(cfg: AppConfig, slot: str, now: datetime, deals: List[Deal]) -> None:
+    date_str = now.strftime("%Y-%m-%d")
+    slot_label = "오전" if slot == "am" else "오후"
+    date_slot = f"{date_str}_{slot}"
 
     title = f"{date_str} 커뮤니티 핫딜 TOP{len(deals)} ({slot_label})"
-    slug = f"community-hotdeal-{date_str}-{slot}"  # 슬롯별로 분리
+    slug = f"community-hotdeal-{date_str}-{slot}"
     html = build_html(slot_label, now, deals)
 
     if cfg.run.dry_run:
-        print("[DRY_RUN] 발행 생략. 미리보기 HTML ↓\n")
+        print(f"[DRY_RUN] 슬롯={slot_label} 발행 생략. 미리보기 HTML ↓\n")
         print(html)
+        print("\n" + "-" * 80 + "\n")
         return
 
     existing = get_existing_post(cfg.sqlite_path, date_slot)
@@ -688,11 +683,24 @@ def run(cfg: AppConfig) -> None:
         post_id, old_link = existing
         wp_post_id, wp_link = wp_update_post(cfg.wp, post_id, title, html)
         save_post_meta(cfg.sqlite_path, date_slot, wp_post_id, wp_link)
-        print("OK(updated):", wp_post_id, wp_link or old_link)
+        print("OK(updated):", slot, wp_post_id, wp_link or old_link)
     else:
         wp_post_id, wp_link = wp_create_post(cfg.wp, title, slug, html)
         save_post_meta(cfg.sqlite_path, date_slot, wp_post_id, wp_link)
-        print("OK(created):", wp_post_id, wp_link)
+        print("OK(created):", slot, wp_post_id, wp_link)
+
+
+def run(cfg: AppConfig) -> None:
+    now = datetime.now(tz=KST)
+    slots = resolve_slots(now, cfg.run.run_slot)
+
+    init_db(cfg.sqlite_path)
+
+    # (수집은 한 번만) — 하루 2번은 보통 Actions에서 두 번 실행 권장
+    deals = collect_deals(cfg, now)
+
+    for slot in slots:
+        publish_one_slot(cfg, slot, now, deals)
 
 
 def main():
