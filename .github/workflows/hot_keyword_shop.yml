@@ -3,8 +3,8 @@ name: Hot Keyword -> Naver Shop -> WP (AM/PM)
 on:
   workflow_dispatch:
   schedule:
-    - cron: "5 0 * * *"   # 09:05 KST
-    - cron: "5 6 * * *"   # 15:05 KST
+    - cron: "12 0 * * *"   # 09:05 KST
+    - cron: "12 6 * * *"   # 15:05 KST
 
 permissions:
   contents: read
