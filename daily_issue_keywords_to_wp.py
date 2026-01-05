@@ -8,22 +8,10 @@ daily_issue_keywords_to_wp.py (완전 통합/안정화)
 - WordPress REST API로 오전/오후(am/pm) 글을 별도로 생성/업데이트 (slug 분리)
 - 어제 대비를 위해 SQLite에 트렌딩 데이터 저장 (GitHub Actions 캐시와 함께 사용 권장)
 
-필수 Secrets
-  - WP_BASE_URL
-  - WP_USER
-  - WP_APP_PASS
-
-권장 env
-  - WP_CATEGORY_IDS=4
-  - LIMIT=50
-  - EXAMPLE_LINKS=5
-  - TREND_LIMIT=20
-  - WINDOW_HOURS=12
-  - FEEDS_MAX=100
-  - FEED_TIMEOUT=8
-  - MAX_WORKERS=20
-  - RUN_SLOT=am|pm
-  - DEBUG=1
+✅ 중요 수정(이번 버전)
+- RUN_SLOT이 비어있거나 이상하면, KST 현재 시간으로 자동 slot 결정(am/pm)
+  => 오후 실행이 오전 slug를 덮어쓰는 문제 방지
+- 카테고리는 그대로 env(WP_CATEGORY_IDS)로만 제어(코드에서 건드리지 않음)
 """
 
 from __future__ import annotations
@@ -101,6 +89,24 @@ def _split_lines_env(name: str) -> List[str]:
 
 
 # -----------------------------
+# slot helper (핵심 수정)
+# -----------------------------
+def _detect_slot_kst(now: Optional[datetime] = None) -> str:
+    """
+    KST 현재 시간을 기준으로 자동 슬롯 결정
+    - 00:00 ~ 11:59 => am
+    - 12:00 ~ 23:59 => pm
+    """
+    now = now or datetime.now(KST)
+    return "am" if now.hour < 12 else "pm"
+
+
+def _normalize_slot(slot: str) -> str:
+    s = (slot or "").strip().lower()
+    return s if s in ("am", "pm") else ""
+
+
+# -----------------------------
 # config
 # -----------------------------
 @dataclass
@@ -109,7 +115,7 @@ class WordPressConfig:
     username: str
     app_password: str
     status: str = "publish"
-    category_ids: List[int] = field(default_factory=lambda: [4])
+    category_ids: List[int] = field(default_factory=lambda: [4])  # ✅ 카테고리 로직 유지(ENV로만 제어)
 
 
 @dataclass
@@ -136,6 +142,11 @@ class AppConfig:
 
 
 def load_cfg() -> AppConfig:
+    # ✅ slot: env가 비었거나 잘못되면 KST 기준으로 자동 결정
+    env_slot = _normalize_slot(_env("RUN_SLOT", ""))
+    auto_slot = _detect_slot_kst(datetime.now(KST))
+    slot = env_slot or auto_slot
+
     wp = WordPressConfig(
         base_url=_env("WP_BASE_URL").rstrip("/"),
         username=_env("WP_USER"),
@@ -155,11 +166,11 @@ def load_cfg() -> AppConfig:
         feed_timeout=_env_int("FEED_TIMEOUT", 8),
         dry_run=_env_bool("DRY_RUN", False),
         debug=_env_bool("DEBUG", False),
-        slot=(_env("RUN_SLOT", "am") or "am").lower(),
+        slot=slot,
         sqlite_path=_env("SQLITE_PATH", "data/issue_trends.sqlite3") or "data/issue_trends.sqlite3",
     )
-    if run.slot not in ("am", "pm"):
-        run.slot = "am"
+
+    # 범위 제한
     run.limit = max(1, min(run.limit, 200))
     run.example_links = max(1, min(run.example_links, 10))
     run.trend_limit = max(1, min(run.trend_limit, 50))
@@ -288,15 +299,10 @@ def load_trends_by_date(path: str, date_str: str) -> List[Dict[str, Any]]:
 # Google Trends RSS
 # -----------------------------
 def parse_traffic_to_int(s: str) -> int:
-    """
-    RSS의 approx_traffic은 대략값 문자열(예: '10만+', '20K+', '1M+') 형태.
-    숫자로 바꿔 '전날 대비' 계산에 사용(정확한 실측이 아니라 '대략'임).
-    """
     if not s:
         return 0
     t = str(s).strip().replace(",", "").replace("+", "").upper()
 
-    # 한글 단위
     m = re.search(r"(\d+(?:\.\d+)?)\s*만", t)
     if m:
         return int(float(m.group(1)) * 10000)
@@ -304,7 +310,6 @@ def parse_traffic_to_int(s: str) -> int:
     if m:
         return int(float(m.group(1)) * 1000)
 
-    # 영문 단위
     m = re.search(r"(\d+(?:\.\d+)?)\s*K", t)
     if m:
         return int(float(m.group(1)) * 1000)
@@ -312,7 +317,6 @@ def parse_traffic_to_int(s: str) -> int:
     if m:
         return int(float(m.group(1)) * 1_000_000)
 
-    # 숫자만
     m = re.search(r"(\d+)", t)
     if m:
         try:
@@ -691,7 +695,7 @@ def wp_create_post(cfg: WordPressConfig, title: str, slug: str, html: str) -> Tu
         "slug": slug,
         "content": html,
         "status": cfg.status,
-        "categories": cfg.category_ids,
+        "categories": cfg.category_ids,  # ✅ 카테고리는 env(WP_CATEGORY_IDS)에서 들어온 값 그대로
     }
     r = requests.post(url, headers=headers, json=payload, timeout=35)
     if r.status_code not in (200, 201):
@@ -708,7 +712,7 @@ def wp_update_post(cfg: WordPressConfig, post_id: int, title: str, slug: str, ht
         "slug": slug,
         "content": html,
         "status": cfg.status,
-        "categories": cfg.category_ids,
+        "categories": cfg.category_ids,  # ✅ 동일
     }
     r = requests.post(url, headers=headers, json=payload, timeout=35)
     if r.status_code not in (200, 201):
@@ -737,12 +741,6 @@ def fmt_delta(n: int) -> str:
 
 
 def build_trends_delta_table(today: List[Dict[str, Any]], yday: List[Dict[str, Any]]) -> str:
-    """
-    전날 대비:
-    - 순위변동: (어제rank - 오늘rank) > 0 이면 상승(▲)
-    - 트래픽변동: today.traffic_num - yday.traffic_num
-    - 바(bar): 오늘 traffic_num을 max 기준으로 %로 표현
-    """
     y_map: Dict[str, Dict[str, Any]] = {}
     for it in yday:
         k = (it.get("keyword") or "").strip()
@@ -766,7 +764,7 @@ def build_trends_delta_table(today: List[Dict[str, Any]], yday: List[Dict[str, A
         if y_rank is None:
             rchg = "NEW"
         else:
-            diff = y_rank - i  # +면 상승
+            diff = y_rank - i
             if diff > 0:
                 rchg = f"▲{diff}"
             elif diff < 0:
@@ -925,8 +923,15 @@ def main() -> None:
         cfg.run.dry_run = True
     if args["debug"]:
         cfg.run.debug = True
-    if args["slot"] in ("am", "pm"):
-        cfg.run.slot = args["slot"]
+
+    # ✅ CLI --slot 이 들어오면 최우선 적용(정상값만)
+    cli_slot = _normalize_slot(args.get("slot") or "")
+    if cli_slot:
+        cfg.run.slot = cli_slot
+
+    # ✅ 최종 slot이 이상하면 다시 자동 결정
+    if cfg.run.slot not in ("am", "pm"):
+        cfg.run.slot = _detect_slot_kst(datetime.now(KST))
 
     validate_cfg(cfg)
     print_safe(cfg)
@@ -935,14 +940,14 @@ def main() -> None:
     date_str = now.strftime("%Y-%m-%d")
     yday_str = (now - timedelta(days=1)).strftime("%Y-%m-%d")
 
+    # ✅ 하루 2번 각각 1개 글 유지: 날짜 + 슬롯(am/pm)으로 slug 고정
     slug = f"daily-issue-keywords-{date_str}-{cfg.run.slot}"
     title = f"{date_str} 데일리 이슈 키워드 TOP{cfg.run.limit} ({slot_label(cfg.run.slot)})"
 
-    # DB init + load yesterday
     init_db(cfg.run.sqlite_path)
     trends_yday = load_trends_by_date(cfg.run.sqlite_path, yday_str)
 
-    # 1) Google Trends (today)
+    # 1) Google Trends
     try:
         trends_today = fetch_google_trends(cfg.run.google_geo, cfg.run.trend_limit)
         print(f"[TRENDS] ok {len(trends_today)} items")
@@ -950,9 +955,7 @@ def main() -> None:
         trends_today = []
         print("[TRENDS] failed:", ex)
 
-    # store today trends for tomorrow compare
     upsert_trends(cfg.run.sqlite_path, date_str, trends_today)
-
     trend_keywords = [t.get("keyword", "") for t in trends_today if t.get("keyword")]
 
     # 2) feeds
@@ -981,7 +984,7 @@ def main() -> None:
         print(html)
         return
 
-    # 4) WP upsert by slug
+    # 4) WP upsert by slug (✅ 하루/슬롯당 1개 유지)
     existing = wp_find_post_by_slug(cfg.wp, slug)
     if existing:
         post_id, old_link = existing
