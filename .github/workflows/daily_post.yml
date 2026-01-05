@@ -4,8 +4,8 @@ on:
   workflow_dispatch:
   schedule:
     # GitHub Actions cron은 UTC 기준
-    # 09:10 KST = 00:10 UTC
-    - cron: "10 0 * * *"
+    # 09:18 KST = 00:18 UTC
+    - cron: "18 0 * * *"
 
 jobs:
   post:
