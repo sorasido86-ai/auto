@@ -2,7 +2,7 @@ name: Community Hotdeal TOP20 -> WordPress (AM/PM)
 
 on:
   schedule:
-    - cron: "0 0,9 * * *"   # 00:00 UTC(09:00 KST), 09:00 UTC(18:00 KST)
+    - cron: "21 0,9 * * *"   # 00:21 UTC(09:00 KST), 09:21 UTC(18:00 KST)
   workflow_dispatch:
 
 jobs:
