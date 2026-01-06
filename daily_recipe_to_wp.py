@@ -2,12 +2,13 @@
 """
 daily_recipe_to_wp.py (완전 통합 / 매일 1개 레시피 자동 발행 + 대표이미지 업로드)
 
-✅ 기능
+✅ 포함
 - TheMealDB 공개 레시피 API에서 매일 다른 레시피 1개 랜덤 수집
 - SQLite로 오늘 발행 여부/레시피 중복(최근 N일) 방지
 - WordPress에 글 생성/업데이트
-- ✅ 썸네일 이미지 자동 다운로드 → WP Media 업로드 → featured_media(대표이미지) 지정
-- ✅ 제목/본문을 "블로거 톤"으로 자동 구성(소개/재료/레시피/팁/보관/출처)
+- ✅ 썸네일 자동 다운로드 → WP Media 업로드 → featured_media(대표이미지) 지정
+- ✅ 제목/본문을 블로거 톤으로 자동 구성
+- ✅ (중요) 기존 sqlite가 옛 스키마여도 자동으로 컬럼 추가(마이그레이션)
 
 필수 환경변수(GitHub Secrets):
   - WP_BASE_URL
@@ -23,9 +24,9 @@ daily_recipe_to_wp.py (완전 통합 / 매일 1개 레시피 자동 발행 + 대
   - DEBUG: 1이면 로그 상세
   - AVOID_REPEAT_DAYS: 90 (최근 N일 내 동일 레시피 id 재사용 방지)
   - MAX_TRIES: 20 (중복 피하려고 랜덤 재시도 횟수)
-  - UPLOAD_THUMB: 1/0 (기본 1)  썸네일 WP 업로드
-  - SET_FEATURED: 1/0 (기본 1)  대표이미지 지정
-  - EMBED_IMAGE_IN_BODY: 1/0 (기본 1) 본문 상단에 이미지 삽입(테마에 따라 대표이미지만으로 충분하면 0 추천)
+  - UPLOAD_THUMB: 1/0 (기본 1)
+  - SET_FEATURED: 1/0 (기본 1)
+  - EMBED_IMAGE_IN_BODY: 1/0 (기본 1)
 """
 
 from __future__ import annotations
@@ -114,8 +115,7 @@ def load_cfg() -> AppConfig:
     wp_pass = _env("WP_APP_PASS")
     wp_status = _env("WP_STATUS", "publish") or "publish"
 
-    # ✅ 기본 카테고리 7번
-    cat_ids = _parse_int_list(_env("WP_CATEGORY_IDS", "7"))
+    cat_ids = _parse_int_list(_env("WP_CATEGORY_IDS", "7"))  # 기본 7
     tag_ids = _parse_int_list(_env("WP_TAG_IDS", ""))
 
     sqlite_path = _env("SQLITE_PATH", "data/daily_recipe.sqlite3")
@@ -180,14 +180,33 @@ def print_safe_cfg(cfg: AppConfig) -> None:
 
 
 # -----------------------------
-# SQLite
+# SQLite (with migration)
 # -----------------------------
+def _table_columns(con: sqlite3.Connection, table: str) -> set:
+    cur = con.cursor()
+    cur.execute(f"PRAGMA table_info({table})")
+    cols = {str(r[1]) for r in cur.fetchall()}  # r[1] = name
+    return cols
+
+
+def _ensure_columns(con: sqlite3.Connection, table: str, needed: Dict[str, str]) -> None:
+    """
+    needed: {col_name: "SQL type/definition"} e.g. {"media_id": "INTEGER DEFAULT 0"}
+    """
+    cols = _table_columns(con, table)
+    cur = con.cursor()
+    for col, ddl in needed.items():
+        if col not in cols:
+            cur.execute(f"ALTER TABLE {table} ADD COLUMN {col} {ddl}")
+    con.commit()
+
+
 def init_db(path: str) -> None:
     Path(path).parent.mkdir(parents=True, exist_ok=True)
     con = sqlite3.connect(path)
     cur = con.cursor()
 
-    # 오늘 발행 이력(재실행 시 update)
+    # 최신 스키마로 CREATE (기존 테이블 있으면 유지)
     cur.execute(
         """
         CREATE TABLE IF NOT EXISTS daily_posts (
@@ -201,8 +220,6 @@ def init_db(path: str) -> None:
         )
         """
     )
-
-    # 레시피 사용 이력(중복 방지)
     cur.execute(
         """
         CREATE TABLE IF NOT EXISTS used_recipes (
@@ -211,15 +228,39 @@ def init_db(path: str) -> None:
         )
         """
     )
-
     con.commit()
+
+    # ✅ 마이그레이션: 예전 DB(컬럼 누락) 자동 보정
+    _ensure_columns(
+        con,
+        "daily_posts",
+        {
+            "media_id": "INTEGER DEFAULT 0",
+            "media_url": "TEXT DEFAULT ''",
+        },
+    )
+    _ensure_columns(
+        con,
+        "daily_posts",
+        {
+            "recipe_id": "TEXT",
+            "wp_post_id": "INTEGER DEFAULT 0",
+            "wp_link": "TEXT DEFAULT ''",
+            "created_at": "TEXT",
+        },
+    )
+    _ensure_columns(con, "used_recipes", {"used_at": "TEXT"})
+
     con.close()
 
 
 def get_today_post(path: str, date_key: str) -> Optional[Tuple[str, int, str, int, str]]:
     con = sqlite3.connect(path)
     cur = con.cursor()
-    cur.execute("SELECT recipe_id, wp_post_id, wp_link, media_id, media_url FROM daily_posts WHERE date_key = ?", (date_key,))
+    cur.execute(
+        "SELECT recipe_id, wp_post_id, wp_link, media_id, media_url FROM daily_posts WHERE date_key = ?",
+        (date_key,),
+    )
     row = cur.fetchone()
     con.close()
     if not row:
@@ -240,7 +281,7 @@ def save_today_post(path: str, date_key: str, recipe_id: str, post_id: int, link
         INSERT OR REPLACE INTO daily_posts(date_key, recipe_id, wp_post_id, wp_link, media_id, media_url, created_at)
         VALUES (?, ?, ?, ?, ?, ?, ?)
         """,
-        (date_key, recipe_id, post_id, link, media_id, media_url, datetime.utcnow().isoformat()),
+        (date_key, recipe_id, post_id, link, int(media_id or 0), str(media_url or ""), datetime.utcnow().isoformat()),
     )
     con.commit()
     con.close()
@@ -283,7 +324,7 @@ def was_used_recently(path: str, recipe_id: str, days: int) -> bool:
 # -----------------------------
 def wp_auth_header(user: str, app_pass: str) -> Dict[str, str]:
     token = base64.b64encode(f"{user}:{app_pass}".encode("utf-8")).decode("utf-8")
-    return {"Authorization": f"Basic {token}", "User-Agent": "daily-recipe-bot/2.0"}
+    return {"Authorization": f"Basic {token}", "User-Agent": "daily-recipe-bot/2.1"}
 
 
 def wp_create_post(cfg: WordPressConfig, title: str, slug: str, html: str, featured_media: int = 0) -> Tuple[int, str]:
@@ -323,20 +364,15 @@ def wp_update_post(cfg: WordPressConfig, post_id: int, title: str, html: str, fe
 
 
 def wp_upload_media(cfg: WordPressConfig, image_bytes: bytes, filename: str, mime: str, title: str, alt_text: str) -> Tuple[int, str]:
-    """
-    업로드 성공 시: (media_id, source_url) 반환
-    """
     url = cfg.base_url.rstrip("/") + "/wp-json/wp/v2/media"
     headers = wp_auth_header(cfg.user, cfg.app_pass)
 
-    # 1) multipart 업로드 시도
-    files = {
-        "file": (filename, image_bytes, mime),
-    }
+    # multipart 우선
+    files = {"file": (filename, image_bytes, mime)}
     data = {"title": title}
     r = requests.post(url, headers=headers, files=files, data=data, timeout=40)
 
-    # 일부 환경에서 multipart가 막히면 raw 업로드가 더 잘 먹는 경우가 있어 fallback
+    # fallback: raw upload
     if r.status_code not in (200, 201):
         headers2 = {
             **headers,
@@ -352,7 +388,7 @@ def wp_upload_media(cfg: WordPressConfig, image_bytes: bytes, filename: str, mim
     media_id = int(j["id"])
     source_url = str(j.get("source_url") or "")
 
-    # alt_text 업데이트(가능하면)
+    # alt_text 업데이트(되면 하고, 안되면 패스)
     try:
         url2 = cfg.base_url.rstrip("/") + f"/wp-json/wp/v2/media/{media_id}"
         headers_json = {**headers, "Content-Type": "application/json"}
@@ -368,7 +404,7 @@ def wp_upload_media(cfg: WordPressConfig, image_bytes: bytes, filename: str, mim
 # -----------------------------
 def _session() -> requests.Session:
     s = requests.Session()
-    s.headers.update({"User-Agent": "Mozilla/5.0 (compatible; daily-recipe-bot/2.0)"})
+    s.headers.update({"User-Agent": "Mozilla/5.0 (compatible; daily-recipe-bot/2.1)"})
     return s
 
 
@@ -393,18 +429,15 @@ def pick_instructions_steps(instr: str) -> List[str]:
     t = clean_text(instr or "")
     if not t:
         return []
-
     lines = [x.strip() for x in re.split(r"[\r\n]+", t) if x.strip()]
     if len(lines) >= 3:
         return lines[:25]
-
     parts = [x.strip() for x in re.split(r"\.\s+", t) if x.strip()]
     if len(parts) >= 3:
         out = []
         for p in parts[:25]:
             out.append(p if p.endswith(".") else p + ".")
         return out
-
     return [t]
 
 
@@ -432,15 +465,10 @@ def fetch_unique_recipe(cfg: AppConfig) -> Dict[str, Any]:
         last = meal
         if cfg.run.debug:
             print("[DEBUG] repeat avoided:", rid)
-    if last:
-        return last
-    raise RuntimeError("레시피를 가져오지 못했습니다.")
+    return last if last else fetch_random_recipe()
 
 
 def download_image(url: str) -> Tuple[bytes, str]:
-    """
-    returns: (bytes, mime)
-    """
     if not url:
         raise RuntimeError("썸네일 URL이 없습니다.")
     with _session() as s:
@@ -473,7 +501,6 @@ def fmt_dt(dt: datetime) -> str:
 
 
 def blogger_intro(name: str, area: str, cat: str) -> str:
-    # 블로거톤 인트로(과하지 않게)
     bits = []
     if cat:
         bits.append(cat)
@@ -483,14 +510,11 @@ def blogger_intro(name: str, area: str, cat: str) -> str:
     vibe = f" ({vibe})" if vibe else ""
     return (
         f"<p>오늘은 <b>{htmlmod.escape(name)}</b>{htmlmod.escape(vibe)} 레시피를 가져왔어요. "
-        f"바쁜 날에도 부담 없이 따라 할 수 있게 핵심만 정리해둘게요 🙂</p>"
+        f"처음 해보는 분도 따라 하기 쉽게 핵심만 깔끔하게 정리해둘게요 🙂</p>"
     )
 
 
 def build_recipe_html(cfg: AppConfig, now: datetime, meal: Dict[str, Any], media_url: str = "") -> Tuple[str, str, str, str]:
-    """
-    returns: (recipe_id, title, slug, html)
-    """
     date_str = now.strftime("%Y-%m-%d")
     rid = str(meal.get("idMeal") or "")
     name = clean_text(str(meal.get("strMeal") or "오늘의 레시피"))
@@ -504,12 +528,8 @@ def build_recipe_html(cfg: AppConfig, now: datetime, meal: Dict[str, Any], media
     ingredients = extract_ingredients(meal)
     steps = pick_instructions_steps(str(meal.get("strInstructions") or ""))
 
-    # 제목도 블로거톤: 너무 길면 자연스럽게
-    title = f"{date_str} 오늘의 레시피 | {name}"
-    if area:
-        title += f" ({area})"
-
-    slug = f"daily-recipe-{date_str}"  # 하루 1개 고정(오늘 재실행하면 update)
+    title = f"{date_str} 오늘의 레시피 | {name}" + (f" ({area})" if area else "")
+    slug = f"daily-recipe-{date_str}"
 
     mealdb_link = f"https://www.themealdb.com/meal/{rid}" if rid else "https://www.themealdb.com/"
     ref = source_url or mealdb_link
@@ -524,7 +544,6 @@ def build_recipe_html(cfg: AppConfig, now: datetime, meal: Dict[str, Any], media
         meta_bits.append(f"스타일: <b>{htmlmod.escape(area)}</b>")
     meta = f"<p>{' · '.join(meta_bits)}</p>" if meta_bits else ""
 
-    # 이미지: 업로드된 media_url 우선, 없으면 원본 thumb 사용
     img_url = media_url or thumb_src
     img_block = ""
     if cfg.run.embed_image_in_body and img_url:
@@ -539,27 +558,22 @@ def build_recipe_html(cfg: AppConfig, now: datetime, meal: Dict[str, Any], media
     intro = blogger_intro(name, area, cat)
 
     ing_html = (
-        "<ul>"
-        + "".join(f"<li>{htmlmod.escape(x)}</li>" for x in ingredients)
-        + "</ul>"
+        "<ul>" + "".join(f"<li>{htmlmod.escape(x)}</li>" for x in ingredients) + "</ul>"
         if ingredients
         else "<p>-</p>"
     )
 
-    # 블로거톤 스텝(원문을 그대로 복붙 느낌 줄이려고 '요약' 문장 + 원문 스텝 제공)
-    # 번역은 하지 않음(영문일 수 있음) — 대신 읽기 편하게 정돈
     step_items = []
     for s in steps:
         s2 = clean_text(s)
-        if not s2:
-            continue
-        step_items.append(f"<li>{htmlmod.escape(s2)}</li>")
+        if s2:
+            step_items.append(f"<li>{htmlmod.escape(s2)}</li>")
     step_html = "<ol>" + "".join(step_items) + "</ol>" if step_items else "<p>-</p>"
 
     tips = (
         "<ul>"
-        "<li>재료 계량은 집마다 컵/스푼이 달라서, 처음엔 조금씩 넣어가며 맛을 맞추는 게 좋아요.</li>"
-        "<li>불 조절이 맛을 좌우해요. 센 불로 시작했다면 중약불로 마무리해 주세요.</li>"
+        "<li>처음엔 계량을 너무 딱 맞추기보다, 조금씩 넣어가며 맛을 조절하는 게 실패 확률이 낮아요.</li>"
+        "<li>센 불로 시작했다면 중약불로 마무리해서 속까지 고르게 익혀주세요.</li>"
         "<li>남은 음식은 완전히 식힌 뒤 밀폐 보관하면 다음 날 더 맛있어지는 경우가 많아요.</li>"
         "</ul>"
     )
@@ -574,21 +588,14 @@ def build_recipe_html(cfg: AppConfig, now: datetime, meal: Dict[str, Any], media
     )
 
     html = (
-        disclosure
-        + head
-        + meta
-        + intro
-        + img_block
-        + "<h2>재료</h2>"
-        + ing_html
+        disclosure + head + meta + intro + img_block
+        + "<h2>재료</h2>" + ing_html
         + "<h2>만드는 법</h2>"
-        + "<p style='opacity:.85;'>아래 순서대로만 따라가면 됩니다. (원문 레시피 흐름을 최대한 살렸어요.)</p>"
+        + "<p style='opacity:.85;'>아래 순서대로만 따라가면 됩니다. (원문 흐름을 최대한 살려 정돈했어요.)</p>"
         + step_html
-        + "<h2>맛있게 만드는 팁</h2>"
-        + tips
+        + "<h2>맛있게 만드는 팁</h2>" + tips
         + refs
     )
-
     return rid, title, slug, html
 
 
@@ -599,18 +606,18 @@ def run(cfg: AppConfig) -> None:
     now = datetime.now(tz=KST)
     date_key = now.strftime("%Y-%m-%d")
 
+    # ✅ init_db가 마이그레이션까지 수행 -> 이후 SELECT에서 컬럼 에러 안남
     init_db(cfg.sqlite_path)
 
-    # 레시피 하나 뽑기(최근 N일 중복 방지)
     meal = fetch_unique_recipe(cfg)
     rid = str(meal.get("idMeal") or "")
     name = clean_text(str(meal.get("strMeal") or "오늘의 레시피"))
     thumb = clean_text(str(meal.get("strMealThumb") or ""))
 
-    # 이미지 업로드(선택)
     media_id = 0
     media_url = ""
 
+    # 썸네일 업로드(실패해도 글은 계속)
     if cfg.run.upload_thumb and thumb and not cfg.run.dry_run:
         try:
             img_bytes, mime = download_image(thumb)
@@ -621,13 +628,10 @@ def run(cfg: AppConfig) -> None:
             if cfg.run.debug:
                 print("[DEBUG] media uploaded:", media_id, media_url)
         except Exception as e:
-            # 이미지 업로드 실패해도 글 발행은 진행
             if cfg.run.debug:
                 print("[WARN] media upload failed:", repr(e))
-            media_id = 0
-            media_url = ""
+            media_id, media_url = 0, ""
 
-    # 블로거톤 HTML 생성 (업로드된 media_url 있으면 본문 이미지로 사용)
     rid2, title, slug, html = build_recipe_html(cfg, now, meal, media_url=media_url)
 
     if cfg.run.dry_run:
@@ -635,14 +639,13 @@ def run(cfg: AppConfig) -> None:
         print(html)
         return
 
-    # 오늘 글은 update로 유지(슬러그 고정)
     today = get_today_post(cfg.sqlite_path, date_key)
     featured = media_id if cfg.run.set_featured else 0
 
     if today and today[1] > 0:
         _, post_id, old_link, _, _ = today
         wp_post_id, wp_link = wp_update_post(cfg.wp, post_id, title, html, featured_media=featured)
-        save_today_post(cfg.sqlite_path, date_key, rid2, wp_post_id, wp_link, media_id, media_url)
+        save_today_post(cfg.sqlite_path, date_key, rid2, wp_post_id, wp_link or old_link, media_id, media_url)
         if rid2:
             mark_used_recipe(cfg.sqlite_path, rid2)
         print("OK(updated):", wp_post_id, wp_link or old_link)
