@@ -1,15 +1,9 @@
-name: Daily Recipe to WP
+name: Daily Recipe to WordPress
 
 on:
   schedule:
-    - cron: "5 0 * * *"   # 09:05 KST
-    - cron: "5 9 * * *"   # 18:05 KST
+    - cron: "5 0 * * *"   # 09:05 KST (UTC+9)
   workflow_dispatch:
-    inputs:
-      run_slot:
-        description: "day / am / pm"
-        required: false
-        default: "day"
 
 jobs:
   post:
@@ -24,23 +18,19 @@ jobs:
         with:
           python-version: "3.11"
 
+      # ✅ SQLite 저장(중복/이력 유지)
+      - name: Cache data (sqlite)
+        uses: actions/cache@v4
+        with:
+          path: data
+          key: daily-recipe-data-${{ runner.os }}-v1
+          restore-keys: |
+            daily-recipe-data-${{ runner.os }}-
+
       - name: Install deps
         run: |
           python -m pip install --upgrade pip
-          pip install requests
-
-      - name: Decide RUN_SLOT
-        shell: bash
-        run: |
-          if [ "${{ github.event_name }}" = "schedule" ]; then
-            if [ "${{ github.event.schedule }}" = "5 0 * * *" ]; then
-              echo "RUN_SLOT=am" >> $GITHUB_ENV
-            else
-              echo "RUN_SLOT=pm" >> $GITHUB_ENV
-            fi
-          else
-            echo "RUN_SLOT=${{ github.event.inputs.run_slot }}" >> $GITHUB_ENV
-          fi
+          pip install requests openai
 
       - name: Run
         env:
@@ -50,22 +40,24 @@ jobs:
 
           # ✅ 카테고리 7번
           WP_CATEGORY_IDS: "7"
+          WP_STATUS: "publish"
 
-          # 한글 블로거톤(필수: OPENAI_API_KEY)
+          # ✅ 한글 블로거톤
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-          OPENAI_MODEL: "gpt-5-mini"
-          KOREANIZE: "1"
-          BLOG_TONE: "1"
+          OPENAI_MODEL: "gpt-5.2"
+          STRICT_KOREAN: "1"
 
+          # 옵션
+          RUN_SLOT: "day"
           SQLITE_PATH: "data/daily_recipe.sqlite3"
-          AVOID_REPEAT_DAYS: "90"
-          MAX_TRIES: "20"
-
           UPLOAD_THUMB: "1"
           SET_FEATURED: "1"
           EMBED_IMAGE_IN_BODY: "1"
 
-          WP_STATUS: "publish"
+          AVOID_REPEAT_DAYS: "90"
+          MAX_TRIES: "20"
+          FORCE_NEW: "0"
+
           DRY_RUN: "0"
           DEBUG: "0"
         run: |
