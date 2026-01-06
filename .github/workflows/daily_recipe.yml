@@ -1,15 +1,13 @@
 name: Daily Recipe → WordPress (AM/PM)
 
 on:
-  # ✅ (1) 실행 시간만 바꾸면 됨
-  # GitHub cron은 UTC 기준!
+  # ✅ (1) 시간만 바꾸면 됨 (GitHub cron은 UTC 기준)
   # - 09:23 KST = 00:23 UTC
   # - 18:05 KST = 09:05 UTC
   schedule:
-    - cron: "23 0 * * *"   # 오전(AM) KST 09:23
-    - cron: "5 9 * * *"   # 오후(PM) KST 18:05
+    - cron: "23 0 * * *"   # AM (KST 09:23)
+    - cron: "5 9 * * *"   # PM (KST 18:05)
 
-  # 수동 실행도 가능
   workflow_dispatch:
     inputs:
       slot:
@@ -17,16 +15,12 @@ on:
         required: true
         default: "am"
         type: choice
-        options:
-          - am
-          - pm
-          - day
+        options: [am, pm, day]
       force_new:
         description: "Force new recipe even if already posted today (0/1)"
         required: false
         default: "0"
 
-# 같은 시간에 중복 실행 방지
 concurrency:
   group: daily-recipe-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
@@ -34,7 +28,6 @@ concurrency:
 jobs:
   post:
     runs-on: ubuntu-latest
-
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -44,18 +37,17 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install deps
+      # ✅ openai 누락 방지: 무조건 설치
+      - name: Install deps (always)
         run: |
           python -m pip install --upgrade pip
+          pip install --upgrade openai requests
+          # requirements.txt가 있으면 거기에 있는 것들도 추가 설치
           if [ -f requirements.txt ]; then
             pip install -r requirements.txt
-          else
-            pip install openai requests
           fi
 
       # ✅ 슬롯 자동 판별(스케줄 실행일 때만)
-      # - 00시 UTC대 실행 → am
-      # - 09시 UTC대 실행 → pm
       - name: Resolve RUN_SLOT
         id: slot
         shell: bash
@@ -75,8 +67,6 @@ jobs:
             echo "FORCE_NEW=0" >> $GITHUB_OUTPUT
           fi
 
-      # SQLite(중복방지/이력) 캐시로 유지
-      # ※ actions/cache는 key가 같으면 저장이 안 되므로 run_id를 섞고 restore-keys로 복원
       - name: Restore sqlite cache
         uses: actions/cache@v4
         with:
@@ -87,46 +77,42 @@ jobs:
 
       - name: Run bot
         env:
-          # ✅ 필수(Secrets)
+          # ✅ 필수 Secrets (여기 4개는 GitHub Secrets에 등록되어 있어야 함)
           WP_BASE_URL: ${{ secrets.WP_BASE_URL }}
           WP_USER: ${{ secrets.WP_USER }}
           WP_APP_PASS: ${{ secrets.WP_APP_PASS }}
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
 
-          # ✅ (2) 카테고리 여기서만 바꾸면 됨
+          # ✅ (2) 카테고리 번호 바꾸려면 여기만 변경
           WP_CATEGORY_IDS: "7"
           WP_STATUS: "publish"
+          WP_TAG_IDS: ""
 
-          # 옵션
-          WP_TAG_IDS: ""                      # 필요하면 "1,2,3"
           SQLITE_PATH: "data/daily_recipe.sqlite3"
+
           RUN_SLOT: ${{ steps.slot.outputs.RUN_SLOT }}
           FORCE_NEW: ${{ steps.slot.outputs.FORCE_NEW }}
 
-          # 한국어/블로그톤 설정
           STRICT_KOREAN: "1"
           OPENAI_MODEL: "gpt-5.2"
           OPENAI_MAX_RETRIES: "3"
           AVOID_REPEAT_DAYS: "90"
           MAX_TRIES: "20"
 
-          # 썸네일/대표이미지
           UPLOAD_THUMB: "1"
           SET_FEATURED: "1"
           EMBED_IMAGE_IN_BODY: "1"
 
-          # OpenAI 크레딧 소진 시 "무료번역 폴백" (네 파이썬 통합코드에 반영된 값)
           FREE_TRANSLATE_URL: "https://libretranslate.de/translate"
           FREE_TRANSLATE_SOURCE: "en"
           FREE_TRANSLATE_TARGET: "ko"
-          # FREE_TRANSLATE_API_KEY: ${{ secrets.FREE_TRANSLATE_API_KEY }}  # 필요하면
+          # FREE_TRANSLATE_API_KEY: ${{ secrets.FREE_TRANSLATE_API_KEY }}  # 필요할 때만
 
-          # 디버그 필요할 때만 1
           DEBUG: "0"
           DRY_RUN: "0"
 
         run: |
           mkdir -p data
           echo "[RUN] slot=${RUN_SLOT} force_new=${FORCE_NEW}"
-          # ✅ (3) 실행 파일명만 여기서 맞추면 됨
+          # ✅ (3) 파이썬 파일명이 다르면 여기만 바꾸면 됨
           python daily_recipe_to_wp.py
