@@ -2,104 +2,85 @@ name: Daily Korean Recipe to WordPress
 
 on:
   schedule:
-    # 09:15 KST == 00:15 UTC
-    - cron: "15 0 * * *"
-  workflow_dispatch:
-    inputs:
-      run_slot:
-        description: "Run slot (day/am/pm)"
-        required: false
-        default: "day"
-        type: choice
-        options:
-          - day
-          - am
-          - pm
-      force_new:
-        description: "Force new recipe even if already posted today (0/1)"
-        required: false
-        default: "0"
-        type: choice
-        options:
-          - "0"
-          - "1"
-      dry_run:
-        description: "DRY_RUN (0/1)"
-        required: false
-        default: "0"
-        type: choice
-        options:
-          - "0"
-          - "1"
-      debug:
-        description: "DEBUG (0/1)"
-        required: false
-        default: "0"
-        type: choice
-        options:
-          - "0"
-          - "1"
+    # 01:10 UTC = 10:17 KST
+    - cron: "17 1 * * *"
+  workflow_dispatch: {}
+
+concurrency:
+  group: daily-korean-recipe
+  cancel-in-progress: true
 
 jobs:
-  run:
+  post:
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Set up Python
+      - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+          cache: "pip"
 
-      - name: Install deps
+      - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           pip install requests openai
 
-      - name: Cache sqlite
-        uses: actions/cache@v4
+      # SQLite(data/) 유지용 캐시 (레시피 반복 방지에 도움)
+      - name: Restore cache (data)
+        uses: actions/cache/restore@v4
         with:
           path: data
-          key: daily-korean-recipe-sqlite-${{ runner.os }}-${{ github.ref_name }}
+          key: daily-korean-recipe-data-${{ github.run_id }}
           restore-keys: |
-            daily-korean-recipe-sqlite-${{ runner.os }}-
+            daily-korean-recipe-data-
 
-      - name: Run bot
+      - name: Run script
         env:
           WP_BASE_URL: ${{ secrets.WP_BASE_URL }}
           WP_USER: ${{ secrets.WP_USER }}
           WP_APP_PASS: ${{ secrets.WP_APP_PASS }}
 
-          # 카테고리 7번 고정(원하면 여기만 변경)
+          # 카테고리 7번 고정
           WP_CATEGORY_IDS: "7"
           WP_STATUS: "publish"
-          SQLITE_PATH: "data/daily_korean_recipe.sqlite3"
 
-          # 식품안전나라(식약처) OpenAPI 키 (없으면 내장 레시피로만 동작)
+          # 식품안전나라(레시피 DB)
           MFDS_API_KEY: ${{ secrets.MFDS_API_KEY }}
 
-          # 블로거톤 강화(선택)
-          USE_OPENAI: "0"
-          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-          OPENAI_MODEL: "gpt-4.1-mini"
+          # 레시피 이미지가 비어도 기본 썸네일로 대체 (필수 추천)
+          DEFAULT_THUMB_URL: ${{ secrets.DEFAULT_THUMB_URL }}
 
-          # 입력값(수동 실행 시)
-          RUN_SLOT: ${{ github.event.inputs.run_slot || 'day' }}
-          FORCE_NEW: ${{ github.event.inputs.force_new || '0' }}
-          DRY_RUN: ${{ github.event.inputs.dry_run || '0' }}
-          DEBUG: ${{ github.event.inputs.debug || '0' }}
+          # 1일 1회용 슬롯
+          RUN_SLOT: "day"
+          FORCE_NEW: "0"
 
-          # 운영 옵션
+          # 옵션
           STRICT_KOREAN: "1"
-          AVOID_REPEAT_DAYS: "90"
-          MAX_TRIES: "25"
-
-          # 이미지 옵션
           UPLOAD_THUMB: "1"
           SET_FEATURED: "1"
           EMBED_IMAGE_IN_BODY: "1"
-          # DEFAULT_THUMB_URL: ""  # 필요하면 secrets 대신 변수로 직접 넣어도 됨
+          REUSE_MEDIA_BY_SEARCH: "1"
+
+          SQLITE_PATH: "data/daily_korean_recipe.sqlite3"
+
+          # OpenAI로 블로거톤 강화(원하면 켜기)
+          USE_OPENAI: "1"
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          OPENAI_MODEL: "gpt-4.1-mini"
+
+          # 디버그 필요하면 1로
+          DEBUG: "0"
+          DRY_RUN: "0"
         run: |
           mkdir -p data
           python daily_korean_recipe_to_wp.py
+
+      - name: Save cache (data)
+        uses: actions/cache/save@v4
+        with:
+          path: data
+          key: daily-korean-recipe-data-${{ github.run_id }}
