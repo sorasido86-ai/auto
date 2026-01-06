@@ -1,16 +1,17 @@
 # -*- coding: utf-8 -*-
 """
-daily_recipe_to_wp.py (완전 통합/안정화)
-- 랜덤 레시피(TheMealDB) 수집 → 한글 블로거톤 변환(OpenAI) → WordPress 발행/업데이트
-- 썸네일(대표이미지) 자동 업로드 + featured_media 지정
-- SQLite 발행 이력 저장 + 스키마 자동 마이그레이션(컬럼 누락 자동 추가)
-- DB가 날아가도: WP slug로 기존 글을 찾아서 "업데이트" (중복 생성 방지)
+daily_recipe_to_wp.py (완전 통합/안정화 + 조회수형 블로그톤 + 크레딧 소진 시 무료번역 폴백)
+- TheMealDB 랜덤 레시피 수집
+- OpenAI로 한국어 블로그톤(후킹/요약/포인트/실패방지/SEO) 글 생성
+- WordPress 발행/업데이트 + 썸네일 업로드/대표이미지 설정
+- SQLite 발행 이력 + 스키마 자동 마이그레이션
+- ✅ OpenAI 크레딧 소진(insufficient_quota) 시: 무료번역(LibreTranslate)로 간단글이라도 자동 발행
 
 필수 env (GitHub Secrets):
   - WP_BASE_URL
   - WP_USER
   - WP_APP_PASS
-  - OPENAI_API_KEY  (한글 블로거톤용)
+  - OPENAI_API_KEY
 
 선택 env:
   - WP_STATUS=publish (기본 publish)
@@ -19,16 +20,21 @@ daily_recipe_to_wp.py (완전 통합/안정화)
   - SQLITE_PATH=data/daily_recipe.sqlite3 (기본)
 
   - RUN_SLOT=day/am/pm (기본 day)
-  - DRY_RUN=1 (발행 안함)
-  - DEBUG=1 (상세 로그)
+  - DRY_RUN=1
+  - DEBUG=1
 
   - OPENAI_MODEL=gpt-5.2 (기본 gpt-5.2)
-  - STRICT_KOREAN=1 (기본 1)  # 한글 출력이 아니면 실패 처리
-  - FORCE_NEW=0 (기본 0)      # 이미 오늘 글이 있으면 같은 recipe_id 유지(있으면) / 1이면 새 레시피로 교체
-  - AVOID_REPEAT_DAYS=90 (기본 90)
-  - MAX_TRIES=20 (기본 20)
+  - STRICT_KOREAN=1 (기본 1)  # 한글 아니면 실패. 단, '크레딧 소진'이면 무료번역으로 폴백
+  - FORCE_NEW=0 (기본 0)
+  - AVOID_REPEAT_DAYS=90
+  - MAX_TRIES=20
+  - OPENAI_MAX_RETRIES=3
 
-참고: OpenAI SDK 사용( pip install openai ) :contentReference[oaicite:1]{index=1}
+무료번역 폴백(LibreTranslate) 선택 env:
+  - FREE_TRANSLATE_URL=https://libretranslate.de/translate   (기본값)
+  - FREE_TRANSLATE_API_KEY=   (필요한 인스턴스면 넣기)
+  - FREE_TRANSLATE_SOURCE=en  (기본 en)
+  - FREE_TRANSLATE_TARGET=ko  (기본 ko)
 """
 
 from __future__ import annotations
@@ -36,15 +42,19 @@ from __future__ import annotations
 import base64
 import json
 import os
+import random
 import re
 import sqlite3
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import requests
-from openai import OpenAI  # 공식 SDK :contentReference[oaicite:2]{index=2}
+
+import openai  # 예외 타입 용도
+from openai import OpenAI  # 공식 SDK
 
 KST = timezone(timedelta(hours=9))
 
@@ -110,12 +120,21 @@ class RunConfig:
     upload_thumb: bool = True
     set_featured: bool = True
     embed_image_in_body: bool = True
+    openai_max_retries: int = 3
 
 
 @dataclass
 class OpenAIConfig:
     api_key: str
-    model: str = "gpt-5.2"  # 문서 예시 기준 :contentReference[oaicite:3]{index=3}
+    model: str = "gpt-5.2"
+
+
+@dataclass
+class FreeTranslateConfig:
+    url: str = "https://libretranslate.de/translate"
+    api_key: str = ""
+    source: str = "en"
+    target: str = "ko"
 
 
 @dataclass
@@ -124,6 +143,7 @@ class AppConfig:
     run: RunConfig
     sqlite_path: str
     openai: OpenAIConfig
+    free_tr: FreeTranslateConfig
 
 
 def load_cfg() -> AppConfig:
@@ -157,6 +177,12 @@ def load_cfg() -> AppConfig:
 
     openai_key = _env("OPENAI_API_KEY", "")
     openai_model = _env("OPENAI_MODEL", "gpt-5.2") or "gpt-5.2"
+    openai_max_retries = _env_int("OPENAI_MAX_RETRIES", 3)
+
+    free_url = _env("FREE_TRANSLATE_URL", "https://libretranslate.de/translate")
+    free_api_key = _env("FREE_TRANSLATE_API_KEY", "")
+    free_src = _env("FREE_TRANSLATE_SOURCE", "en")
+    free_tgt = _env("FREE_TRANSLATE_TARGET", "ko")
 
     return AppConfig(
         wp=WordPressConfig(
@@ -178,9 +204,11 @@ def load_cfg() -> AppConfig:
             upload_thumb=upload_thumb,
             set_featured=set_featured,
             embed_image_in_body=embed_image_in_body,
+            openai_max_retries=openai_max_retries,
         ),
         sqlite_path=sqlite_path,
         openai=OpenAIConfig(api_key=openai_key, model=openai_model),
+        free_tr=FreeTranslateConfig(url=free_url, api_key=free_api_key, source=free_src, target=free_tgt),
     )
 
 
@@ -216,6 +244,9 @@ def print_safe_cfg(cfg: AppConfig) -> None:
     print("[CFG] UPLOAD_THUMB:", cfg.run.upload_thumb, "| SET_FEATURED:", cfg.run.set_featured, "| EMBED_IMAGE_IN_BODY:", cfg.run.embed_image_in_body)
     print("[CFG] OPENAI_API_KEY:", ok(cfg.openai.api_key))
     print("[CFG] OPENAI_MODEL:", cfg.openai.model)
+    print("[CFG] OPENAI_MAX_RETRIES:", cfg.run.openai_max_retries)
+    print("[CFG] FREE_TRANSLATE_URL:", cfg.free_tr.url)
+    print("[CFG] FREE_TRANSLATE_SOURCE/TARGET:", cfg.free_tr.source, "->", cfg.free_tr.target)
 
 
 # -----------------------------
@@ -256,7 +287,7 @@ def init_db(path: str, debug: bool = False) -> None:
     con.commit()
 
     cur.execute("PRAGMA table_info(daily_posts)")
-    cols = {row[1] for row in cur.fetchall()}  # name at index 1
+    cols = {row[1] for row in cur.fetchall()}
 
     for col, typ in REQUIRED_COLUMNS.items():
         if col not in cols:
@@ -346,7 +377,6 @@ def wp_auth_header(user: str, app_pass: str) -> Dict[str, str]:
 
 
 def wp_find_post_by_slug(cfg: WordPressConfig, slug: str) -> Optional[int]:
-    # slug로 기존 글을 찾아서 "중복 생성"을 막고 업데이트하도록
     url = cfg.base_url.rstrip("/") + f"/wp-json/wp/v2/posts?slug={slug}&per_page=1&context=edit"
     r = requests.get(url, headers=wp_auth_header(cfg.user, cfg.app_pass), timeout=20)
     if r.status_code != 200:
@@ -489,12 +519,156 @@ def split_steps(instructions: str) -> List[str]:
 
 
 # -----------------------------
-# OpenAI: Korean blogger tone generation
+# OpenAI helpers + quota detection
 # -----------------------------
-def generate_korean_blog(openai_cfg: OpenAIConfig, recipe: Dict[str, Any], debug: bool = False) -> Tuple[str, str]:
+def _is_insufficient_quota_error(e: Exception) -> bool:
+    s = (repr(e) or "") + " " + (str(e) or "")
+    s = s.lower()
+    return ("insufficient_quota" in s) or ("exceeded your current quota" in s) or ("check your plan and billing" in s)
+
+
+def _openai_call_with_retry(
+    client: OpenAI,
+    model: str,
+    instructions: str,
+    input_text: str,
+    max_retries: int,
+    debug: bool = False,
+):
+    for attempt in range(max_retries + 1):
+        try:
+            return client.responses.create(
+                model=model,
+                instructions=instructions,
+                input=input_text,
+            )
+        except openai.RateLimitError as e:
+            # ✅ 크레딧 소진이면 재시도 의미 없음 → 즉시 상위로 올려서 폴백
+            if _is_insufficient_quota_error(e):
+                raise
+            if attempt == max_retries:
+                raise
+            sleep_s = (2 ** attempt) + random.random()
+            if debug:
+                print(f"[OPENAI] RateLimit → retry in {sleep_s:.2f}s")
+            time.sleep(sleep_s)
+        except openai.APIError as e:
+            if attempt == max_retries:
+                raise
+            sleep_s = (2 ** attempt) + random.random()
+            if debug:
+                print(f"[OPENAI] APIError → retry in {sleep_s:.2f}s | {repr(e)}")
+            time.sleep(sleep_s)
+
+
+# -----------------------------
+# Free translate (LibreTranslate)
+# -----------------------------
+def free_translate_text(cfg: FreeTranslateConfig, text: str, debug: bool = False) -> str:
+    text = (text or "").strip()
+    if not text:
+        return ""
+
+    payload = {
+        "q": text,
+        "source": cfg.source,
+        "target": cfg.target,
+        "format": "text",
+    }
+    if cfg.api_key:
+        payload["api_key"] = cfg.api_key
+
+    try:
+        r = requests.post(cfg.url, json=payload, timeout=20)
+        if r.status_code != 200:
+            if debug:
+                print("[FREE_TR] non-200:", r.status_code, r.text[:200])
+            return text
+        j = r.json()
+        out = (j.get("translatedText") or "").strip()
+        return out or text
+    except Exception as e:
+        if debug:
+            print("[FREE_TR] failed:", repr(e))
+        return text
+
+
+def build_korean_simple_with_free_translate(free_cfg: FreeTranslateConfig, recipe: Dict[str, Any], now: datetime, debug: bool = False) -> Tuple[str, str]:
     """
-    공식 SDK + Responses API: response.output_text 사용 :contentReference[oaicite:4]{index=4}
+    ✅ OpenAI 크레딧 소진 시 사용할 '간단 글' 생성
+    - 제목/재료/과정만 한국어로 번역(가능한 범위)
+    - 블로그톤은 템플릿 문장으로 최소 구성(과도한 생성 없음)
     """
+    title_en = recipe.get("title", "Daily Recipe")
+    title_ko = free_translate_text(free_cfg, title_en, debug=debug)
+    category_en = recipe.get("category", "")
+    area_en = recipe.get("area", "")
+
+    category_ko = free_translate_text(free_cfg, category_en, debug=debug) if category_en else ""
+    area_ko = free_translate_text(free_cfg, area_en, debug=debug) if area_en else ""
+
+    # 재료 번역(원문 병기)
+    ing_lines = []
+    for it in recipe.get("ingredients", []):
+        name_en = (it.get("name") or "").strip()
+        mea = (it.get("measure") or "").strip()
+        name_ko = free_translate_text(free_cfg, name_en, debug=debug) if name_en else ""
+        label = f"{name_ko} ({name_en})" if name_ko and name_ko != name_en else name_en
+        if mea:
+            ing_lines.append(f"<li>{label} <span style='opacity:.75'>— {mea}</span></li>")
+        else:
+            ing_lines.append(f"<li>{label}</li>")
+
+    steps_en = split_steps(recipe.get("instructions", ""))
+    step_lines = []
+    for s in steps_en:
+        ko = free_translate_text(free_cfg, s, debug=debug)
+        step_lines.append(f"<li>{ko}</li>")
+
+    src = (recipe.get("source") or "").strip()
+    yt = (recipe.get("youtube") or "").strip()
+
+    meta_line = " / ".join([x for x in [area_ko, category_ko] if x]).strip()
+    meta_html = f"<p style='opacity:.8;font-size:13px;'>분류: {meta_line}</p>" if meta_line else ""
+
+    body = f"""
+    <p style="padding:10px;border-left:4px solid #111;background:#f7f7f7;">
+      ※ OpenAI 크레딧 소진으로 인해, 오늘은 무료 번역 기반의 간단 레시피로 자동 발행되었습니다.
+    </p>
+    <p>기준시각: <b>{now.astimezone(KST).strftime("%Y-%m-%d %H:%M")}</b></p>
+    {meta_html}
+    <p>오늘은 <b>{title_ko}</b>를 간단히 정리해볼게요. 재료/과정은 원문을 그대로 번역했습니다.</p>
+
+    <h2>재료</h2>
+    <ul>
+      {''.join(ing_lines)}
+    </ul>
+
+    <h2>만드는 법</h2>
+    <ol>
+      {''.join(step_lines)}
+    </ol>
+
+    <p style="opacity:.7;font-size:13px;">
+      출처: {f"<a href='{src}' target='_blank' rel='nofollow noopener'>{src}</a>" if src else "-"}
+      {" | " + f"<a href='{yt}' target='_blank' rel='nofollow noopener'>YouTube</a>" if yt else ""}
+    </p>
+    """
+    # 제목은 조회수형으로 살짝만(과하지 않게)
+    title_final = f"실패 없이 따라하는 {title_ko} 레시피"
+    return title_final, body
+
+
+# -----------------------------
+# OpenAI: 조회수형 블로그톤 (후킹/요약/포인트/실패방지/SEO)
+# -----------------------------
+def generate_korean_blog_highview(
+    openai_cfg: OpenAIConfig,
+    recipe: Dict[str, Any],
+    strict_korean: bool,
+    max_retries: int,
+    debug: bool = False
+) -> Tuple[str, str]:
     client = OpenAI(api_key=openai_cfg.api_key)
 
     payload_recipe = {
@@ -507,32 +681,52 @@ def generate_korean_blog(openai_cfg: OpenAIConfig, recipe: Dict[str, Any], debug
         "youtube": recipe.get("youtube", ""),
     }
 
+    # ✅ 조회수형 톤: 후킹 + 한줄요약 + 포인트/실패방지 + 자연스러운 CTA
     instructions = (
-        "너는 한국의 음식 블로거다. 반드시 한국어로만 작성해.\n"
-        "중요: 제공된 ingredients/steps 외의 재료/양/과정을 절대 추가하거나 바꾸지 마.\n"
-        "출력은 '제목 1줄' + 'HTML 본문'으로 구성.\n"
-        "본문 섹션은 아래 순서로:\n"
-        "1) 소개(짧게)\n"
-        "2) 재료(리스트)\n"
-        "3) 만드는 법(번호)\n"
-        "4) 팁(선택)\n"
-        "5) 마무리 한 줄\n"
-        "HTML은 워드프레스에 바로 붙여넣을 수 있게 깨끗하게."
+        "너는 한국 음식 블로거이자 SEO 글쓰기 전문가다. 반드시 한국어로만 작성해.\n"
+        "\n"
+        "[절대 규칙]\n"
+        "1) 제공된 ingredients/steps 외의 재료, 계량, 조리과정(단계)을 절대 추가/삭제/변경하지 마.\n"
+        "2) 시간/온도 숫자를 원문에 없으면 단정하지 마(예: 10분, 180도). 필요하면 '상태를 보며'처럼 표현.\n"
+        "3) 부연설명은 가능: 맛 포인트, 실패 방지 체크, 식감 체크 방법 등 '일반적인 설명'을 자연스럽게 덧붙여라.\n"
+        "\n"
+        "[조회수 잘 나오는 말투]\n"
+        "- 첫 문단은 ‘후킹’ 2문장: (누구나 실패하는 포인트) → (이 글에서 해결)\n"
+        "- 문장은 짧게, 리듬감 있게. 과한 이모지/과장 광고 금지.\n"
+        "- 독자가 저장/공유하고 싶게: '실패 방지 체크리스트'를 짧게.\n"
+        "- 클릭 유도는 부드럽게: '저장해두면 편해요' 정도.\n"
+        "\n"
+        "[출력 형식]\n"
+        "첫 줄: 제목(한국어, 28~48자, 너무 자극적 금지)\n"
+        "둘째 줄부터: 워드프레스용 HTML(마크다운 금지)\n"
+        "본문 구성(순서 고정):\n"
+        "1) <p>후킹 2문장 + 한줄요약</p>\n"
+        "2) <h2>오늘의 핵심 포인트 5가지</h2><ul><li>...</li></ul>\n"
+        "3) <h2>재료</h2><ul> (재료명은 한국어로 풀어쓰고, 원문명은 괄호로 병기 가능)</ul>\n"
+        "4) <h2>만드는 법</h2><ol>\n"
+        "   - steps 수만큼만 <li>를 만들고, 각 <li> 안에:\n"
+        "     (a) 원문 step을 의미 그대로 자연스러운 한국어로\n"
+        "     (b) 같은 <li> 안에 <div style='font-size:13px;opacity:.8;margin-top:6px;'>실패 방지 팁: ...</div> 1줄\n"
+        "5) <h2>실패 방지 체크리스트</h2><ul> 4~6개</ul>\n"
+        "6) <h2>마무리</h2><p>저장/공유 유도 1문장 포함</p>\n"
+        "7) <p style='opacity:.7;font-size:13px;'>출처 링크(있으면) + 자동생성 안내</p>\n"
     )
 
     user_input = "레시피 JSON:\n" + json.dumps(payload_recipe, ensure_ascii=False, indent=2)
 
-    resp = client.responses.create(
+    resp = _openai_call_with_retry(
+        client=client,
         model=openai_cfg.model,
         instructions=instructions,
-        input=user_input,
+        input_text=user_input,
+        max_retries=max_retries,
+        debug=debug,
     )
 
     text = (resp.output_text or "").strip()
     if debug:
         print("[OPENAI] output_text length:", len(text))
 
-    # 첫 줄 = 제목, 나머지 = HTML 본문(간단 규칙)
     lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
     if len(lines) < 2:
         raise RuntimeError("OpenAI 응답이 너무 짧습니다(제목/본문 분리 실패).")
@@ -540,11 +734,10 @@ def generate_korean_blog(openai_cfg: OpenAIConfig, recipe: Dict[str, Any], debug
     title = lines[0]
     body = "\n".join(lines[1:]).strip()
 
-    # 한국어 검증(STRICT_KOREAN일 때)
-    if not re.search(r"[가-힣]", title) or not re.search(r"[가-힣]", body):
-        raise RuntimeError("OpenAI 응답이 한국어가 아닙니다(한글 검증 실패). OPENAI_MODEL/프롬프트/키 권한 확인.")
+    if strict_korean:
+        if not re.search(r"[가-힣]", title) or not re.search(r"[가-힣]", body):
+            raise RuntimeError("OpenAI 응답이 한국어가 아닙니다(한글 검증 실패).")
 
-    # body가 HTML이 아니면 최소 래핑
     if "<" not in body:
         body = "<p>" + body.replace("\n", "<br/>") + "</p>"
 
@@ -552,39 +745,9 @@ def generate_korean_blog(openai_cfg: OpenAIConfig, recipe: Dict[str, Any], debug
 
 
 # -----------------------------
-# HTML rendering fallback (절대권장 X)
-# -----------------------------
-DISCLOSURE = "※ 본 포스팅은 레시피 정보를 바탕으로 자동 생성된 글입니다."
-
-
-def build_basic_html(recipe: Dict[str, Any], now: datetime) -> str:
-    title = recipe.get("title", "")
-    ingredients = recipe.get("ingredients", [])
-    steps = split_steps(recipe.get("instructions", ""))
-
-    ing_html = "<ul>" + "".join(
-        f"<li>{(i.get('name') or '').strip()} {('('+i.get('measure','').strip()+')' if (i.get('measure') or '').strip() else '')}</li>"
-        for i in ingredients
-    ) + "</ul>"
-
-    step_html = "<ol>" + "".join(f"<li>{s}</li>" for s in steps) + "</ol>"
-
-    return f"""
-    <p style="padding:10px;border-left:4px solid #111;background:#f7f7f7;">{DISCLOSURE}</p>
-    <p>기준시각: <b>{now.astimezone(KST).strftime("%Y-%m-%d %H:%M")}</b></p>
-    <h2>{title}</h2>
-    <h3>재료</h3>
-    {ing_html}
-    <h3>만드는 법</h3>
-    {step_html}
-    """
-
-
-# -----------------------------
 # Main flow
 # -----------------------------
 def pick_recipe(cfg: AppConfig, existing: Optional[Dict[str, Any]]) -> Dict[str, Any]:
-    # 오늘 글이 있고, recipe_id도 저장돼있고, FORCE_NEW=0이면 같은 레시피를 유지
     if existing and existing.get("recipe_id") and not cfg.run.force_new:
         return fetch_recipe_by_id(str(existing["recipe_id"]))
 
@@ -598,7 +761,7 @@ def pick_recipe(cfg: AppConfig, existing: Optional[Dict[str, Any]]) -> Dict[str,
             continue
         return cand
 
-    raise RuntimeError("레시피를 가져오지 못했습니다(중복 회피/시도 횟수 초과). AVOID_REPEAT_DAYS 또는 MAX_TRIES 조정 필요.")
+    raise RuntimeError("레시피를 가져오지 못했습니다(중복 회피/시도 횟수 초과).")
 
 
 def run(cfg: AppConfig) -> None:
@@ -614,7 +777,6 @@ def run(cfg: AppConfig) -> None:
 
     existing = get_today_post(cfg.sqlite_path, date_key)
 
-    # DB에 wp_post_id가 없더라도 slug로 WP에서 찾아서 업데이트 가능하게
     wp_post_id: Optional[int] = None
     if existing and existing.get("wp_post_id"):
         wp_post_id = int(existing["wp_post_id"])
@@ -639,14 +801,32 @@ def run(cfg: AppConfig) -> None:
 
     featured = media_id if (cfg.run.set_featured and media_id) else None
 
-    # ✅ 한글 블로거톤 생성 (실패하면 STRICT_KOREAN=1일 때 바로 실패)
-    title_ko, body_html = generate_korean_blog(cfg.openai, recipe, debug=cfg.run.debug)
+    # ✅ 1) OpenAI로 조회수형 한국어 블로그톤 생성
+    # ✅ 2) 크레딧 소진(insufficient_quota)면 무료번역 폴백으로 "간단글"이라도 발행
+    try:
+        title_ko, body_html = generate_korean_blog_highview(
+            cfg.openai,
+            recipe,
+            strict_korean=cfg.run.strict_korean,
+            max_retries=cfg.run.openai_max_retries,
+            debug=cfg.run.debug,
+        )
+    except Exception as e:
+        if _is_insufficient_quota_error(e):
+            print("[WARN] OpenAI quota depleted → fallback to FREE translate")
+            title_ko, body_html = build_korean_simple_with_free_translate(cfg.free_tr, recipe, now, debug=cfg.run.debug)
+        else:
+            # 크레딧 소진이 아닌데도 실패하면: 기존 정책대로
+            if cfg.run.strict_korean:
+                raise
+            print("[WARN] OpenAI failed (non-quota) → fallback to FREE translate:", repr(e))
+            title_ko, body_html = build_korean_simple_with_free_translate(cfg.free_tr, recipe, now, debug=cfg.run.debug)
 
     # 본문에 이미지 삽입(업로드 성공하면 WP URL 우선)
     if cfg.run.embed_image_in_body:
         img = media_url or thumb_url
         if img:
-            body_html = f'<p><img src="{img}" alt="{title_ko}" style="max-width:100%;height:auto;"></p>\n' + body_html
+            body_html = f'<p><img src="{img}" alt="{title_ko}" style="max-width:100%;height:auto;border-radius:12px;"></p>\n' + body_html
 
     title = f"{date_str} {slot_label} 레시피 | {title_ko}"
 
