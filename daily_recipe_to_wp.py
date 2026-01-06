@@ -1,31 +1,34 @@
 # -*- coding: utf-8 -*-
 """
 daily_recipe_to_wp.py (완전 통합/안정화)
-- 랜덤 레시피 수집(TheMealDB) → 중복 회피 → 한글 블로거톤 변환(OpenAI) → WP 발행/업데이트
-- 썸네일 자동 업로드 + 대표이미지(Featured) 설정 + 본문 내 이미지 삽입 옵션
+- 랜덤 레시피(TheMealDB) 수집 → 한글 블로거톤 변환(OpenAI) → WordPress 발행/업데이트
+- 썸네일(대표이미지) 자동 업로드 + featured_media 지정
 - SQLite 발행 이력 저장 + 스키마 자동 마이그레이션(컬럼 누락 자동 추가)
+- DB가 날아가도: WP slug로 기존 글을 찾아서 "업데이트" (중복 생성 방지)
 
 필수 env (GitHub Secrets):
   - WP_BASE_URL
   - WP_USER
   - WP_APP_PASS
+  - OPENAI_API_KEY  (한글 블로거톤용)
 
 선택 env:
   - WP_STATUS=publish (기본 publish)
   - WP_CATEGORY_IDS="7" (기본 7)
   - WP_TAG_IDS="1,2,3" (선택)
   - SQLITE_PATH=data/daily_recipe.sqlite3 (기본)
+
+  - RUN_SLOT=day/am/pm (기본 day)
+  - DRY_RUN=1 (발행 안함)
+  - DEBUG=1 (상세 로그)
+
+  - OPENAI_MODEL=gpt-5.2 (기본 gpt-5.2)
+  - STRICT_KOREAN=1 (기본 1)  # 한글 출력이 아니면 실패 처리
+  - FORCE_NEW=0 (기본 0)      # 이미 오늘 글이 있으면 같은 recipe_id 유지(있으면) / 1이면 새 레시피로 교체
   - AVOID_REPEAT_DAYS=90 (기본 90)
   - MAX_TRIES=20 (기본 20)
-  - RUN_SLOT=am/pm/day (기본 day)
-  - DRY_RUN=1 (발행 안함, 출력만)
-  - DEBUG=1 (상세로그)
 
-한글/블로거톤(추천):
-  - KOREANIZE=1 (기본 1)
-  - BLOG_TONE=1 (기본 1)
-  - OPENAI_API_KEY=... (GitHub Secret로 추가)
-  - OPENAI_MODEL=gpt-5-mini (기본 gpt-5-mini)
+참고: OpenAI SDK 사용( pip install openai ) :contentReference[oaicite:1]{index=1}
 """
 
 from __future__ import annotations
@@ -35,15 +38,18 @@ import json
 import os
 import re
 import sqlite3
-import sys
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import requests
+from openai import OpenAI  # 공식 SDK :contentReference[oaicite:2]{index=2}
 
 KST = timezone(timedelta(hours=9))
+
+THEMEALDB_RANDOM = "https://www.themealdb.com/api/json/v1/1/random.php"
+THEMEALDB_LOOKUP = "https://www.themealdb.com/api/json/v1/1/lookup.php?i={id}"
 
 
 # -----------------------------
@@ -97,10 +103,10 @@ class RunConfig:
     run_slot: str = "day"     # day / am / pm
     dry_run: bool = False
     debug: bool = False
+    strict_korean: bool = True
+    force_new: bool = False
     avoid_repeat_days: int = 90
     max_tries: int = 20
-    koreanize: bool = True
-    blog_tone: bool = True
     upload_thumb: bool = True
     set_featured: bool = True
     embed_image_in_body: bool = True
@@ -108,8 +114,8 @@ class RunConfig:
 
 @dataclass
 class OpenAIConfig:
-    api_key: str = ""
-    model: str = "gpt-5-mini"   # 필요 시 env로 변경
+    api_key: str
+    model: str = "gpt-5.2"  # 문서 예시 기준 :contentReference[oaicite:3]{index=3}
 
 
 @dataclass
@@ -139,18 +145,18 @@ def load_cfg() -> AppConfig:
     dry_run = _env_bool("DRY_RUN", False)
     debug = _env_bool("DEBUG", False)
 
+    strict_korean = _env_bool("STRICT_KOREAN", True)
+    force_new = _env_bool("FORCE_NEW", False)
+
     avoid_repeat_days = _env_int("AVOID_REPEAT_DAYS", 90)
     max_tries = _env_int("MAX_TRIES", 20)
-
-    koreanize = _env_bool("KOREANIZE", True)
-    blog_tone = _env_bool("BLOG_TONE", True)
 
     upload_thumb = _env_bool("UPLOAD_THUMB", True)
     set_featured = _env_bool("SET_FEATURED", True)
     embed_image_in_body = _env_bool("EMBED_IMAGE_IN_BODY", True)
 
     openai_key = _env("OPENAI_API_KEY", "")
-    openai_model = _env("OPENAI_MODEL", "gpt-5-mini") or "gpt-5-mini"
+    openai_model = _env("OPENAI_MODEL", "gpt-5.2") or "gpt-5.2"
 
     return AppConfig(
         wp=WordPressConfig(
@@ -165,10 +171,10 @@ def load_cfg() -> AppConfig:
             run_slot=run_slot,
             dry_run=dry_run,
             debug=debug,
+            strict_korean=strict_korean,
+            force_new=force_new,
             avoid_repeat_days=avoid_repeat_days,
             max_tries=max_tries,
-            koreanize=koreanize,
-            blog_tone=blog_tone,
             upload_thumb=upload_thumb,
             set_featured=set_featured,
             embed_image_in_body=embed_image_in_body,
@@ -186,6 +192,8 @@ def validate_cfg(cfg: AppConfig) -> None:
         missing.append("WP_USER")
     if not cfg.wp.app_pass:
         missing.append("WP_APP_PASS")
+    if not cfg.openai.api_key:
+        missing.append("OPENAI_API_KEY")
     if missing:
         raise RuntimeError("필수 설정 누락:\n- " + "\n- ".join(missing))
 
@@ -203,10 +211,11 @@ def print_safe_cfg(cfg: AppConfig) -> None:
     print("[CFG] SQLITE_PATH:", cfg.sqlite_path)
     print("[CFG] RUN_SLOT:", cfg.run.run_slot)
     print("[CFG] DRY_RUN:", cfg.run.dry_run, "| DEBUG:", cfg.run.debug)
+    print("[CFG] STRICT_KOREAN:", cfg.run.strict_korean, "| FORCE_NEW:", cfg.run.force_new)
     print("[CFG] AVOID_REPEAT_DAYS:", cfg.run.avoid_repeat_days, "| MAX_TRIES:", cfg.run.max_tries)
-    print("[CFG] KOREANIZE:", cfg.run.koreanize, "| BLOG_TONE:", cfg.run.blog_tone)
     print("[CFG] UPLOAD_THUMB:", cfg.run.upload_thumb, "| SET_FEATURED:", cfg.run.set_featured, "| EMBED_IMAGE_IN_BODY:", cfg.run.embed_image_in_body)
-    print("[CFG] OPENAI_API_KEY:", "OK" if cfg.openai.api_key else "MISSING", "| OPENAI_MODEL:", cfg.openai.model)
+    print("[CFG] OPENAI_API_KEY:", ok(cfg.openai.api_key))
+    print("[CFG] OPENAI_MODEL:", cfg.openai.model)
 
 
 # -----------------------------
@@ -226,7 +235,6 @@ CREATE TABLE IF NOT EXISTS daily_posts (
 )
 """
 
-# 예전 DB에 컬럼이 없을 때(너가 겪은 media_id 오류) 자동으로 추가
 REQUIRED_COLUMNS: Dict[str, str] = {
     "date_key": "TEXT",
     "slot": "TEXT",
@@ -247,7 +255,6 @@ def init_db(path: str, debug: bool = False) -> None:
     cur.execute(TABLE_SQL)
     con.commit()
 
-    # migration: missing columns → ALTER TABLE ADD COLUMN
     cur.execute("PRAGMA table_info(daily_posts)")
     cols = {row[1] for row in cur.fetchall()}  # name at index 1
 
@@ -338,6 +345,21 @@ def wp_auth_header(user: str, app_pass: str) -> Dict[str, str]:
     return {"Authorization": f"Basic {token}", "User-Agent": "daily-recipe-bot/1.0"}
 
 
+def wp_find_post_by_slug(cfg: WordPressConfig, slug: str) -> Optional[int]:
+    # slug로 기존 글을 찾아서 "중복 생성"을 막고 업데이트하도록
+    url = cfg.base_url.rstrip("/") + f"/wp-json/wp/v2/posts?slug={slug}&per_page=1&context=edit"
+    r = requests.get(url, headers=wp_auth_header(cfg.user, cfg.app_pass), timeout=20)
+    if r.status_code != 200:
+        return None
+    arr = r.json()
+    if isinstance(arr, list) and arr:
+        try:
+            return int(arr[0].get("id"))
+        except Exception:
+            return None
+    return None
+
+
 def wp_create_post(cfg: WordPressConfig, title: str, slug: str, html: str, featured_media: Optional[int]) -> Tuple[int, str]:
     url = cfg.base_url.rstrip("/") + "/wp-json/wp/v2/posts"
     headers = {**wp_auth_header(cfg.user, cfg.app_pass), "Content-Type": "application/json"}
@@ -377,21 +399,16 @@ def wp_update_post(cfg: WordPressConfig, post_id: int, title: str, html: str, fe
 
 
 def wp_upload_media(cfg: WordPressConfig, image_url: str, filename_hint: str = "recipe.jpg") -> Tuple[int, str]:
-    """
-    WP 미디어 업로드:
-    - WP가 보안 플러그인/설정에 따라 REST 미디어 업로드를 막을 수 있음.
-    """
     media_endpoint = cfg.base_url.rstrip("/") + "/wp-json/wp/v2/media"
     headers = wp_auth_header(cfg.user, cfg.app_pass).copy()
 
-    # 이미지 다운로드
     r = requests.get(image_url, timeout=30)
     if r.status_code != 200 or not r.content:
         raise RuntimeError(f"Image download failed: {r.status_code} url={image_url}")
 
     content = r.content
-    ctype = r.headers.get("Content-Type", "").split(";")[0].strip().lower() or "image/jpeg"
-    # 파일명 정리
+    ctype = (r.headers.get("Content-Type") or "image/jpeg").split(";")[0].strip().lower()
+
     safe_name = re.sub(r"[^a-zA-Z0-9._-]+", "-", filename_hint).strip("-") or "recipe.jpg"
     if "." not in safe_name:
         safe_name += ".jpg"
@@ -410,9 +427,6 @@ def wp_upload_media(cfg: WordPressConfig, image_url: str, filename_hint: str = "
 # -----------------------------
 # Recipe fetch (TheMealDB)
 # -----------------------------
-THEMEALDB_RANDOM = "https://www.themealdb.com/api/json/v1/1/random.php"
-
-
 def fetch_random_recipe() -> Dict[str, Any]:
     r = requests.get(THEMEALDB_RANDOM, timeout=25)
     if r.status_code != 200:
@@ -421,8 +435,22 @@ def fetch_random_recipe() -> Dict[str, Any]:
     meals = j.get("meals") or []
     if not meals:
         raise RuntimeError("Recipe API returned empty meals")
-    m = meals[0]
+    return _normalize_meal(meals[0])
 
+
+def fetch_recipe_by_id(recipe_id: str) -> Dict[str, Any]:
+    url = THEMEALDB_LOOKUP.format(id=recipe_id)
+    r = requests.get(url, timeout=25)
+    if r.status_code != 200:
+        raise RuntimeError(f"Recipe lookup failed: {r.status_code}")
+    j = r.json()
+    meals = j.get("meals") or []
+    if not meals:
+        raise RuntimeError("Recipe lookup returned empty meals")
+    return _normalize_meal(meals[0])
+
+
+def _normalize_meal(m: Dict[str, Any]) -> Dict[str, Any]:
     recipe_id = str(m.get("idMeal") or "").strip()
     title = str(m.get("strMeal") or "").strip()
     category = str(m.get("strCategory") or "").strip()
@@ -430,7 +458,6 @@ def fetch_random_recipe() -> Dict[str, Any]:
     instructions = str(m.get("strInstructions") or "").strip()
     thumb = str(m.get("strMealThumb") or "").strip()
 
-    # ingredients: strIngredient1..20 + strMeasure1..20
     ingredients: List[Dict[str, str]] = []
     for i in range(1, 21):
         ing = str(m.get(f"strIngredient{i}") or "").strip()
@@ -455,9 +482,7 @@ def split_steps(instructions: str) -> List[str]:
     t = (instructions or "").strip()
     if not t:
         return []
-    # 문단/줄 기준 분리
     parts = [p.strip() for p in re.split(r"\r?\n+", t) if p.strip()]
-    # 너무 길면 문장 분리 보조
     if len(parts) <= 2 and len(t) > 400:
         parts = [p.strip() for p in re.split(r"(?<=[.!?])\s+", t) if p.strip()]
     return parts
@@ -466,103 +491,73 @@ def split_steps(instructions: str) -> List[str]:
 # -----------------------------
 # OpenAI: Korean blogger tone generation
 # -----------------------------
-def openai_generate_korean_blog(cfg: OpenAIConfig, recipe: Dict[str, Any], debug: bool = False) -> Tuple[str, str]:
+def generate_korean_blog(openai_cfg: OpenAIConfig, recipe: Dict[str, Any], debug: bool = False) -> Tuple[str, str]:
     """
-    레시피 원문(영문)을 '한글 + 블로거톤'으로 변환.
-    - Responses API 사용: POST https://api.openai.com/v1/responses :contentReference[oaicite:1]{index=1}
+    공식 SDK + Responses API: response.output_text 사용 :contentReference[oaicite:4]{index=4}
     """
-    if not cfg.api_key:
-        raise RuntimeError("OPENAI_API_KEY가 없어 한글 변환을 할 수 없습니다. (KOREANIZE=0으로 끄거나 Key를 추가하세요)")
+    client = OpenAI(api_key=openai_cfg.api_key)
 
-    title_en = recipe.get("title", "")
-    ingredients = recipe.get("ingredients", [])
-    steps = split_steps(recipe.get("instructions", ""))
-
-    # 입력 데이터(환각 방지: 제공된 재료/단계만 쓰라고 강하게 지시)
     payload_recipe = {
-        "title_en": title_en,
+        "title_en": recipe.get("title", ""),
         "category_en": recipe.get("category", ""),
         "area_en": recipe.get("area", ""),
-        "ingredients": ingredients,
-        "steps_en": steps,
+        "ingredients": recipe.get("ingredients", []),
+        "steps_en": split_steps(recipe.get("instructions", "")),
         "source_url": recipe.get("source", ""),
         "youtube": recipe.get("youtube", ""),
     }
 
     instructions = (
-        "You are a Korean food blogger. "
-        "Rewrite the given recipe into natural Korean blog tone. "
-        "Do NOT invent new ingredients or steps. Use ONLY the provided ingredients and steps. "
-        "Return ONLY in this exact format:\n"
-        "[TITLE]\n<one line Korean title>\n[/TITLE]\n"
-        "[BODY_HTML]\n<valid HTML body in Korean>\n[/BODY_HTML]\n"
-        "In BODY_HTML, include sections: 소개, 재료, 만드는 법(번호), 팁(선택), 마무리 한 줄.\n"
-        "Optionally add the English title in parentheses after the Korean title."
+        "너는 한국의 음식 블로거다. 반드시 한국어로만 작성해.\n"
+        "중요: 제공된 ingredients/steps 외의 재료/양/과정을 절대 추가하거나 바꾸지 마.\n"
+        "출력은 '제목 1줄' + 'HTML 본문'으로 구성.\n"
+        "본문 섹션은 아래 순서로:\n"
+        "1) 소개(짧게)\n"
+        "2) 재료(리스트)\n"
+        "3) 만드는 법(번호)\n"
+        "4) 팁(선택)\n"
+        "5) 마무리 한 줄\n"
+        "HTML은 워드프레스에 바로 붙여넣을 수 있게 깨끗하게."
     )
 
-    user_input = (
-        "Here is the recipe JSON.\n"
-        + json.dumps(payload_recipe, ensure_ascii=False, indent=2)
+    user_input = "레시피 JSON:\n" + json.dumps(payload_recipe, ensure_ascii=False, indent=2)
+
+    resp = client.responses.create(
+        model=openai_cfg.model,
+        instructions=instructions,
+        input=user_input,
     )
 
-    url = "https://api.openai.com/v1/responses"
-    headers = {
-        "Content-Type": "application/json",
-        "Authorization": f"Bearer {cfg.api_key}",
-    }
-    body = {
-        "model": cfg.model,
-        "instructions": instructions,
-        "input": user_input,
-        "store": False,
-    }
-
-    r = requests.post(url, headers=headers, json=body, timeout=60)
-    if r.status_code not in (200, 201):
-        raise RuntimeError(f"OpenAI API failed: {r.status_code} body={r.text[:500]}")
-
-    data = r.json()
-
-    # Responses JSON에서 텍스트 추출(필드가 다를 수 있어 방어적으로)
-    text = ""
-    if isinstance(data, dict):
-        if isinstance(data.get("output_text"), str) and data["output_text"].strip():
-            text = data["output_text"]
-        else:
-            out = data.get("output") or []
-            # message content를 훑어서 합치기
-            chunks: List[str] = []
-            for item in out:
-                if not isinstance(item, dict):
-                    continue
-                if item.get("type") == "message":
-                    content = item.get("content") or []
-                    for c in content:
-                        if isinstance(c, dict) and c.get("type") == "output_text":
-                            chunks.append(str(c.get("text") or ""))
-            text = "\n".join(chunks)
-
+    text = (resp.output_text or "").strip()
     if debug:
-        print("[OPENAI] raw length:", len(text))
+        print("[OPENAI] output_text length:", len(text))
 
-    m_title = re.search(r"\[TITLE\]\s*(.*?)\s*\[/TITLE\]", text, re.DOTALL | re.IGNORECASE)
-    m_body = re.search(r"\[BODY_HTML\]\s*(.*?)\s*\[/BODY_HTML\]", text, re.DOTALL | re.IGNORECASE)
+    # 첫 줄 = 제목, 나머지 = HTML 본문(간단 규칙)
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    if len(lines) < 2:
+        raise RuntimeError("OpenAI 응답이 너무 짧습니다(제목/본문 분리 실패).")
 
-    if not m_title or not m_body:
-        raise RuntimeError("OpenAI 출력 파싱 실패(포맷 불일치).")
+    title = lines[0]
+    body = "\n".join(lines[1:]).strip()
 
-    title_ko = m_title.group(1).strip()
-    body_html = m_body.group(1).strip()
-    return title_ko, body_html
+    # 한국어 검증(STRICT_KOREAN일 때)
+    if not re.search(r"[가-힣]", title) or not re.search(r"[가-힣]", body):
+        raise RuntimeError("OpenAI 응답이 한국어가 아닙니다(한글 검증 실패). OPENAI_MODEL/프롬프트/키 권한 확인.")
+
+    # body가 HTML이 아니면 최소 래핑
+    if "<" not in body:
+        body = "<p>" + body.replace("\n", "<br/>") + "</p>"
+
+    return title, body
 
 
 # -----------------------------
-# HTML rendering fallback(영문)
+# HTML rendering fallback (절대권장 X)
 # -----------------------------
-DISCLOSURE = "※ 본 포스팅은 레시피 정보를 바탕으로 자동 생성된 글이며, 일부 번역/표현은 자연스럽게 다듬어질 수 있습니다."
+DISCLOSURE = "※ 본 포스팅은 레시피 정보를 바탕으로 자동 생성된 글입니다."
 
 
-def build_fallback_html(recipe: Dict[str, Any], now: datetime) -> str:
+def build_basic_html(recipe: Dict[str, Any], now: datetime) -> str:
     title = recipe.get("title", "")
     ingredients = recipe.get("ingredients", [])
     steps = split_steps(recipe.get("instructions", ""))
@@ -574,17 +569,13 @@ def build_fallback_html(recipe: Dict[str, Any], now: datetime) -> str:
 
     step_html = "<ol>" + "".join(f"<li>{s}</li>" for s in steps) + "</ol>"
 
-    thumb = recipe.get("thumb", "")
-    thumb_html = f'<p><img src="{thumb}" alt="{title}" style="max-width:100%;height:auto;"></p>' if thumb else ""
-
     return f"""
     <p style="padding:10px;border-left:4px solid #111;background:#f7f7f7;">{DISCLOSURE}</p>
     <p>기준시각: <b>{now.astimezone(KST).strftime("%Y-%m-%d %H:%M")}</b></p>
-    {thumb_html}
     <h2>{title}</h2>
-    <h3>Ingredients</h3>
+    <h3>재료</h3>
     {ing_html}
-    <h3>Steps</h3>
+    <h3>만드는 법</h3>
     {step_html}
     """
 
@@ -592,21 +583,12 @@ def build_fallback_html(recipe: Dict[str, Any], now: datetime) -> str:
 # -----------------------------
 # Main flow
 # -----------------------------
-def run(cfg: AppConfig) -> None:
-    now = datetime.now(tz=KST)
-    date_str = now.strftime("%Y-%m-%d")
-    slot = cfg.run.run_slot  # day/am/pm
-    slot_label = "오전" if slot == "am" else ("오후" if slot == "pm" else "오늘")
-
-    # 슬롯별로 글을 분리하고 싶으면 RUN_SLOT=am/pm 사용
-    date_key = f"{date_str}_{slot}" if slot in ("am", "pm") else date_str
-    slug = f"daily-recipe-{date_str}-{slot}" if slot in ("am", "pm") else f"daily-recipe-{date_str}"
-
-    init_db(cfg.sqlite_path, debug=cfg.run.debug)
+def pick_recipe(cfg: AppConfig, existing: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    # 오늘 글이 있고, recipe_id도 저장돼있고, FORCE_NEW=0이면 같은 레시피를 유지
+    if existing and existing.get("recipe_id") and not cfg.run.force_new:
+        return fetch_recipe_by_id(str(existing["recipe_id"]))
 
     recent_ids = set(get_recent_recipe_ids(cfg.sqlite_path, cfg.run.avoid_repeat_days))
-    recipe: Optional[Dict[str, Any]] = None
-
     for _ in range(max(1, cfg.run.max_tries)):
         cand = fetch_random_recipe()
         rid = (cand.get("id") or "").strip()
@@ -614,12 +596,32 @@ def run(cfg: AppConfig) -> None:
             continue
         if rid in recent_ids:
             continue
-        recipe = cand
-        break
+        return cand
 
-    if recipe is None:
-        raise RuntimeError("레시피를 가져오지 못했습니다(중복 회피/시도 횟수 초과). AVOID_REPEAT_DAYS 또는 MAX_TRIES 조정 필요.")
+    raise RuntimeError("레시피를 가져오지 못했습니다(중복 회피/시도 횟수 초과). AVOID_REPEAT_DAYS 또는 MAX_TRIES 조정 필요.")
 
+
+def run(cfg: AppConfig) -> None:
+    now = datetime.now(tz=KST)
+    date_str = now.strftime("%Y-%m-%d")
+    slot = cfg.run.run_slot
+    slot_label = "오전" if slot == "am" else ("오후" if slot == "pm" else "오늘")
+
+    date_key = f"{date_str}_{slot}" if slot in ("am", "pm") else date_str
+    slug = f"daily-recipe-{date_str}-{slot}" if slot in ("am", "pm") else f"daily-recipe-{date_str}"
+
+    init_db(cfg.sqlite_path, debug=cfg.run.debug)
+
+    existing = get_today_post(cfg.sqlite_path, date_key)
+
+    # DB에 wp_post_id가 없더라도 slug로 WP에서 찾아서 업데이트 가능하게
+    wp_post_id: Optional[int] = None
+    if existing and existing.get("wp_post_id"):
+        wp_post_id = int(existing["wp_post_id"])
+    else:
+        wp_post_id = wp_find_post_by_slug(cfg.wp, slug)
+
+    recipe = pick_recipe(cfg, existing)
     recipe_id = recipe.get("id", "")
     recipe_title_en = recipe.get("title", "") or "Daily Recipe"
 
@@ -627,6 +629,7 @@ def run(cfg: AppConfig) -> None:
     media_id: Optional[int] = None
     media_url: str = ""
     thumb_url = (recipe.get("thumb") or "").strip()
+
     if cfg.run.upload_thumb and thumb_url:
         try:
             media_id, media_url = wp_upload_media(cfg.wp, thumb_url, filename_hint=f"recipe-{date_str}-{slot}.jpg")
@@ -636,59 +639,41 @@ def run(cfg: AppConfig) -> None:
 
     featured = media_id if (cfg.run.set_featured and media_id) else None
 
-    # 본문/제목 생성 (한글 블로거톤)
-    title = ""
-    html = ""
-    if cfg.run.koreanize and cfg.run.blog_tone:
-        try:
-            title_ko, body_ko = openai_generate_korean_blog(cfg.openai, recipe, debug=cfg.run.debug)
-            title = title_ko
-            html = body_ko
-        except Exception as e:
-            if cfg.run.debug:
-                print("[WARN] OpenAI koreanize failed. fallback to EN:", repr(e))
-            title = f"{date_str} 오늘의 레시피 ({slot_label}) - {recipe_title_en}"
-            html = build_fallback_html(recipe, now)
-    else:
-        title = f"{date_str} 오늘의 레시피 ({slot_label}) - {recipe_title_en}"
-        html = build_fallback_html(recipe, now)
+    # ✅ 한글 블로거톤 생성 (실패하면 STRICT_KOREAN=1일 때 바로 실패)
+    title_ko, body_html = generate_korean_blog(cfg.openai, recipe, debug=cfg.run.debug)
 
-    # 본문에 업로드한 이미지 삽입(가능하면 WP에 올린 URL 사용)
+    # 본문에 이미지 삽입(업로드 성공하면 WP URL 우선)
     if cfg.run.embed_image_in_body:
         img = media_url or thumb_url
         if img:
-            html = f'<p><img src="{img}" alt="{title}" style="max-width:100%;height:auto;"></p>\n' + html
+            body_html = f'<p><img src="{img}" alt="{title_ko}" style="max-width:100%;height:auto;"></p>\n' + body_html
+
+    title = f"{date_str} {slot_label} 레시피 | {title_ko}"
 
     if cfg.run.dry_run:
-        print("[DRY_RUN] 발행 생략. 미리보기 ↓\n")
+        print("[DRY_RUN] 발행 생략. 미리보기 ↓")
         print("TITLE:", title)
         print("SLUG:", slug)
-        print(html[:2000] + ("\n...(truncated)" if len(html) > 2000 else ""))
+        print(body_html[:2000] + ("\n...(truncated)" if len(body_html) > 2000 else ""))
         return
 
-    existing = get_today_post(cfg.sqlite_path, date_key)
-    if existing and existing.get("wp_post_id"):
-        post_id = int(existing["wp_post_id"])
-        wp_post_id, wp_link = wp_update_post(cfg.wp, post_id, title, html, featured_media=featured)
-        save_post_meta(cfg.sqlite_path, date_key, slot, recipe_id, recipe_title_en, wp_post_id, wp_link, media_id, media_url)
-        print("OK(updated):", wp_post_id, wp_link)
+    # 발행/업데이트
+    if wp_post_id:
+        new_id, wp_link = wp_update_post(cfg.wp, wp_post_id, title, body_html, featured_media=featured)
+        save_post_meta(cfg.sqlite_path, date_key, slot, recipe_id, recipe_title_en, new_id, wp_link, media_id, media_url)
+        print("OK(updated):", new_id, wp_link)
     else:
-        wp_post_id, wp_link = wp_create_post(cfg.wp, title, slug, html, featured_media=featured)
-        save_post_meta(cfg.sqlite_path, date_key, slot, recipe_id, recipe_title_en, wp_post_id, wp_link, media_id, media_url)
-        print("OK(created):", wp_post_id, wp_link)
+        new_id, wp_link = wp_create_post(cfg.wp, title, slug, body_html, featured_media=featured)
+        save_post_meta(cfg.sqlite_path, date_key, slot, recipe_id, recipe_title_en, new_id, wp_link, media_id, media_url)
+        print("OK(created):", new_id, wp_link)
 
 
 def main():
     cfg = load_cfg()
-    validate_cfg(cfg)
     print_safe_cfg(cfg)
+    validate_cfg(cfg)
     run(cfg)
 
 
 if __name__ == "__main__":
-    try:
-        main()
-    except Exception:
-        import traceback
-        traceback.print_exc()
-        raise
+    main()
