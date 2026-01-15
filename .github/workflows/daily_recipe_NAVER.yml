@@ -1,16 +1,14 @@
-name: Daily Recipe to WordPress (NaverStyle)
+name: Daily Recipe to WordPress (Naver Style)
 
 on:
   workflow_dispatch:
   schedule:
-    # KST 09:10 (UTC 00:10)
-    - cron: "10 0 * * *"
-    # KST 18:10 (UTC 09:10)
-    - cron: "10 9 * * *"
+    - cron: "0 22 * * *" # 07:00 KST 매일
 
 jobs:
-  run:
+  post:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
 
     steps:
       - name: Checkout
@@ -23,73 +21,37 @@ jobs:
 
       - name: Install deps
         run: |
-          python -m pip install --upgrade pip
-          python -m pip install requests openai
+          python -m pip install -U pip
+          pip install openai requests
 
-      - name: Debug - list files
+      - name: List files (debug)
         run: |
           pwd
           ls -al
-          test -f daily_recipe_to_wp_naverstyle.py || (echo "ERROR: script not found at repo root" && exit 2)
+          find . -maxdepth 4 -type f -name "daily_recipe_to_wp_naverstyle.py" -print
 
-      - name: Run bot (AM slot)
-        if: github.event_name == 'schedule' && github.event.schedule == '10 0 * * *'
+      - name: Run bot
         env:
           WP_BASE_URL: ${{ secrets.WP_BASE_URL }}
           WP_USER: ${{ secrets.WP_USER }}
           WP_APP_PASS: ${{ secrets.WP_APP_PASS }}
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-          WP_STATUS: "publish"
-          WP_CATEGORY_IDS: "7"
-          SQLITE_PATH: "data/daily_recipe.sqlite3"
-          RUN_SLOT: "am"
-          DRY_RUN: "0"
-          DEBUG: "0"
-          NAVER_RANDOM_LEVEL: "2"
-          NAVER_EXPERIENCE_LEVEL: "2"
-          NAVER_TEXT_TRIES: "3"
-          # NAVER_KEYWORDS: "김치찌개,된장찌개,집밥"
-          # OPENAI_MODEL: "gpt-4.1-mini"
-        run: |
-          mkdir -p data
-          python daily_recipe_to_wp_naverstyle.py
 
-      - name: Run bot (PM slot)
-        if: github.event_name == 'schedule' && github.event.schedule == '10 9 * * *'
-        env:
-          WP_BASE_URL: ${{ secrets.WP_BASE_URL }}
-          WP_USER: ${{ secrets.WP_USER }}
-          WP_APP_PASS: ${{ secrets.WP_APP_PASS }}
-          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-          WP_STATUS: "publish"
-          WP_CATEGORY_IDS: "7"
-          SQLITE_PATH: "data/daily_recipe.sqlite3"
-          RUN_SLOT: "pm"
-          DRY_RUN: "0"
-          DEBUG: "0"
-          NAVER_RANDOM_LEVEL: "2"
-          NAVER_EXPERIENCE_LEVEL: "2"
-          NAVER_TEXT_TRIES: "3"
-        run: |
-          mkdir -p data
-          python daily_recipe_to_wp_naverstyle.py
+          WP_STATUS: ${{ vars.WP_STATUS }}
+          WP_CATEGORY_IDS: ${{ vars.WP_CATEGORY_IDS }}
+          WP_TAG_IDS: ${{ vars.WP_TAG_IDS }}
 
-      - name: Run bot (Manual)
-        if: github.event_name == 'workflow_dispatch'
-        env:
-          WP_BASE_URL: ${{ secrets.WP_BASE_URL }}
-          WP_USER: ${{ secrets.WP_USER }}
-          WP_APP_PASS: ${{ secrets.WP_APP_PASS }}
-          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-          WP_STATUS: "publish"
-          WP_CATEGORY_IDS: "7"
           SQLITE_PATH: "data/daily_recipe.sqlite3"
           RUN_SLOT: "day"
+          FORCE_NEW: "0"
           DRY_RUN: "0"
-          DEBUG: "0"
-          NAVER_RANDOM_LEVEL: "2"
-          NAVER_EXPERIENCE_LEVEL: "2"
-          NAVER_TEXT_TRIES: "3"
+          DEBUG: "1"
+
+          NAVER_KEYWORDS: ${{ vars.NAVER_KEYWORDS }}
+          NAVER_TITLE_KEYWORD: ${{ vars.NAVER_TITLE_KEYWORD }}
+          OPENAI_MODEL: ${{ vars.OPENAI_MODEL }}
+
+          FREE_TRANSLATE_URLS: ${{ vars.FREE_TRANSLATE_URLS }}
         run: |
           mkdir -p data
           python daily_recipe_to_wp_naverstyle.py
