@@ -1,39 +1,34 @@
 # -*- coding: utf-8 -*-
 """
-daily_recipe_to_wp_naverstyle.py (통합 완성본: 홈피드 가독성 강화 + 재료목록 강제 + 제목 템플릿 랜덤 + 번역 보정)
-- TheMealDB 랜덤 레시피 수집
-- OpenAI로 한국어 '사람 글' 톤(홈피드형 여백/호흡/존댓말 수다) 생성
-- 재료 목록/조리 단계는 파이썬이 강제로 HTML 삽입(누락 방지)
-- ✅ 제목/재료에 남는 영어를 LibreTranslate로 자동 번역 보정
-- WordPress 발행/업데이트 + 썸네일 업로드/대표이미지 설정
-- SQLite 발행 이력 + 스키마 자동 마이그레이션
-- OpenAI 크레딧 소진/실패 시: 무료번역(LibreTranslate) 폴백
+daily_recipe_to_wp_naverstyle.py (통합 완성본: 네이버 홈피드형 + 가독성 + 재료목록 + 번역 누락 최소화)
 
-필수 env (GitHub Secrets):
-  - WP_BASE_URL
-  - WP_USER
-  - WP_APP_PASS
-  - OPENAI_API_KEY
+핵심 개선
+- OpenAI로 레시피(제목/재료/계량/단계) 먼저 한국어 번역(JSON)
+- 본문은 한국어만 쓰도록 강제 + 영어 잔존 검사 후 재작성(필요시 1회)
+- LibreTranslate 폴백은 공개 서버가 흔들리므로 여러 엔드포인트 순환 + bulk + retry
 
-권장 env:
-  - WP_STATUS=publish
-  - WP_CATEGORY_IDS="7"
-  - WP_TAG_IDS="1,2,3"
-  - SQLITE_PATH=data/daily_recipe.sqlite3
-  - RUN_SLOT=day|am|pm
-  - FORCE_NEW=0|1
-  - DRY_RUN=0|1
-  - DEBUG=0|1
-  - OPENAI_MODEL=... (기본 gpt-4.1-mini)
-  - NAVER_TITLE_KEYWORD="김치찌개"  (없으면 NAVER_KEYWORDS 첫 키워드 사용, 그것도 없으면 레시피명 기반)
-  - NAVER_TITLE_MODE=random|benefit|threat|curiosity|compare (기본 random)
-  - NAVER_KEYWORDS="키워드1,키워드2" (선택)
+필수 env (GitHub Secrets)
+- WP_BASE_URL
+- WP_USER
+- WP_APP_PASS
+- OPENAI_API_KEY
 
-LibreTranslate(폴백) env:
-  - FREE_TRANSLATE_URL=https://libretranslate.de/translate
-  - FREE_TRANSLATE_API_KEY=
-  - FREE_TRANSLATE_SOURCE=en
-  - FREE_TRANSLATE_TARGET=ko
+권장 env
+- WP_STATUS=publish
+- WP_CATEGORY_IDS="7"
+- WP_TAG_IDS="1,2,3"
+- SQLITE_PATH=data/daily_recipe.sqlite3
+- RUN_SLOT=day|am|pm
+- FORCE_NEW=0|1
+- DRY_RUN=0|1
+- DEBUG=0|1
+- OPENAI_MODEL=gpt-4.1-mini (또는 너 계정에서 되는 모델)
+- NAVER_KEYWORDS="키워드1,키워드2"
+- NAVER_TITLE_KEYWORD=""  (비우면 키워드/레시피명으로 자동)
+
+무료 번역 폴백
+- FREE_TRANSLATE_URLS="https://libretranslate.de/translate,https://translate.astian.org/translate"
+  (없으면 기본 리스트 사용)
 """
 
 from __future__ import annotations
@@ -53,7 +48,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import requests
 
-import openai  # 예외 타입
+import openai
 from openai import OpenAI
 
 KST = timezone(timedelta(hours=9))
@@ -110,7 +105,7 @@ class WordPressConfig:
 
 @dataclass
 class RunConfig:
-    run_slot: str = "day"     # day / am / pm
+    run_slot: str = "day"  # day / am / pm
     dry_run: bool = False
     debug: bool = False
     force_new: bool = False
@@ -126,7 +121,6 @@ class RunConfig:
 class NaverStyleConfig:
     keywords_csv: str = ""
     title_keyword: str = ""
-    title_mode: str = "random"  # random|benefit|threat|curiosity|compare
 
 
 @dataclass
@@ -137,7 +131,7 @@ class OpenAIConfig:
 
 @dataclass
 class FreeTranslateConfig:
-    url: str = "https://libretranslate.de/translate"
+    urls: List[str] = field(default_factory=list)
     api_key: str = ""
     source: str = "en"
     target: str = "ko"
@@ -184,16 +178,21 @@ def load_cfg() -> AppConfig:
     openai_key = _env("OPENAI_API_KEY", "")
     openai_model = _env("OPENAI_MODEL", "gpt-4.1-mini") or "gpt-4.1-mini"
 
-    free_url = _env("FREE_TRANSLATE_URL", "https://libretranslate.de/translate")
+    # LibreTranslate endpoints (rotate)
+    urls_csv = _env("FREE_TRANSLATE_URLS", "")
+    urls = [u.strip() for u in urls_csv.split(",") if u.strip()]
+    if not urls:
+        urls = [
+            "https://libretranslate.de/translate",
+            "https://translate.astian.org/translate",
+        ]
+
     free_api_key = _env("FREE_TRANSLATE_API_KEY", "")
     free_src = _env("FREE_TRANSLATE_SOURCE", "en")
     free_tgt = _env("FREE_TRANSLATE_TARGET", "ko")
 
     naver_keywords = _env("NAVER_KEYWORDS", "")
     title_keyword = _env("NAVER_TITLE_KEYWORD", "")
-    title_mode = (_env("NAVER_TITLE_MODE", "random") or "random").strip().lower()
-    if title_mode not in ("random", "benefit", "threat", "curiosity", "compare"):
-        title_mode = "random"
 
     return AppConfig(
         wp=WordPressConfig(
@@ -208,11 +207,10 @@ def load_cfg() -> AppConfig:
         naver=NaverStyleConfig(
             keywords_csv=naver_keywords,
             title_keyword=title_keyword,
-            title_mode=title_mode,
         ),
         sqlite_path=sqlite_path,
         openai=OpenAIConfig(api_key=openai_key, model=openai_model),
-        free_tr=FreeTranslateConfig(url=free_url, api_key=free_api_key, source=free_src, target=free_tgt),
+        free_tr=FreeTranslateConfig(urls=urls, api_key=free_api_key, source=free_src, target=free_tgt),
     )
 
 
@@ -245,13 +243,12 @@ def print_safe_cfg(cfg: AppConfig) -> None:
     print("[CFG] DRY_RUN:", int(cfg.run.dry_run), "| DEBUG:", int(cfg.run.debug))
     print("[CFG] OPENAI_MODEL:", cfg.openai.model, "| OPENAI_KEY:", ok(cfg.openai.api_key))
     print("[CFG] NAVER_TITLE_KEYWORD:", cfg.naver.title_keyword or "(auto)")
-    print("[CFG] NAVER_TITLE_MODE:", cfg.naver.title_mode)
     print("[CFG] NAVER_KEYWORDS:", cfg.naver.keywords_csv or "(empty)")
-    print("[CFG] FREE_TRANSLATE_URL:", cfg.free_tr.url)
+    print("[CFG] FREE_TRANSLATE_URLS:", ", ".join(cfg.free_tr.urls))
 
 
 # -----------------------------
-# SQLite (history) + migration
+# SQLite
 # -----------------------------
 TABLE_SQL = """
 CREATE TABLE IF NOT EXISTS daily_posts (
@@ -267,35 +264,11 @@ CREATE TABLE IF NOT EXISTS daily_posts (
 )
 """
 
-REQUIRED_COLUMNS: Dict[str, str] = {
-    "date_key": "TEXT",
-    "slot": "TEXT",
-    "recipe_id": "TEXT",
-    "recipe_title": "TEXT",
-    "wp_post_id": "INTEGER",
-    "wp_link": "TEXT",
-    "media_id": "INTEGER",
-    "media_url": "TEXT",
-    "created_at": "TEXT",
-}
-
-
 def init_db(path: str, debug: bool = False) -> None:
     Path(path).parent.mkdir(parents=True, exist_ok=True)
     con = sqlite3.connect(path)
     cur = con.cursor()
     cur.execute(TABLE_SQL)
-    con.commit()
-
-    cur.execute("PRAGMA table_info(daily_posts)")
-    cols = {row[1] for row in cur.fetchall()}
-
-    for col, typ in REQUIRED_COLUMNS.items():
-        if col not in cols:
-            if debug:
-                print(f"[DB] add column: {col} {typ}")
-            cur.execute(f"ALTER TABLE daily_posts ADD COLUMN {col} {typ}")
-
     con.commit()
     con.close()
 
@@ -456,7 +429,7 @@ def wp_upload_media(cfg: WordPressConfig, image_url: str, filename_hint: str = "
 
 
 # -----------------------------
-# Recipe fetch (TheMealDB)
+# Recipe fetch
 # -----------------------------
 def fetch_random_recipe() -> Dict[str, Any]:
     r = requests.get(THEMEALDB_RANDOM, timeout=25)
@@ -520,90 +493,7 @@ def split_steps(instructions: str) -> List[str]:
 
 
 # -----------------------------
-# OpenAI helpers + quota detection
-# -----------------------------
-def _is_insufficient_quota_error(e: Exception) -> bool:
-    s = (repr(e) or "") + " " + (str(e) or "")
-    s = s.lower()
-    return ("insufficient_quota" in s) or ("exceeded your current quota" in s) or ("check your plan and billing" in s)
-
-
-def _openai_call_with_retry(
-    client: OpenAI,
-    model: str,
-    instructions: str,
-    input_text: str,
-    max_retries: int,
-    debug: bool = False,
-):
-    for attempt in range(max_retries + 1):
-        try:
-            return client.responses.create(model=model, instructions=instructions, input=input_text)
-        except openai.RateLimitError as e:
-            if _is_insufficient_quota_error(e):
-                raise
-            if attempt == max_retries:
-                raise
-            time.sleep((2 ** attempt) + random.random())
-        except openai.APIError:
-            if attempt == max_retries:
-                raise
-            time.sleep((2 ** attempt) + random.random())
-        except Exception:
-            if attempt == max_retries:
-                raise
-            time.sleep((2 ** attempt) + random.random())
-
-
-# -----------------------------
-# Free translate (LibreTranslate)
-# -----------------------------
-def free_translate_text(cfg: FreeTranslateConfig, text: str, debug: bool = False) -> str:
-    text = (text or "").strip()
-    if not text:
-        return ""
-
-    payload = {"q": text, "source": cfg.source, "target": cfg.target, "format": "text"}
-    if cfg.api_key:
-        payload["api_key"] = cfg.api_key
-
-    try:
-        r = requests.post(cfg.url, json=payload, timeout=20)
-        if r.status_code != 200:
-            if debug:
-                print("[FREE_TR] non-200:", r.status_code, r.text[:200])
-            return text
-        j = r.json()
-        out = (j.get("translatedText") or "").strip()
-        return out or text
-    except Exception as e:
-        if debug:
-            print("[FREE_TR] failed:", repr(e))
-        return text
-
-
-def free_translate_bulk(cfg: FreeTranslateConfig, texts: List[str], debug: bool = False) -> List[str]:
-    """
-    여러 문장을 한 번에 번역  줄수 제한/속도 고려
-    실패하거나 분리가 깨지면 개별 번역으로 폴백
-    """
-    texts = [t.strip() for t in (texts or [])]
-    if not texts:
-        return []
-    token = "|||__SPLIT__|||"
-    joined = f"\n{token}\n".join(texts)
-    out = free_translate_text(cfg, joined, debug=debug)
-    parts = [p.strip() for p in (out or "").split(token)]
-    if len(parts) != len(texts):
-        # 폴백: 개별
-        if debug:
-            print("[FREE_TR] bulk split mismatch → fallback individual")
-        return [free_translate_text(cfg, t, debug=debug) for t in texts]
-    return parts
-
-
-# -----------------------------
-# Translation heuristics
+# English detection
 # -----------------------------
 _RE_HAS_ASCII = re.compile(r"[A-Za-z]")
 _RE_HAS_KO = re.compile(r"[가-힣]")
@@ -614,266 +504,355 @@ def looks_english(s: str) -> bool:
         return False
     return bool(_RE_HAS_ASCII.search(s)) and not bool(_RE_HAS_KO.search(s))
 
-
-def ensure_korean_phrase(cfg: AppConfig, s: str) -> str:
-    s = (s or "").strip()
-    if not s:
-        return s
-    # 영어가 섞였으면 번역 한 번 더 시도
-    if looks_english(s):
-        tr = free_translate_text(cfg.free_tr, s, debug=cfg.run.debug).strip()
-        return tr or s
-    return s
+def html_has_too_much_english(html: str) -> bool:
+    txt = re.sub(r"<[^>]+>", " ", html or "")
+    txt = re.sub(r"\s+", " ", txt).strip()
+    if not txt:
+        return False
+    english_chars = sum(1 for ch in txt if ("A" <= ch <= "Z") or ("a" <= ch <= "z"))
+    # 너무 빡세게 잡으면 한두 단어도 걸리니 0.7% 이상이면 재작성
+    return (english_chars / max(1, len(txt))) > 0.007
 
 
 # -----------------------------
-# Title templates (random)
+# OpenAI helpers
 # -----------------------------
-def _first_keyword_from_csv(csv: str) -> str:
+def _is_insufficient_quota_error(e: Exception) -> bool:
+    s = (repr(e) or "") + " " + (str(e) or "")
+    s = s.lower()
+    return ("insufficient_quota" in s) or ("exceeded your current quota" in s) or ("check your plan and billing" in s)
+
+def _openai_call_with_retry(client: OpenAI, model: str, instructions: str, input_text: str, max_retries: int, debug: bool=False):
+    for attempt in range(max_retries + 1):
+        try:
+            return client.responses.create(model=model, instructions=instructions, input=input_text)
+        except openai.RateLimitError as e:
+            if _is_insufficient_quota_error(e):
+                raise
+            if attempt == max_retries:
+                raise
+            time.sleep((2 ** attempt) + random.random())
+        except openai.APIError as e:
+            if attempt == max_retries:
+                raise
+            if debug:
+                print("[OPENAI] APIError retry:", repr(e))
+            time.sleep((2 ** attempt) + random.random())
+        except Exception as e:
+            if attempt == max_retries:
+                raise
+            if debug:
+                print("[OPENAI] Unknown retry:", repr(e))
+            time.sleep((2 ** attempt) + random.random())
+
+
+# -----------------------------
+# LibreTranslate (rotate + retry + bulk)
+# -----------------------------
+def _free_translate_request(url: str, api_key: str, source: str, target: str, text: str, debug: bool=False) -> Optional[str]:
+    payload = {"q": text, "source": source, "target": target, "format": "text"}
+    if api_key:
+        payload["api_key"] = api_key
+    try:
+        r = requests.post(url, json=payload, timeout=25)
+        if r.status_code != 200:
+            if debug:
+                print("[FREE_TR] non-200:", url, r.status_code, r.text[:120])
+            return None
+        j = r.json()
+        out = (j.get("translatedText") or "").strip()
+        return out or None
+    except Exception as e:
+        if debug:
+            print("[FREE_TR] failed:", url, repr(e))
+        return None
+
+def free_translate_text(cfg: FreeTranslateConfig, text: str, debug: bool=False) -> str:
+    text = (text or "").strip()
+    if not text:
+        return ""
+    # 여러 엔드포인트를 순환 시도
+    for u in cfg.urls:
+        out = _free_translate_request(u, cfg.api_key, cfg.source, cfg.target, text, debug=debug)
+        if out and out.strip() and out.strip() != text.strip():
+            return out.strip()
+        # 번역이 원문 그대로 오면 다음 서버로
+    return text
+
+def free_translate_bulk(cfg: FreeTranslateConfig, texts: List[str], debug: bool=False) -> List[str]:
+    texts = [t.strip() for t in (texts or []) if t and t.strip()]
+    if not texts:
+        return []
+    token = "|||__SPLIT__|||"
+    joined = f"\n{token}\n".join(texts)
+
+    # bulk는 용량이 커서 실패가 잦으니 2회만 재시도
+    for _ in range(2):
+        out = free_translate_text(cfg, joined, debug=debug)
+        parts = [p.strip() for p in (out or "").split(token)]
+        if len(parts) == len(texts):
+            return parts
+        time.sleep(0.6 + random.random())
+
+    # 폴백: 개별
+    if debug:
+        print("[FREE_TR] bulk mismatch → individual fallback")
+    return [free_translate_text(cfg, t, debug=debug) for t in texts]
+
+
+# -----------------------------
+# Recipe -> Korean (strong)
+# -----------------------------
+def translate_recipe_to_korean(cfg: AppConfig, recipe: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    반환 예시:
+    {
+      "title_ko": "...",
+      "ingredients": [{"name_en": "...", "name_ko": "...", "measure_en": "...", "measure_ko": "..."}],
+      "steps_ko": ["...", "...", ...],
+    }
+    """
+    title_en = recipe.get("title", "") or ""
+    ingredients = recipe.get("ingredients", []) or []
+    steps_en = split_steps(recipe.get("instructions", ""))
+
+    # 1) OpenAI로 먼저 번역(JSON 강제)
+    try:
+        client = OpenAI(api_key=cfg.openai.api_key)
+        instructions = """
+너는 번역기다  아래 입력을 한국어로 정확히 번역해라
+- 출력은 JSON만  다른 설명 금지
+- 영어 단어를 남기지 마라  단 고유명사나 브랜드가 애매하면 괄호에 영문을 남겨도 된다
+- ingredients는 같은 개수 유지  steps도 같은 개수 유지
+JSON 스키마:
+{
+ "title_ko": "string",
+ "ingredients": [{"name_en":"string","name_ko":"string","measure_en":"string","measure_ko":"string"}],
+ "steps_ko": ["string", ...]
+}
+""".strip()
+
+        payload = {
+            "title_en": title_en,
+            "ingredients": ingredients,
+            "steps_en": steps_en,
+        }
+        resp = _openai_call_with_retry(
+            client=client,
+            model=cfg.openai.model,
+            instructions=instructions,
+            input_text=json.dumps(payload, ensure_ascii=False),
+            max_retries=cfg.run.openai_max_retries,
+            debug=cfg.run.debug,
+        )
+        txt = (resp.output_text or "").strip()
+        data = json.loads(txt)
+
+        # 최소 방어
+        if not isinstance(data, dict):
+            raise RuntimeError("translate json invalid")
+        if not data.get("title_ko"):
+            raise RuntimeError("translate title empty")
+        if not isinstance(data.get("ingredients", []), list):
+            raise RuntimeError("translate ingredients invalid")
+        if not isinstance(data.get("steps_ko", []), list):
+            raise RuntimeError("translate steps invalid")
+
+        return data
+
+    except Exception as e:
+        if cfg.run.debug:
+            print("[WARN] translate_recipe_to_korean via OpenAI failed → fallback:", repr(e))
+
+    # 2) LibreTranslate bulk 폴백
+    title_ko = free_translate_text(cfg.free_tr, title_en, debug=cfg.run.debug) if title_en else "오늘 레시피"
+    ing_texts: List[str] = []
+    for it in ingredients:
+        ing_texts.append((it.get("name") or "").strip())
+        ing_texts.append((it.get("measure") or "").strip())
+    step_texts = steps_en[:]
+
+    trans_ing = free_translate_bulk(cfg.free_tr, ing_texts, debug=cfg.run.debug) if ing_texts else []
+    trans_steps = free_translate_bulk(cfg.free_tr, step_texts, debug=cfg.run.debug) if step_texts else []
+
+    out_ings = []
+    k = 0
+    for it in ingredients:
+        name_en = (it.get("name") or "").strip()
+        mea_en = (it.get("measure") or "").strip()
+        name_ko = trans_ing[k].strip() if k < len(trans_ing) else name_en
+        mea_ko = trans_ing[k+1].strip() if (k+1) < len(trans_ing) else mea_en
+        k += 2
+        out_ings.append({
+            "name_en": name_en,
+            "name_ko": name_ko or name_en,
+            "measure_en": mea_en,
+            "measure_ko": mea_ko or mea_en,
+        })
+
+    return {
+        "title_ko": title_ko or title_en or "오늘 레시피",
+        "ingredients": out_ings,
+        "steps_ko": trans_steps if trans_steps else steps_en,
+    }
+
+
+# -----------------------------
+# Title templates
+# -----------------------------
+def _first_keyword(csv: str) -> str:
     for x in (csv or "").split(","):
         x = x.strip()
         if x:
             return x
     return ""
 
-
-def make_title(keyword: str, mode: str = "random") -> str:
-    keyword = (keyword or "").strip()
-    if not keyword:
-        keyword = "오늘 레시피"
-
-    benefit = [
-        f"{keyword} 이번엔 왜 실패가 줄었는지 한 번만 짚어볼게요",
+def make_title(keyword: str) -> str:
+    keyword = (keyword or "").strip() or "오늘 레시피"
+    pools = [
         f"{keyword} 이 포인트만 잡으면 맛이 안정되는 이유",
-        f"{keyword} 손 많이 갈 것 같아도 의외로 편해지는 순서가 있어요",
-    ]
-    threat = [
-        f"{keyword} 여기서 급해지면 맛이 붕 뜹니다 저도 이 지점이 제일 불안해요",
-        f"{keyword} 이거 한 번 놓치면 식감이 확 무너질 수 있어요",
+        f"{keyword} 다들 여기서 망하더라고요 그 지점만 정리해요",
+        f"{keyword} 손 많이 갈 것 같아도 흐름만 잡으면 편해요",
         f"{keyword} 같은 재료인데 결과가 갈리는 건 보통 이 한 줄 차이예요",
     ]
-    curiosity = [
-        f"{keyword} 다들 어디서 망하는지 궁금하셨죠 그 지점만 정리해요",
-        f"{keyword} 왜 어떤 날은 맛있고 어떤 날은 애매한지 그 이유만요",
-        f"{keyword} 대충 해도 괜찮아지는 기준이 진짜 따로 있어요",
-    ]
-    compare = [
-        f"{keyword} 따라하기보다 상태를 보는 쪽이 편하더라고요",
-        f"{keyword} 정량파 vs 상태파 저는 이제 이쪽으로 기울었어요",
-        f"{keyword} 레시피대로 vs 내 기준대로 뭐가 더 안 흔들릴까요",
-    ]
-
-    pools = {"benefit": benefit, "threat": threat, "curiosity": curiosity, "compare": compare}
-    if mode == "random":
-        mode = random.choices(["curiosity", "benefit", "threat", "compare"], weights=[35, 30, 20, 15], k=1)[0]
-    return random.choice(pools.get(mode, curiosity))
+    return random.choice(pools)
 
 
 # -----------------------------
-# HTML builders (readability + forced lists + translation)
+# HTML builders (readability)
 # -----------------------------
-def _ingredients_html(cfg: AppConfig, recipe: Dict[str, Any]) -> str:
-    items = recipe.get("ingredients", []) or []
-    names_en: List[str] = []
-    needs_idx: List[int] = []
+def wrap_readable(html: str) -> str:
+    # 줄 간격/여백을 강제로 넉넉하게
+    return (
+        "<div style='line-height:2.0;font-size:16px;letter-spacing:-0.2px;'>"
+        + html
+        + "</div>"
+    )
 
-    for i, it in enumerate(items):
-        name = (it.get("name") or "").strip()
-        if name and looks_english(name):
-            needs_idx.append(i)
-            names_en.append(name)
-
-    translated_map: Dict[int, str] = {}
-    if names_en:
-        trans = free_translate_bulk(cfg.free_tr, names_en, debug=cfg.run.debug)
-        for j, idx in enumerate(needs_idx):
-            ko = (trans[j] or "").strip()
-            translated_map[idx] = ko
-
+def ingredients_html(ko_pack: Dict[str, Any]) -> str:
     lis = []
-    for i, it in enumerate(items):
-        name = (it.get("name") or "").strip()
-        mea = (it.get("measure") or "").strip()
-        if not name:
-            continue
+    for it in ko_pack.get("ingredients", []) or []:
+        name_ko = (it.get("name_ko") or "").strip()
+        name_en = (it.get("name_en") or "").strip()
+        mea_ko = (it.get("measure_ko") or "").strip()
+        mea_en = (it.get("measure_en") or "").strip()
 
-        ko = translated_map.get(i, "").strip()
-        if ko and ko.lower() != name.lower():
-            label = f"{_html.escape(ko)} <span style='opacity:.65'>({_html.escape(name)})</span>"
-        else:
-            label = _html.escape(name)
+        name_part = _html.escape(name_ko or name_en)
+        if name_en and (name_ko and name_ko.lower() != name_en.lower()):
+            name_part += f" <span style='opacity:.6'>({_html.escape(name_en)})</span>"
 
-        if mea:
-            label += f" <span style='opacity:.78'>({_html.escape(mea)})</span>"
+        mea_part = (mea_ko or mea_en).strip()
+        if mea_part:
+            name_part += f" <span style='opacity:.8'>— {_html.escape(mea_part)}</span>"
 
-        lis.append(f"<li style='margin:0 0 10px 0;'>{label}</li>")
+        lis.append(f"<li style='margin:0 0 12px 0;'>{name_part}</li>")
 
     if not lis:
-        lis = ["<li style='margin:0 0 10px 0;'>재료 정보가 비어있어요</li>"]
+        lis = ["<li style='margin:0 0 12px 0;'>재료 정보가 비어있어요</li>"]
 
-    return "<ul style='margin:0;padding-left:18px;'>" + "".join(lis) + "</ul>"
+    return "<ul style='margin:10px 0 18px 0;padding-left:18px;'>" + "".join(lis) + "</ul>"
 
-
-def _steps_html(recipe: Dict[str, Any]) -> str:
-    steps = split_steps(recipe.get("instructions", ""))
+def steps_html(ko_pack: Dict[str, Any]) -> str:
     lis = []
-    for s in steps:
+    for s in ko_pack.get("steps_ko", []) or []:
         s = (s or "").strip()
         if not s:
             continue
-        lis.append(f"<li style='margin:0 0 12px 0;'>{_html.escape(s)}</li>")
+        lis.append(f"<li style='margin:0 0 14px 0;'>{_html.escape(s)}</li>")
     if not lis:
-        lis = ["<li style='margin:0 0 12px 0;'>과정 정보가 비어있어요</li>"]
-    return "<ol style='margin:0;padding-left:20px;'>" + "".join(lis) + "</ol>"
-
-
-def wrap_readable(body_html: str) -> str:
-    return "<div style='line-height:1.9;font-size:16px;letter-spacing:-0.2px;'>" + body_html + "</div>"
-
-
-def plain_len(html_text: str) -> int:
-    t = re.sub(r"<[^>]+>", "", html_text or "")
-    t = re.sub(r"\s+", " ", t).strip()
-    return len(t)
+        lis = ["<li style='margin:0 0 14px 0;'>과정 정보가 비어있어요</li>"]
+    return "<ol style='margin:10px 0 18px 0;padding-left:20px;'>" + "".join(lis) + "</ol>"
 
 
 # -----------------------------
-# OpenAI prompt for homefeed style
+# OpenAI homefeed body (tokens)
 # -----------------------------
-def build_homefeed_prompt(cfg: AppConfig, recipe: Dict[str, Any], keyword: str, now: datetime) -> Tuple[str, str]:
-    ing_token = "[[INGREDIENTS]]"
-    step_token = "[[STEPS]]"
+ING_TOKEN = "[[INGREDIENTS]]"
+STEP_TOKEN = "[[STEPS]]"
 
-    seeds = [
-        "요리는 완벽보다 다음에 또 할 수 있는 방식이 더 오래 가더라고요",
-        "레시피는 답이라기보다 실패를 줄이는 힌트 같아요",
-        "급하게 하면 꼭 한 군데서 삐끗해서 저는 기준부터 잡는 편이에요",
-        "정량보다 상태를 보면 마음이 편해지는 순간이 있어요",
-    ]
-    seed = random.choice(seeds)
+def build_body_prompt(keyword: str) -> str:
+    return f"""
+너는 한국어로 글을 쓰는 블로그 운영자다  네이버 홈피드에서 읽기 편한 ‘수다 존댓말’ 톤으로 쓴다
 
-    instructions = f"""
-너는 한국어로 글을 쓰는 블로그 운영자다  아래 레시피를 바탕으로 네이버 홈피드에서 읽기 편한 글을 HTML로 작성해라
+[강제 규칙]
+- 영어 단어를 최대한 쓰지 마라  영어가 필요한 경우는 괄호로 1회만
+- 마침표는 쓰지 않는다  대신 줄바꿈과 여백으로 호흡을 둔다
+- 도입부 200~300자
+- 굵은 소제목 3개
+- 전체 2300자 이상
+- 레시피를 실제로 해먹었다는 단정은 금지  대신 집에서 해보면 보통 여기서 갈린다 같은 현장감 기준으로 말한다
 
-[중요 사실 규칙]
-- 너는 실제로 조리해본 적이 없다  그래서 오늘 해먹어봤는데 같은 체험 단정은 쓰지 마
-- 대신 집에서 해보면 보통 여기서 갈린다  상태를 이렇게 보면 된다  같은 현장감 기준으로 쓴다
-- 제공된 재료 목록과 단계 외의 재료  계량  단계는 추가 삭제 변경 금지
-- 시간 온도 숫자는 원문에 없으면 단정 금지  상태를 보며 같은 표현을 쓴다
-
-[톤과 가독성]
-- 친구에게 진심 담아 수다 떠는 존댓말로
-- 마침표는 쓰지 않는다  대신 띄어쓰기와 여백과 줄바꿈으로 호흡을 둔다
-- 문단은 짧게  대신 줄바꿈을 자주  한 문단 2~4줄 느낌
-
-[길이]
-- 전체 텍스트는 2300자 이상이 되도록
-- 도입부는 200~300자 정도로
-- 굵은 소제목 3개를 만들고  각 섹션은 충분히 길게 쓴다
-
-[구성]
-1) <p>도입부</p>
-2) <h2><b>소제목 1</b></h2> + 내용
-3) <h2><b>소제목 2</b></h2> + 내용 + 여기 어딘가에 토큰 {ing_token} 을 반드시 한 번 넣기
-4) <h2><b>소제목 3</b></h2> + 내용 + 여기 어딘가에 토큰 {step_token} 을 반드시 한 번 넣기
-5) 마지막에 <p style='opacity:.7;font-size:13px;'>출처 링크가 있으면 간단히</p>
-
-[키워드]
-- 글 흐름 중간중간에 '{keyword}' 단어를 자연스럽게 2~4번만 섞어라  과도하게 반복하지 마
-- 씨앗 문장도 자연스럽게 녹여라  {seed}
+[중요]
+- 본문 중간에 반드시 토큰 {ING_TOKEN} 를 한 번 넣어라
+- 본문 후반에 반드시 토큰 {STEP_TOKEN} 를 한 번 넣어라
+- 키워드 '{keyword}'는 자연스럽게 2~4번만
 
 [출력]
-- HTML만 출력한다  제목은 출력하지 않는다
+- HTML만 출력한다
 """.strip()
 
-    payload = {
-        "title_en": recipe.get("title", ""),
-        "category_en": recipe.get("category", ""),
-        "area_en": recipe.get("area", ""),
-        "ingredients": recipe.get("ingredients", []),
-        "steps_en": split_steps(recipe.get("instructions", "")),
-        "source_url": recipe.get("source", ""),
-        "youtube": recipe.get("youtube", ""),
-        "now_kst": now.astimezone(KST).strftime("%Y-%m-%d %H:%M"),
-        "keyword": keyword,
-    }
-    user_input = "레시피 JSON:\n" + json.dumps(payload, ensure_ascii=False, indent=2)
-    return instructions, user_input
-
-
-def generate_homefeed_body(cfg: AppConfig, recipe: Dict[str, Any], keyword: str, now: datetime) -> str:
-    ing_token = "[[INGREDIENTS]]"
-    step_token = "[[STEPS]]"
-    ing_html = _ingredients_html(cfg, recipe)
-    steps_html = _steps_html(recipe)
-
+def generate_body_html(cfg: AppConfig, recipe_ko: Dict[str, Any], keyword: str) -> str:
     client = OpenAI(api_key=cfg.openai.api_key)
-    inst, user_in = build_homefeed_prompt(cfg, recipe, keyword=keyword, now=now)
+
+    payload = {
+        "keyword": keyword,
+        "title_ko": recipe_ko.get("title_ko", ""),
+        "hint": "재료/단계는 토큰 위치에 삽입될 예정이라 본문에 별도 목록을 과하게 반복하지 말기",
+    }
+
     resp = _openai_call_with_retry(
         client=client,
         model=cfg.openai.model,
-        instructions=inst,
-        input_text=user_in,
+        instructions=build_body_prompt(keyword),
+        input_text=json.dumps(payload, ensure_ascii=False),
         max_retries=cfg.run.openai_max_retries,
         debug=cfg.run.debug,
     )
     body = (resp.output_text or "").strip()
     if "<" not in body:
         safe = _html.escape(body).replace("\n", "<br/><br/>")
-        body = f"<p style='margin:0 0 16px 0;'>{safe}</p>"
+        body = f"<p style='margin:0 0 18px 0;'>{safe}</p>"
 
-    if ing_token in body:
-        body = body.replace(ing_token, ing_html)
-    else:
-        body += "<h2><b>재료 목록</b></h2>" + ing_html
-
-    if step_token in body:
-        body = body.replace(step_token, steps_html)
-    else:
-        body += "<h2><b>만드는 과정</b></h2>" + steps_html
-
-    body = wrap_readable(body)
-
-    if plain_len(body) < 2300:
-        fillers = [
-            "이 메뉴는 딱 한 번만 기준을 잡아두면 다음부터는 마음이 훨씬 편해지더라고요<br/><br/>"
-            "특히 간을 급하게 잡는 순간이 오면 잠깐 멈추고 향과 농도를 먼저 보는 쪽이 안정적이에요<br/><br/>",
-            "저는 요리할 때 완벽하려고 하면 오히려 더 흔들리더라고요<br/><br/>"
-            "그래서 오늘은 딱 한 가지 기준만 챙기자 이런 식으로 스스로를 설득하는 편이에요<br/><br/>",
-            "혹시라도 중간에 꼬였다 싶으면 처음부터 다시 하기보다 상태를 먼저 확인해보세요<br/><br/>"
-            "이상하게도 그 한 번의 확인이 전체 흐름을 다시 정리해주는 느낌이 있거든요<br/><br/>",
-        ]
-        while plain_len(body) < 2300:
-            body += "<p style='margin:0 0 16px 0;'>" + random.choice(fillers) + "</p>"
-
-    src = (recipe.get("source") or "").strip()
-    yt = (recipe.get("youtube") or "").strip()
-    links = []
-    if src:
-        links.append(f"<a href='{_html.escape(src)}' target='_blank' rel='nofollow noopener'>source</a>")
-    if yt:
-        links.append(f"<a href='{_html.escape(yt)}' target='_blank' rel='nofollow noopener'>youtube</a>")
-    if links:
-        body += "<p style='opacity:.7;font-size:13px;margin-top:18px;'>" + " | ".join(links) + "</p>"
+    # 토큰이 빠졌으면 강제로 붙임
+    if ING_TOKEN not in body:
+        body += f"<h2><b>재료</b></h2>{ING_TOKEN}"
+    if STEP_TOKEN not in body:
+        body += f"<h2><b>만드는 법</b></h2>{STEP_TOKEN}"
 
     return body
 
 
-def build_korean_simple_with_free_translate(cfg: AppConfig, recipe: Dict[str, Any], now: datetime, keyword: str) -> Tuple[str, str]:
-    title_en = recipe.get("title", "Daily Recipe")
-    title_ko = ensure_korean_phrase(cfg, free_translate_text(cfg.free_tr, title_en, debug=cfg.run.debug) or title_en)
+def rewrite_korean_only_if_needed(cfg: AppConfig, html: str) -> str:
+    if not html_has_too_much_english(html):
+        return html
 
-    body = wrap_readable(
-        f"<p style='margin:0 0 16px 0;'>오늘은 자동 생성 호출이 어려워서 공개 레시피를 한국어로 간단히 정리했어요<br/><br/>"
-        f"그래도 { _html.escape(keyword) } 포인트만 놓치지 않게 흐름을 잡아둘게요</p>"
-        f"<h2><b>재료 목록</b></h2>{_ingredients_html(cfg, recipe)}"
-        f"<h2><b>만드는 과정</b></h2>{_steps_html(recipe)}"
+    if cfg.run.debug:
+        print("[CHECK] english remained → rewrite once")
+
+    client = OpenAI(api_key=cfg.openai.api_key)
+    inst = """
+다음 HTML을 한국어로만 자연스럽게 다시 써라
+- 마침표 금지  줄바꿈과 여백으로 호흡
+- 존댓말 수다 톤 유지
+- 구조는 유지  토큰 [[INGREDIENTS]] 와 [[STEPS]] 는 반드시 그대로 남겨라
+- 영어 단어가 있으면 가능한 한 한국어로 바꿔라
+- HTML만 출력
+""".strip()
+
+    resp = _openai_call_with_retry(
+        client=client,
+        model=cfg.openai.model,
+        instructions=inst,
+        input_text=html,
+        max_retries=cfg.run.openai_max_retries,
+        debug=cfg.run.debug,
     )
-    return f"{title_ko} 실패 포인트만 잡아두기", body
+    out = (resp.output_text or "").strip()
+    return out if out else html
 
 
 # -----------------------------
-# Main flow
+# pick recipe
 # -----------------------------
 def pick_recipe(cfg: AppConfig, existing: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     if existing and existing.get("recipe_id") and not cfg.run.force_new:
@@ -888,10 +867,12 @@ def pick_recipe(cfg: AppConfig, existing: Optional[Dict[str, Any]]) -> Dict[str,
         if rid in recent_ids:
             continue
         return cand
+    raise RuntimeError("레시피를 가져오지 못했습니다(중복 회피/시도 초과).")
 
-    raise RuntimeError("레시피를 가져오지 못했습니다(중복 회피/시도 횟수 초과).")
 
-
+# -----------------------------
+# main run
+# -----------------------------
 def run(cfg: AppConfig) -> None:
     now = datetime.now(tz=KST)
     date_str = now.strftime("%Y-%m-%d")
@@ -916,15 +897,7 @@ def run(cfg: AppConfig) -> None:
 
     recipe = pick_recipe(cfg, existing)
 
-    # 제목 키워드 결정 + 번역 보정
-    keyword = (cfg.naver.title_keyword or "").strip()
-    if not keyword:
-        keyword = _first_keyword_from_csv(cfg.naver.keywords_csv)
-    if not keyword:
-        keyword = free_translate_text(cfg.free_tr, recipe.get("title", ""), debug=cfg.run.debug) or (recipe.get("title") or "오늘 레시피")
-    keyword = ensure_korean_phrase(cfg, keyword)
-
-    # 썸네일 업로드(기본: TheMealDB)
+    # 썸네일 업로드
     media_id: Optional[int] = None
     media_url: str = ""
     thumb_url = (recipe.get("thumb") or "").strip()
@@ -938,35 +911,63 @@ def run(cfg: AppConfig) -> None:
 
     featured = media_id if (cfg.run.set_featured and media_id) else None
 
-    # 본문 생성
+    # 레시피 한국어 번역(강제)
+    recipe_ko = translate_recipe_to_korean(cfg, recipe)
+
+    # 제목 키워드 선택
+    keyword = (cfg.naver.title_keyword or "").strip()
+    if not keyword:
+        keyword = _first_keyword(cfg.naver.keywords_csv)
+    if not keyword:
+        keyword = (recipe_ko.get("title_ko") or "").strip() or "오늘 레시피"
+
+    # 제목 생성
+    title_core = make_title(keyword)
+    title = f"{date_str} {slot_label} | {title_core}"
+
+    # 본문 생성(토큰 포함) + 영어 잔존 시 재작성
     try:
-        body_html = generate_homefeed_body(cfg, recipe, keyword=keyword, now=now)
+        body = generate_body_html(cfg, recipe_ko, keyword=keyword)
+        body = rewrite_korean_only_if_needed(cfg, body)
     except Exception as e:
         if _is_insufficient_quota_error(e):
-            print("[WARN] OpenAI quota depleted → fallback to free translate")
+            print("[WARN] OpenAI quota depleted → fallback simple")
         else:
-            print("[WARN] OpenAI failed → fallback to free translate:", repr(e))
-        _, body_html = build_korean_simple_with_free_translate(cfg, recipe, now, keyword=keyword)
+            print("[WARN] OpenAI failed → fallback simple:", repr(e))
+
+        # 폴백: 최소 구성이라도 한국어 재료/단계는 유지
+        body = (
+            f"<p style='margin:0 0 18px 0;'>"
+            f"{_html.escape(keyword)} 기준만 잡아두고 가볍게 따라가도 충분히 만들 수 있어요<br/><br/>"
+            f"오늘은 실패 포인트보다 흐름을 먼저 잡는 쪽으로 정리해볼게요"
+            f"</p>"
+            f"<h2><b>재료</b></h2>{ING_TOKEN}"
+            f"<h2><b>만드는 법</b></h2>{STEP_TOKEN}"
+        )
+
+    # 토큰 치환(재료/단계는 항상 한국어)
+    body = body.replace(ING_TOKEN, ingredients_html(recipe_ko))
+    body = body.replace(STEP_TOKEN, steps_html(recipe_ko))
 
     # 본문 맨 위 이미지
     if cfg.run.embed_image_in_body:
         img = media_url or thumb_url
         if img:
             img_tag = (
-                f"<p style='margin:0 0 18px 0;'><img src=\"{_html.escape(img)}\" alt=\"{_html.escape(keyword)}\" "
-                "style=\"max-width:100%;height:auto;border-radius:14px;display:block;\"/></p>"
+                f"<p style='margin:0 0 22px 0;'>"
+                f"<img src=\"{_html.escape(img)}\" alt=\"{_html.escape(keyword)}\" "
+                f"style=\"max-width:100%;height:auto;border-radius:14px;display:block;\"/>"
+                f"</p>"
             )
-            body_html = img_tag + body_html
+            body = img_tag + body
 
-    # 제목 템플릿 랜덤 적용(키워드 번역 보정된 값)
-    title_core = make_title(keyword, mode=cfg.naver.title_mode)
-    title = f"{date_str} {slot_label} | {title_core}"
+    body_html = wrap_readable(body)
 
     if cfg.run.dry_run:
-        print("[DRY_RUN] 발행 생략. 미리보기 ↓")
+        print("[DRY_RUN] 발행 생략")
         print("TITLE:", title)
         print("SLUG:", slug)
-        print(body_html[:2000] + ("\n...(truncated)" if len(body_html) > 2000 else ""))
+        print(body_html[:2500] + ("\n...(truncated)" if len(body_html) > 2500 else ""))
         return
 
     # 발행/업데이트
