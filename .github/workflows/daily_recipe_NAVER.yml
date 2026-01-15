@@ -2,19 +2,13 @@ name: Daily Recipe to WordPress (Naver-friendly)
 
 on:
   schedule:
-    # ✅ KST 09:20 = UTC 00:20
-    - cron: "20 0 * * *"
-    # ✅ KST 18:20 = UTC 09:20
-    - cron: "20 9 * * *"
+    # 매일 09:10 KST = 00:10 UTC
+    - cron: "10 0 * * *"
   workflow_dispatch:
 
 jobs:
-  post:
+  run:
     runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        slot: [am, pm]
-
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -29,40 +23,43 @@ jobs:
           python -m pip install --upgrade pip
           pip install requests openai
 
-      - name: Make data dir
+      - name: Prepare data dir
         run: mkdir -p data
 
       - name: Run bot
         env:
-          RUN_SLOT: ${{ matrix.slot }}
           WP_BASE_URL: ${{ secrets.WP_BASE_URL }}
           WP_USER: ${{ secrets.WP_USER }}
           WP_APP_PASS: ${{ secrets.WP_APP_PASS }}
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
 
-          # 선택
-          WP_STATUS: publish
+          # 옵션(원하면 secrets 또는 repository variables로 옮겨도 됨)
+          WP_STATUS: "publish"
           WP_CATEGORY_IDS: "7"
           WP_TAG_IDS: ""
-          SQLITE_PATH: data/daily_recipe.sqlite3
+          SQLITE_PATH: "data/daily_recipe.sqlite3"
+
+          RUN_SLOT: "day"
+          FORCE_NEW: "0"
+          AVOID_REPEAT_DAYS: "90"
+          MAX_TRIES: "20"
           OPENAI_MODEL: "gpt-5.2"
           OPENAI_MAX_RETRIES: "3"
-          AVOID_REPEAT_DAYS: "90"
-          MAX_TRIES: "25"
+          STRICT_KOREAN: "1"
 
-          # 이미지 대체 (선택)
-          DEFAULT_THUMB_URL: ${{ secrets.DEFAULT_THUMB_URL }}
+          RANDOMIZE_LEVEL: "2"
+          UPLOAD_THUMB: "1"
+          SET_FEATURED: "1"
+          EMBED_IMAGE_IN_BODY: "1"
+          DEFAULT_THUMB_URL: ""
 
-          # MFDS 한식 우선(선택)
-          MFDS_API_KEY: ${{ secrets.MFDS_API_KEY }}
-
-          # 폴백 번역(선택)
+          # 무료번역 폴백(선택)
           FREE_TRANSLATE_URL: "https://libretranslate.de/translate"
-          FREE_TRANSLATE_API_KEY: ${{ secrets.FREE_TRANSLATE_API_KEY }}
+          FREE_TRANSLATE_API_KEY: ""
           FREE_TRANSLATE_SOURCE: "en"
           FREE_TRANSLATE_TARGET: "ko"
 
-          DEBUG: "0"
           DRY_RUN: "0"
+          DEBUG: "0"
         run: |
           python daily_recipe_to_wp_naver.py
