@@ -1,12 +1,11 @@
 # -*- coding: utf-8 -*-
 """
-daily_recipe_to_wp_naverstyle.py (통합 완성본: 네이버 홈피드/홈판 친화형 글 템플릿 + 제목 후킹 랜덤화)
+daily_recipe_to_wp_naverstyle.py (통합 완성본: 네이버 홈피드/홈판 친화형 톤 + 가독성 강화 + 재료 목록 자동 삽입 + 제목 후킹 랜덤)
 - TheMealDB 랜덤 레시피 수집
-- OpenAI로 한국어 '홈피드형' 장문 작성 (도입 200~300자 + 굵은 소제목 3개, 각 1500자 이상, 총 2300자 이상(실제로는 4500+))
-- 친구에게 수다 떨듯 존댓말, 마침표 없이('.' 제거), 여백/줄바꿈으로 호흡
+- OpenAI로 한국어 '사람 글' 톤(친구에게 존댓말 수다 / 경험담 느낌 / 실패포인트 / 상태기준 / 여백 호흡) 생성
 - WordPress 발행/업데이트 + 썸네일 업로드/대표이미지 설정
 - SQLite 발행 이력 + 스키마 자동 마이그레이션
-- ✅ OpenAI 크레딧 소진(insufficient_quota) 시: 템플릿 기반(비-AI) 장문 폴백 + (선택) LibreTranslate로 재료/단계 번역
+- OpenAI 크레딧 소진(insufficient_quota) 시: 무료번역(LibreTranslate) 폴백
 
 필수 env (GitHub Secrets):
   - WP_BASE_URL
@@ -22,28 +21,22 @@ daily_recipe_to_wp_naverstyle.py (통합 완성본: 네이버 홈피드/홈판 �
 
 동작:
   - RUN_SLOT=day|am|pm (기본 day)
-  - FORCE_NEW=0|1 (기본 0)          # 1이면 매번 새 slug로 "항상 새 글"
+  - FORCE_NEW=0|1 (기본 0)          # 1이면 매번 새 글(중복 업로드 의심될 때)
   - DRY_RUN=0|1 (기본 0)
   - DEBUG=0|1 (기본 0)
   - AVOID_REPEAT_DAYS=90
   - MAX_TRIES=20
   - OPENAI_MODEL=... (기본 gpt-4.1-mini)
   - OPENAI_MAX_RETRIES=3
+  - NAVER_TEXT_TRIES=3 (기본 3)     # 글자수/형식 미달 시 재생성 횟수
 
 네이버 스타일/랜덤화:
-  - NAVER_RANDOM_LEVEL=0~3 (기본 2)         # 0=거의 고정, 3=변화 큼
-  - NAVER_EXPERIENCE_LEVEL=0~3 (기본 2)     # 0=정보형, 3=현장감/실패포인트 강조
-  - NAVER_KEYWORDS="키워드1,키워드2,..."     # 선택: 제목/본문에 자연스럽게 사용(첫 번째가 메인)
-  - NAVER_TITLE_MODE=random|benefit|threat|curiosity|compare   # 기본 random
-  - NAVER_TITLE_WEIGHTS="35,30,20,15"       # curiosity,benefit,threat,compare (기본값)
-  - TITLE_NUMBER_EXAMPLES="3가지,5분,10분,1번" # (선택) 제목 숫자 슬롯용
+  - NAVER_RANDOM_LEVEL=0~3 (기본 2)       # 0=거의 고정 3=변화 큼
+  - NAVER_EXPERIENCE_LEVEL=0~3 (기본 2)   # 0=정보형 3=현장감/실패포인트 강조
+  - NAVER_KEYWORDS="키워드1,키워드2,..." (선택) # 제목/본문에 자연스럽게 한두 번만 녹임
+  - PREFER_AREAS="Korean,Japanese,Chinese" (선택) # TheMealDB area 필터
 
-고퀄 썸네일(선택):
-  - THUMB_PROVIDER=themealdb|pexels (기본 themealdb)
-  - PEXELS_API_KEY=...   # THUMB_PROVIDER=pexels일 때
-  - PEXELS_STYLE=clean|minimal|white|topview (기본 clean)
-
-LibreTranslate(선택):
+무료번역(LibreTranslate):
   - FREE_TRANSLATE_URL=https://libretranslate.de/translate
   - FREE_TRANSLATE_API_KEY=
   - FREE_TRANSLATE_SOURCE=en
@@ -53,7 +46,6 @@ LibreTranslate(선택):
 from __future__ import annotations
 
 import base64
-import html
 import json
 import os
 import random
@@ -143,23 +135,15 @@ class RunConfig:
     set_featured: bool = True
     embed_image_in_body: bool = True
     openai_max_retries: int = 3
+    naver_text_tries: int = 3
 
 
 @dataclass
 class NaverStyleConfig:
     random_level: int = 2          # 0~3
     experience_level: int = 2      # 0~3
-    keywords: List[str] = field(default_factory=list)
-    title_mode: str = "random"     # random|benefit|threat|curiosity|compare
-    title_weights: List[int] = field(default_factory=lambda: [35, 30, 20, 15])  # curiosity,benefit,threat,compare
-    title_numbers: List[str] = field(default_factory=list)
-
-
-@dataclass
-class ThumbConfig:
-    provider: str = "themealdb"    # themealdb|pexels
-    pexels_api_key: str = ""
-    pexels_style: str = "clean"    # clean|minimal|white|topview
+    keywords_csv: str = ""
+    prefer_areas: List[str] = field(default_factory=list)
 
 
 @dataclass
@@ -181,7 +165,6 @@ class AppConfig:
     wp: WordPressConfig
     run: RunConfig
     naver: NaverStyleConfig
-    thumb: ThumbConfig
     sqlite_path: str
     openai: OpenAIConfig
     free_tr: FreeTranslateConfig
@@ -213,6 +196,7 @@ def load_cfg() -> AppConfig:
         set_featured=_env_bool("SET_FEATURED", True),
         embed_image_in_body=_env_bool("EMBED_IMAGE_IN_BODY", True),
         openai_max_retries=_env_int("OPENAI_MAX_RETRIES", 3),
+        naver_text_tries=_env_int("NAVER_TEXT_TRIES", 3),
     )
 
     openai_key = _env("OPENAI_API_KEY", "")
@@ -225,27 +209,8 @@ def load_cfg() -> AppConfig:
 
     naver_random_level = max(0, min(3, _env_int("NAVER_RANDOM_LEVEL", 2)))
     naver_exp_level = max(0, min(3, _env_int("NAVER_EXPERIENCE_LEVEL", 2)))
-    naver_keywords = _parse_str_list(_env("NAVER_KEYWORDS", ""))
-    title_mode = (_env("NAVER_TITLE_MODE", "random") or "random").strip().lower()
-
-    w_raw = _env("NAVER_TITLE_WEIGHTS", "35,30,20,15")
-    w = []
-    for x in w_raw.split(","):
-        x = x.strip()
-        if not x:
-            continue
-        try:
-            w.append(int(x))
-        except Exception:
-            pass
-    if len(w) != 4 or sum(max(0, i) for i in w) <= 0:
-        w = [35, 30, 20, 15]
-
-    title_numbers = _parse_str_list(_env("TITLE_NUMBER_EXAMPLES", "3가지,5분,10분,1번,2번"))
-
-    thumb_provider = (_env("THUMB_PROVIDER", "themealdb") or "themealdb").strip().lower()
-    pexels_key = _env("PEXELS_API_KEY", "")
-    pexels_style = (_env("PEXELS_STYLE", "clean") or "clean").strip().lower()
+    naver_keywords = _env("NAVER_KEYWORDS", "")
+    prefer_areas = _parse_str_list(_env("PREFER_AREAS", ""))
 
     return AppConfig(
         wp=WordPressConfig(
@@ -260,15 +225,8 @@ def load_cfg() -> AppConfig:
         naver=NaverStyleConfig(
             random_level=naver_random_level,
             experience_level=naver_exp_level,
-            keywords=naver_keywords,
-            title_mode=title_mode,
-            title_weights=w,
-            title_numbers=title_numbers,
-        ),
-        thumb=ThumbConfig(
-            provider=thumb_provider,
-            pexels_api_key=pexels_key,
-            pexels_style=pexels_style,
+            keywords_csv=naver_keywords,
+            prefer_areas=prefer_areas,
         ),
         sqlite_path=sqlite_path,
         openai=OpenAIConfig(api_key=openai_key, model=openai_model),
@@ -305,9 +263,9 @@ def print_safe_cfg(cfg: AppConfig) -> None:
     print("[CFG] DRY_RUN:", int(cfg.run.dry_run), "| DEBUG:", int(cfg.run.debug))
     print("[CFG] OPENAI_MODEL:", cfg.openai.model, "| OPENAI_KEY:", ok(cfg.openai.api_key))
     print("[CFG] NAVER_RANDOM_LEVEL:", cfg.naver.random_level, "| NAVER_EXPERIENCE_LEVEL:", cfg.naver.experience_level)
-    print("[CFG] NAVER_KEYWORDS:", ",".join(cfg.naver.keywords) if cfg.naver.keywords else "(empty)")
-    print("[CFG] NAVER_TITLE_MODE:", cfg.naver.title_mode, "| WEIGHTS:", cfg.naver.title_weights)
-    print("[CFG] THUMB_PROVIDER:", cfg.thumb.provider, "| PEXELS_KEY:", ok(cfg.thumb.pexels_api_key))
+    print("[CFG] NAVER_KEYWORDS:", cfg.naver.keywords_csv or "(empty)")
+    print("[CFG] PREFER_AREAS:", ",".join(cfg.naver.prefer_areas) if cfg.naver.prefer_areas else "(any)")
+    print("[CFG] NAVER_TEXT_TRIES:", cfg.run.naver_text_tries)
     print("[CFG] FREE_TRANSLATE_URL:", cfg.free_tr.url)
 
 
@@ -452,10 +410,10 @@ def wp_find_post_by_slug(cfg: WordPressConfig, slug: str) -> Optional[int]:
     return None
 
 
-def wp_create_post(cfg: WordPressConfig, title: str, slug: str, html_body: str, featured_media: Optional[int]) -> Tuple[int, str]:
+def wp_create_post(cfg: WordPressConfig, title: str, slug: str, html: str, featured_media: Optional[int]) -> Tuple[int, str]:
     url = cfg.base_url.rstrip("/") + "/wp-json/wp/v2/posts"
     headers = {**wp_auth_header(cfg.user, cfg.app_pass), "Content-Type": "application/json"}
-    payload: Dict[str, Any] = {"title": title, "slug": slug, "content": html_body, "status": cfg.status}
+    payload: Dict[str, Any] = {"title": title, "slug": slug, "content": html, "status": cfg.status}
 
     if cfg.category_ids:
         payload["categories"] = cfg.category_ids
@@ -471,10 +429,10 @@ def wp_create_post(cfg: WordPressConfig, title: str, slug: str, html_body: str, 
     return int(data["id"]), str(data.get("link") or "")
 
 
-def wp_update_post(cfg: WordPressConfig, post_id: int, title: str, html_body: str, featured_media: Optional[int]) -> Tuple[int, str]:
+def wp_update_post(cfg: WordPressConfig, post_id: int, title: str, html: str, featured_media: Optional[int]) -> Tuple[int, str]:
     url = cfg.base_url.rstrip("/") + f"/wp-json/wp/v2/posts/{post_id}"
     headers = {**wp_auth_header(cfg.user, cfg.app_pass), "Content-Type": "application/json"}
-    payload: Dict[str, Any] = {"title": title, "content": html_body, "status": cfg.status}
+    payload: Dict[str, Any] = {"title": title, "content": html, "status": cfg.status}
 
     if cfg.category_ids:
         payload["categories"] = cfg.category_ids
@@ -490,7 +448,7 @@ def wp_update_post(cfg: WordPressConfig, post_id: int, title: str, html_body: st
     return int(data["id"]), str(data.get("link") or "")
 
 
-def wp_upload_media(cfg: WordPressConfig, image_url: str, filename_hint: str = "thumb.jpg") -> Tuple[int, str]:
+def wp_upload_media(cfg: WordPressConfig, image_url: str, filename_hint: str = "recipe.jpg") -> Tuple[int, str]:
     media_endpoint = cfg.base_url.rstrip("/") + "/wp-json/wp/v2/media"
     headers = wp_auth_header(cfg.user, cfg.app_pass).copy()
 
@@ -501,7 +459,7 @@ def wp_upload_media(cfg: WordPressConfig, image_url: str, filename_hint: str = "
     content = r.content
     ctype = (r.headers.get("Content-Type") or "image/jpeg").split(";")[0].strip().lower()
 
-    safe_name = re.sub(r"[^a-zA-Z0-9._-]+", "-", filename_hint).strip("-") or "thumb.jpg"
+    safe_name = re.sub(r"[^a-zA-Z0-9._-]+", "-", filename_hint).strip("-") or "recipe.jpg"
     if "." not in safe_name:
         safe_name += ".jpg"
 
@@ -620,12 +578,12 @@ def _openai_call_with_retry(
             if debug:
                 print(f"[OPENAI] APIError → retry in {sleep_s:.2f}s | {repr(e)}")
             time.sleep(sleep_s)
-        except Exception as e:
+        except Exception:
             if attempt == max_retries:
                 raise
             sleep_s = (2 ** attempt) + random.random()
             if debug:
-                print(f"[OPENAI] UnknownError → retry in {sleep_s:.2f}s | {repr(e)}")
+                print(f"[OPENAI] UnknownError → retry in {sleep_s:.2f}s")
             time.sleep(sleep_s)
 
 
@@ -662,420 +620,360 @@ def free_translate_text(cfg: FreeTranslateConfig, text: str, debug: bool = False
 
 
 # -----------------------------
-# Utilities
+# Title hook templates (recipe-optimized 4 types)
 # -----------------------------
-def _strip_tags(s: str) -> str:
-    s = re.sub(r"<[^>]+>", " ", s or "")
-    s = html.unescape(s)
-    s = re.sub(r"\s+", " ", s).strip()
-    return s
+def _pick_weighted(items: List[Tuple[str, int]]) -> str:
+    total = sum(w for _, w in items)
+    r = random.randint(1, max(1, total))
+    acc = 0
+    for v, w in items:
+        acc += w
+        if r <= acc:
+            return v
+    return items[-1][0]
 
 
-def _remove_periods(s: str) -> str:
-    # 사용자 요청: 마침표 제거 (영문/전각 포함)
-    for ch in [".", "。", "．"]:
-        s = (s or "").replace(ch, "")
-    return s
+def make_hook_title(keyword: str, random_level: int = 2) -> str:
+    """
+    키워드를 제목 맨 앞에 두고
+    이득형 / 위협형 / 궁금형 / 비교형 중 랜덤으로 제목 생성
+    """
+    kw = (keyword or "").strip()
+    if not kw:
+        kw = "오늘 레시피"
 
-
-def _safe_space_rhythm(s: str) -> str:
-    s = (s or "").replace("\r\n", "\n").replace("\r", "\n")
-    s = re.sub(r"\n{3,}", "\n\n", s)
-    return s.strip()
-
-
-def _weighted_choice(items: List[str], weights: List[int]) -> str:
-    w = [max(0, int(x)) for x in weights]
-    if not items:
-        return ""
-    if len(w) != len(items) or sum(w) <= 0:
-        return random.choice(items)
-    total = sum(w)
-    r = random.uniform(0, total)
-    upto = 0.0
-    for item, wi in zip(items, w):
-        upto += wi
-        if r <= upto:
-            return item
-    return items[-1]
-
-
-def _looks_like_finance_keyword(k: str) -> bool:
-    k = (k or "")
-    finance_markers = ["계좌", "적금", "대출", "청년", "금리", "이자", "세액", "연금", "ISA", "청약", "저축", "투자"]
-    return any(m in k for m in finance_markers)
-
-
-# -----------------------------
-# Title generator (후킹 랜덤)
-# -----------------------------
-def build_hook_title(keyword: str, cfg: AppConfig) -> str:
-    k = (keyword or "").strip()
-    if not k:
-        k = "오늘 레시피"
-
-    mode = (cfg.naver.title_mode or "random").strip().lower()
-    styles = ["curiosity", "benefit", "threat", "compare"]
-
-    if mode == "random":
-        chosen = _weighted_choice(styles, cfg.naver.title_weights)
-    elif mode in styles:
-        chosen = mode
-    else:
-        chosen = _weighted_choice(styles, cfg.naver.title_weights)
-
-    is_fin = _looks_like_finance_keyword(k)
-    num_pool = cfg.naver.title_numbers or ["3가지", "5분", "10분", "1번"]
-
-    n1 = random.choice(num_pool)
-    quoted_bits = [
-        "이 한 줄",
-        "딱 한 가지",
-        "가장 많이 갈리는 지점",
-        "진짜 핵심",
-        "의외로 쉬운 기준",
-        "실패가 줄어드는 포인트",
+    weights = [
+        ("benefit", 30),
+        ("threat", 20),
+        ("curiosity", 35),
+        ("compare", 15),
     ]
-    q = random.choice(quoted_bits)
+    t = _pick_weighted(weights)
 
-    if is_fin:
-        benefit = [
-            f"{k} 이번달 신청한 사람만 '조건별 혜택'에서 갈립니다",
-            f"{k} {n1}만 체크했는데도 체감이 달라지더라고요",
-            f"월급이 평범해도 {k}로 '흐름'이 바뀌는 경우가 있어요",
-        ]
-        threat = [
-            f"{k} 잘못 고르면 '혜택'이 줄어드는 경우가 있어요 저도 처음엔 헷갈렸어요",
-            f"{k} 자동이체 놓치면 '조건'에서 손해 보는 분들이 있더라고요",
-            f"친구는 웃는데 나는 후회중 {k} {q} 차이였어요",
-        ]
-        curiosity = [
-            f"{k} 해지하면 손해일까 {q}만 알면 정리가 돼요",
-            f"친구는 이득 보고 나는 그대로 {k} 차이점이 뭐길래",
-            f"{k} 가입한 사람들 {n1} 지나면 제일 먼저 보는 게 있더라고요",
-        ]
-        compare = [
-            f"{k} vs 청년내일저축계좌 진짜 '돈 되는 쪽'은 따로 있어요",
-            f"{k} 선택한 사람들 {n1} 뒤 '잔액 차이'로 놀라는 경우가 있어요",
-            f"직장인 친구는 적금 저는 {k} 누가 더 맞을까요",
-        ]
-    else:
-        benefit = [
-            f"{k} 오늘은 {q}만 잡으면 '실패 확률'이 확 줄어요",
-            f"{k} {n1}만 챙겼더니 맛이 안정되는 느낌이었어요",
-            f"{k} 재료는 평범한데 결과가 다른 이유 {q}에 있어요",
-        ]
-        threat = [
-            f"{k} 여기서 급하면 맛이 무너져요 {q} 때문에요",
-            f"{k} 순서 한 번만 틀려도 '물맛' 나는 경우가 많더라고요",
-            f"친구는 맛있다는데 나는 아쉬웠던 날 {k} {q} 차이였어요",
-        ]
-        curiosity = [
-            f"{k} 왜 자꾸 아쉬울까 {q}만 잡으면 정리가 돼요",
-            f"{k} 실패는 어디서 나올까 보통 {q}에서 갈리더라고요",
-            f"{k} {n1} 지나도 자꾸 떠오르는 이유가 있어요",
-        ]
-        compare = [
-            f"{k} vs {random.choice(['에어프라이어','프라이팬','냄비'])} 진짜 쉬운 쪽은 따로 있어요",
-            f"{k} 집에서 한 사람들 {n1} 뒤 '차이'에 놀라는 포인트가 있어요",
-            f"친구는 간단 버전 저는 {k} 기본 버전 누가 더 잘 맞을까요",
-        ]
+    benefits = [
+        f"{kw} 이거 하나만 바꾸면 맛이 확 달라져요",
+        f"{kw} 처음부터 완벽 말고 이 기준만 잡아도 돼요",
+        f"{kw} 집에서 자주 하는데도 실패 줄인 포인트 1개",
+    ]
+    threats = [
+        f"{kw} 여기서 실수하면 맛이 갑자기 무너져요",
+        f"{kw} 순서만 헷갈리면 밍밍해지기 쉬워요",
+        f"{kw} 간 잡는 타이밍 놓치면 한 번에 흔들려요",
+    ]
+    curios = [
+        f"{kw} 왜 자꾸 밍밍할까 의외로 여기였어요",
+        f"{kw} 유독 맛이 들쭉날쭉한 이유 딱 한 군데",
+        f"{kw} 사람들이 헷갈리는 포인트 제가 한 번 정리해요",
+    ]
+    compares = [
+        f"{kw} vs 비슷한 메뉴 집에서 더 쉬운 쪽은",
+        f"{kw} 밖에서 먹는 맛이랑 다른 이유 비교해보면 보여요",
+        f"{kw} 비슷한 재료인데 결과가 갈리는 지점은 여기",
+    ]
 
-    pick_map = {
-        "benefit": benefit,
-        "threat": threat,
-        "curiosity": curiosity,
-        "compare": compare,
-    }
-    title = random.choice(pick_map.get(chosen, curiosity))
-    title = _remove_periods(title)
-    if len(title) > 52:
-        title = title[:52].strip()
-    return title
+    pool = benefits if t == "benefit" else threats if t == "threat" else curios if t == "curiosity" else compares
+    title = random.choice(pool)
+
+    # 랜덤 레벨이 높을수록 약간의 후킹 장치 추가
+    if random_level >= 2:
+        tails = [
+            "저도 여기서 많이 흔들렸어요",
+            "이거 알면 다음엔 훨씬 편해요",
+            "저장해두면 진짜 도움돼요",
+        ]
+        if random.random() < 0.55:
+            title = f"{title} {random.choice(tails)}"
+    return title.replace(".", "").strip()
 
 
 # -----------------------------
-# Optional: Pexels thumbnail
+# Readability helpers (HTML spacing)
 # -----------------------------
-def pexels_search_image(api_key: str, query: str, style: str = "clean", debug: bool = False) -> Optional[str]:
-    if not api_key:
-        return None
+def wrap_readable(html: str) -> str:
+    """
+    문단 간격과 행간을 강제로 줘서
+    네이버에서 복붙했을 때도 읽기 편하게
+    """
+    html = (html or "").strip()
+    if not html:
+        return html
+    if "<div data-wrap=" in html:
+        return html
+    return (
+        "<div data-wrap='1' style=\"line-height:1.9;font-size:16px;letter-spacing:-0.2px;word-break:keep-all;\">"
+        + html
+        + "</div>"
+    )
 
-    style_map = {
-        "clean": "clean food minimal",
-        "minimal": "minimal food",
-        "white": "food white background",
-        "topview": "food top view minimal",
-    }
-    q = (query or "food").strip()
-    q2 = style_map.get(style, style_map["clean"])
-    full_query = f"{q} {q2}"
 
-    url = "https://api.pexels.com/v1/search"
-    headers = {"Authorization": api_key}
-    params = {"query": full_query, "per_page": 10, "orientation": "landscape"}
-    try:
-        r = requests.get(url, headers=headers, params=params, timeout=25)
-        if r.status_code != 200:
-            if debug:
-                print("[PEXELS] search failed:", r.status_code, r.text[:200])
-            return None
-        j = r.json()
-        photos = j.get("photos") or []
-        candidates = []
-        for p in photos:
-            src = p.get("src") or {}
-            u = src.get("large2x") or src.get("large") or src.get("original")
-            if u:
-                candidates.append(u)
-        if not candidates:
-            return None
-        return random.choice(candidates)
-    except Exception as e:
-        if debug:
-            print("[PEXELS] error:", repr(e))
-        return None
+def strip_tags(text: str) -> str:
+    t = re.sub(r"<[^>]+>", " ", text or "")
+    t = re.sub(r"\s+", " ", t).strip()
+    return t
+
+
+def count_chars_no_space(text: str) -> int:
+    return len(re.sub(r"\s+", "", text or ""))
+
+
+def extract_intro_and_sections(body_html: str) -> Tuple[str, List[str]]:
+    """
+    <p data-intro="1">...</p>
+    <div data-sec="1">...</div> 3개
+    """
+    intro = ""
+    m = re.search(r"<p[^>]*data-intro=['\"]1['\"][^>]*>(.*?)</p>", body_html, flags=re.S | re.I)
+    if m:
+        intro = strip_tags(m.group(1))
+
+    sections: List[str] = []
+    for i in (1, 2, 3):
+        mm = re.search(rf"<div[^>]*data-sec=['\"]{i}['\"][^>]*>(.*?)</div>", body_html, flags=re.S | re.I)
+        if mm:
+            sections.append(strip_tags(mm.group(1)))
+        else:
+            sections.append("")
+    return intro, sections
+
+
+def validate_longform(body_html: str) -> Tuple[bool, str]:
+    intro, secs = extract_intro_and_sections(body_html)
+    intro_len = count_chars_no_space(intro)
+    sec_lens = [count_chars_no_space(s) for s in secs]
+    total_len = count_chars_no_space(strip_tags(body_html))
+
+    # 사용자가 준 스펙
+    if not (200 <= intro_len <= 330):
+        return False, f"intro_len={intro_len} not in 200~330"
+    if any(l < 1500 for l in sec_lens):
+        return False, f"section_len={sec_lens} require each>=1500"
+    if total_len < 2300:
+        return False, f"total_len={total_len} require>=2300"
+    return True, "ok"
+
+
+def build_ingredients_html(cfg: AppConfig, recipe: Dict[str, Any]) -> str:
+    """
+    재료 목록은 모델 출력과 무관하게 항상 삽입
+    이름은 가능한 경우에만 무료 번역으로 살짝 한글화
+    """
+    items = []
+    for it in recipe.get("ingredients", []):
+        name_en = (it.get("name") or "").strip()
+        mea = (it.get("measure") or "").strip()
+        if not name_en:
+            continue
+        # 번역은 best-effort
+        name_ko = free_translate_text(cfg.free_tr, name_en, debug=cfg.run.debug)
+        if name_ko and name_ko.lower() != name_en.lower():
+            label = f"{name_ko} ({name_en})"
+        else:
+            label = name_en
+        if mea:
+            items.append(f"<li style=\"margin:0 0 8px 0;\">{label} <span style='opacity:.75'>— {mea}</span></li>")
+        else:
+            items.append(f"<li style=\"margin:0 0 8px 0;\">{label}</li>")
+
+    if not items:
+        return "<ul data-ingredients='1'><li>재료 정보가 비어있어요</li></ul>"
+
+    return "<ul data-ingredients='1' style=\"margin:10px 0 18px 18px;\">" + "".join(items) + "</ul>"
 
 
 # -----------------------------
-# OpenAI prompt for homefeed-long template
+# Naver-style prompt (homefeed longform + spacing)
 # -----------------------------
-def _build_homefeed_prompt(cfg: AppConfig, recipe: Dict[str, Any], keyword_ko: str, now: datetime) -> Tuple[str, str]:
+def _naver_prompt(cfg: AppConfig, recipe: Dict[str, Any], now: datetime, title_seed: str, ingredients_html: str) -> Tuple[str, str]:
     random_level = cfg.naver.random_level
     exp_level = cfg.naver.experience_level
-    kws = cfg.naver.keywords[:8] if cfg.naver.keywords else []
-    kw_hint = ", ".join(kws) if kws else ""
 
-    openings = [
-        "이 메뉴요  딱히 거창한 날 아니어도 생각나잖아요  그래서 오늘은 어렵게 말 안 하고  진짜 필요한 얘기만 편하게 풀어볼게요",
-        "요즘처럼 기운 없을 때는  복잡한 것보다  실패 확률 낮은 쪽이 마음이 편하더라고요  그래서 이 메뉴를 기준으로 잡아봤어요",
-        "레시피는 많아도  막상 집에서 하면 어딘가 한 끗이 아쉬울 때가 있잖아요  그 지점을 같이 정리해볼게요",
+    hooks = [
+        "레시피는 따라 했는데도 왜 결과가 매번 다르게 나오는지  은근히 신경 쓰이시죠",
+        "똑같은 재료인데 맛이 갈리는 지점이 꼭 있더라고요  그 지점만 잡아도 마음이 편해요",
+        "완벽하게 하려다 오히려 망하는 날이 있어서  저는 기준부터 잡는 쪽으로 바뀌었어요",
+        "이 메뉴  막상 해보면 다들 비슷한 지점에서 흔들리더라고요  그래서 그 부분만 정리해요",
     ]
-    rhythms = [
-        "저는 요리를 볼 때  정답보다  반복 가능한 방식이 먼저라고 생각하거든요",
-        "완벽하게 하려다 오히려 망하는 날이 있어서  저는 기준을 작게 잡는 편이에요",
-        "맛은 결국  내 생활 리듬에 맞아야 오래 가더라고요",
+    one_lines = [
+        "오늘은 상태 기준 하나만 잡고 가요  나머지는 크게 안 흔들려요",
+        "이 글은 재료보다 순서랑 상태 기준에 집중했어요  그게 제일 안정적이더라고요",
+        "실패 포인트만 미리 알고 가면  요리가 훨씬 편해져요",
     ]
-    empathy = [
-        "괜히 급해지면 손이 꼬이는 구간이 있잖아요  그때만 천천히 가면 생각보다 잘 풀려요",
-        "이게 별거 아닌데  한 번만 데이면 다음부터는 습관이 되더라고요",
-        "저도 이런 글 볼 때  너무 교과서 같으면 바로 닫아버리거든요  그래서 말하듯이 써볼게요",
+    points = [
+        "향이 올라오는 타이밍을 기준으로 보기",
+        "수분은 한 번에 늘리지 말고 조금씩 보기",
+        "간은 마지막에 정리한다는 마음으로 보기",
+        "재료 크기를 맞춰서 익는 속도를 맞추기",
+        "완성 직전 식감에서 한 번 더 확인하기",
     ]
+    hook_seed = random.choice(hooks)
+    one_seed = random.choice(one_lines)
+    point_seed = random.choice(points)
 
-    seed_open = random.choice(openings)
-    seed_rhythm = random.choice(rhythms)
-    seed_empathy = random.choice(empathy)
+    kw_list = [k.strip() for k in (cfg.naver.keywords_csv or "").split(",") if k.strip()]
+    kw_hint = ", ".join(kw_list[:6]) if kw_list else ""
 
     steps_en = split_steps(recipe.get("instructions", ""))
-    payload = {
-        "keyword_ko": keyword_ko,
-        "recipe_title_en": recipe.get("title", ""),
+
+    payload_recipe = {
+        "title_en": recipe.get("title", ""),
         "category_en": recipe.get("category", ""),
         "area_en": recipe.get("area", ""),
         "ingredients": recipe.get("ingredients", []),
         "steps_en": steps_en,
         "source_url": recipe.get("source", ""),
         "youtube": recipe.get("youtube", ""),
-        "constraints": {
-            "intro_chars": [200, 300],
-            "section_min_chars": 1500,
-            "section_count": 3,
-            "total_min_chars": 2300,
-            "no_period": True,
-            "tone": "친구에게 수다 떠는 존댓말",
-        },
-        "seed": {
+        "naver_style": {
             "random_level": random_level,
             "experience_level": exp_level,
-            "opening": seed_open,
-            "rhythm": seed_rhythm,
-            "empathy": seed_empathy,
+            "hook_seed": hook_seed,
+            "one_seed": one_seed,
+            "point_seed": point_seed,
+            "title_seed": title_seed,
             "keywords_hint": kw_hint,
-            "season": now.astimezone(KST).strftime("%m월"),
+            "season_hint": now.astimezone(KST).strftime("%m월"),
+            "ingredients_html": ingredients_html,
+            "steps_count": len(steps_en),
         },
     }
 
     instructions = f"""
-너는 한국어 블로그 글을 쓰는 사람이다  독자와 친구처럼 수다 떠는 존댓말로 쓴다
+너는 한국어 블로그 글을 쓰는 사람이다  친구에게 진심 담아 수다 떠는 존댓말로 써라
 
 [절대 규칙]
-- 마침표 문자 . 을 쓰지 마  문장 끝도 마침표로 끝내지 마
-- 가능하면 물음표  느낌표도 최소로  대신 줄바꿈과 여백으로 호흡을 만들어
-- "오늘 해먹어봤는데"  "제가 해보니" 처럼 실제 체험을 단정하지 마  대신 "집에서 해보면"  "보통은"  "저는 이런 기준을 좋아해요" 같은 말로 현장감만 만들어
-- 제공된 ingredients 와 steps_en 기반으로만 요리 내용 구성  재료  계량  단계 수를 추가 삭제 변경하지 마
-- 시간  온도  숫자는 원문에 없으면 단정하지 마  필요하면 "상태를 보며"로 표현
-- AI  챗GPT  자동생성 같은 단어를 본문에 쓰지 마
+- 너는 실제로 조리해본 적이 없다  그래서 "오늘 해먹어봤는데" "제가 해보니" 같은 체험 단정은 금지
+- 대신 "집에서 해보면" "보통 이 지점에서" "상태를 이렇게 보면" 같은 현장감 표현은 허용
+- 제공된 ingredients 와 steps 외 재료 계량 단계 추가 삭제 변경 금지
+- 원문에 없는 시간 온도 숫자 단정 금지  필요하면 "상태를 보며"로 표현
+- 마침표(., 。) 사용 금지  문장 호흡은 줄바꿈과 여백으로 조절
+- 과한 광고 말투 과한 이모지 AI티 문구 금지
 
-[출력 형식  HTML만]
-- 첫 줄에 제목을 쓰지 마  본문 HTML만 출력해
-- 도입부는 <p> 한 블록  텍스트 길이 200~300자 사이
-- 굵은 소제목 3개  각 소제목은 <h2><b>제목</b></h2> 형태
-- 각 소제목 아래 본문은 길게  최소 1500자 이상  <p> 와 <br/> 로 리듬 있게
-- 3번째 소제목 섹션 말미에 자연스럽게 한 번만  저장해두면 편하다는 뉘앙스 한 문장
-- 마지막에 출처는 아주 짧게  <p style='opacity:.6;font-size:13px;'> 로 링크 있으면 넣기
-- 전체는 자연스러운 사람 글  뻔한 교과서 톤 금지  반복 문구 금지
+[가독성 규칙]
+- 문단은 짧게  한 문단 2~4줄 정도
+- 문단 사이 여백을 확실히  <p> 를 자주 쓰고  문단 안에서는 <br/><br/> 로 호흡을 둬라
+- 전체를 <div data-wrap='1' style="line-height:1.9;font-size:16px;"> 로 감싸라
 
-[내용 구성 가이드]
-1) 도입  seed opening 과 rhythm 을 자연스럽게 섞기
-2) 소제목 1  가치관  상황  왜 이 메뉴가 편해지는지  감정  루틴 중심
-3) 소제목 2  실패 포인트  상태 기준  steps_en 을 순서대로 녹여서 흐름 설명  단계 수는 동일
-4) 소제목 3  내 생활에 맞게 유지하는 방법  작은 체크리스트  마무리 수다  seed empathy 섞기  키워드 힌트 있으면 과하지 않게 한 번만
+[형식 요구]
+- 도입부는 200~300자(공백 제외)  반드시 <p data-intro="1"> 로 감싼다
+- 굵은 소제목 3개  각 섹션은 공백 제외 1500자 이상  반드시 <div data-sec="1"> 2 3 로 감싼다
+- 총 글자수는 2300자 이상
+- 각 섹션 맨 위에는 반드시 굵은 제목을 <p><strong>...</strong></p> 로 넣어라
 
-[Seed]
-opening  {seed_open}
-rhythm   {seed_rhythm}
-empathy  {seed_empathy}
-keywords_hint  {kw_hint}
+[재료 목록]
+- 재료 목록은 아래 HTML 을 그대로 삽입해라  수정 금지
+{ingredients_html}
+
+[조리 과정]
+- steps_en 의 개수만큼만 <li> 를 만들어라  개수는 반드시 동일
+- <ol data-steps="1"> 로 감싸라
+- 각 <li> 안에
+  1) 원문 step 의미를 자연스럽게 한국어로 풀어쓴 문장
+  2) 같은 <li> 안에 <div style='font-size:13px;opacity:.82;margin-top:10px;'>실패 포인트: ...<br/><br/>상태 기준: ...</div> 한 줄을 넣어라
+
+[제목]
+- 첫 줄은 제목만 출력
+- 제목은 아래 Seed 를 기반으로 하되  키워드를 맨 앞에 두고 과자극 금지  26~46자
+- Seed: {title_seed}
+
+[출력]
+- 첫 줄: 제목
+- 둘째 줄부터: HTML만 출력
 """.strip()
 
-    user_input = "JSON:\n" + json.dumps(payload, ensure_ascii=False)
+    user_input = "레시피 JSON:\n" + json.dumps(payload_recipe, ensure_ascii=False, indent=2)
     return instructions, user_input
 
 
-def _extract_sections_and_validate(html_body: str) -> Tuple[bool, Dict[str, int], str]:
-    body = html_body or ""
-    parts = re.split(r"(<h2[^>]*>.*?</h2>)", body, flags=re.IGNORECASE | re.DOTALL)
-    intro = parts[0] if parts else body
-    ok = True
-    metrics = {}
+# -----------------------------
+# Fallback (free translate)  가독성/재료 포함
+# -----------------------------
+def build_korean_simple_with_free_translate(
+    cfg: AppConfig,
+    recipe: Dict[str, Any],
+    now: datetime,
+    title_seed: str,
+    ingredients_html: str,
+) -> Tuple[str, str]:
+    title_en = recipe.get("title", "Daily Recipe")
+    title_ko = free_translate_text(cfg.free_tr, title_en, debug=cfg.run.debug) or title_en
 
-    intro_txt = _strip_tags(intro)
-    metrics["intro"] = len(intro_txt)
-    if not (200 <= len(intro_txt) <= 320):
-        ok = False
-
-    sections = []
-    i = 0
-    while i < len(parts):
-        if parts[i].lower().startswith("<h2"):
-            h = parts[i]
-            sec = parts[i + 1] if i + 1 < len(parts) else ""
-            sections.append(h + sec)
-            i += 2
-        else:
-            i += 1
-
-    if len(sections) < 3:
-        ok = False
-
-    for idx in range(3):
-        txt = _strip_tags(sections[idx]) if idx < len(sections) else ""
-        metrics[f"section{idx+1}"] = len(txt)
-        if len(txt) < 1500:
-            ok = False
-
-    if "." in body:
-        ok = False
-
-    return ok, metrics, body
-
-
-def _fallback_long_html(cfg: AppConfig, recipe: Dict[str, Any], keyword_ko: str, now: datetime) -> str:
-    title_en = recipe.get("title", "") or "Recipe"
-    steps_en = split_steps(recipe.get("instructions", ""))[:20]
-    k = keyword_ko or title_en
-
-    intro = (
-        f"{k} 얘기요  요리 글은 많은데  막상 집에서 하면 한 끗이 아쉬울 때가 있잖아요  "
-        f"그래서 오늘은 어렵게 말 안 하고  실패가 줄어드는 기준만 친구한테 수다 떨듯이 정리해볼게요  "
-        f"상태를 보면서 천천히 가면  생각보다 편하게 끝나더라고요"
-    )
-    intro = intro[:280]
-    intro = _remove_periods(intro)
-
-    def para(lines: List[str]) -> str:
-        s = "<br/><br/>".join([html.escape(_remove_periods(x)) for x in lines if x.strip()])
-        return f"<p>{s}</p>"
-
-    sec1_lines = [
-        "저는 요리를 할 때  완벽한 정답보다  반복 가능한 방식이 먼저라고 생각해요",
-        "특히 바쁜 날에는  레시피를 외우기보다  내 눈으로 상태를 보고 조절하는 쪽이 마음이 편하더라고요",
-        "그래서 이 메뉴도  크게 두 가지로만 나눠서 봐요  처음에 흐름을 잡는 구간  그리고 끝에서 맛을 정리하는 구간",
-        "처음에 급해지면 손이 꼬이고  끝에서 욕심내면 과해지는 경우가 많아서요",
-        "제가 좋아하는 기준은 단순해요  지금 냄새가 올라오나  질감이 붙기 시작했나  물기가 남았나  이 정도만 체크해요",
-        "이렇게 기준을 작게 잡아두면  중간에 변수가 생겨도 다시 돌아오기가 쉽더라고요",
-        "오늘은 그 느낌으로  편하게 끝까지 가는 흐름을 같이 잡아볼게요",
-    ]
-    fillers1 = [
-        "재료가 조금 달라도 괜찮아요  다만 같은 재료는 크기를 비슷하게 맞추면 흐름이 안정돼요",
-        "간은 중간에 급하게 잡기보다  마지막에 정리하는 편이 실패가 줄어요  특히 짠맛은 되돌리기 어렵잖아요",
-        "수분은 한 번에 늘리지 말고  조금씩 보면서 맞추면 마음이 편해요",
-        "불은 숫자보다 소리로 듣는 편이에요  지글지글이 너무 거칠면 조금만 낮추고  너무 조용하면 살짝 올리고요",
-        "한 번에 대단하게 하려고 하면 늘 지치더라고요  그래서 저는 부담 안 되는 루틴이 오래 간다고 믿는 편이에요",
-        "지금부터는 단계 흐름을 같이 볼 건데요  단계는 그대로 두고  실패 포인트만 덧붙여볼게요",
-    ]
-    while len(_strip_tags("<br/>".join(sec1_lines))) < 1550:
-        sec1_lines.append(random.choice(fillers1))
-
-    sec2_lines = ["여기부터는 단계 흐름이에요  레시피 단계는 그대로 따라가되  중간중간 상태 기준만 붙여볼게요"]
-    for i, st in enumerate(steps_en[:12], start=1):
-        st_clean = st.strip()
-        if not st_clean:
-            continue
-        sec2_lines.append(f"{i}단계  {st_clean}")
-        sec2_lines.append("실패 포인트는 급하게 넘기는 거예요  상태 기준은 냄새와 질감이 한 번 변하는 타이밍을 느끼는 거고요")
-        sec2_lines.append("만약 물기가 애매하면  바로 더 넣지 말고  잠깐 기다렸다가 결정하면 실수가 줄어요")
-    fillers2 = [
-        "색이 진해지는 순간이 오면  그때부터는 금방 진행되니까  그 전까지만 천천히 가면 돼요",
-        "향이 올라오면  이미 반은 성공한 거예요  그때부터는 과하지 않게만 정리하면 됩니다",
-        "재료가 바닥에 붙기 시작하면  불을 조금 낮추고  뒤집는 타이밍을 늘려보면 좋아요",
-        "간이 불안하면  바로 더 넣지 말고  한 숟갈 떠서 식혀서 맛보는 편이 안정적이에요",
-        "식감은 완성 직전이 갈림길이에요  부드럽게 갈지  살아 있게 갈지  내 취향을 하나만 정하면 됩니다",
-    ]
-    while len(_strip_tags("<br/>".join(sec2_lines))) < 1550:
-        sec2_lines.append(random.choice(fillers2))
-
-    sec3_lines = [
-        "마지막은 제일 현실적인 얘기요  이 메뉴를 꾸준히 하려면  내 생활에 맞게 기준을 낮춰야 하더라고요",
-        "그래서 저는 체크리스트를 작게 잡아요  오늘은 이것만 지키자  이렇게요",
-        "제가 자주 쓰는 작은 체크리스트예요",
-        "재료 크기만 비슷하게 맞추기",
-        "중간에 간을 급하게 잡지 않기",
-        "물기는 조금씩 조절하기",
-        "향이 올라오는 타이밍 놓치지 않기",
-        "완성 직전에 식감만 한 번 결정하기",
-        "이렇게만 해도  이상하게 마음이 편해져요  뭔가 내 기준이 생긴 느낌이거든요",
-        "다음에 메뉴 고민될 때  이 글 저장해두면  필요한 부분만 쓱 보고 다시 시작하기 편하실 거예요",
-    ]
-    fillers3 = [
-        "완벽한 한 번보다  무난하게 여러 번이 더 힘이 됩니다  그게 진짜 내 편이 되는 느낌이거든요",
-        "혹시 오늘은 기운이 없으면  단계 중에 한 번만 천천히 해도 충분해요  그 한 번이 결과를 바꿔요",
-        "요리는 결국 내 삶을 덜 힘들게 하려고 하는 거잖아요  그래서 저는 부담 안 되는 쪽을 선택하는 걸 더 좋아해요",
-    ]
-    while len(_strip_tags("<br/>".join(sec3_lines))) < 1550:
-        sec3_lines.append(random.choice(fillers3))
+    steps_en = split_steps(recipe.get("instructions", ""))
+    step_lines = []
+    for s in steps_en:
+        ko = free_translate_text(cfg.free_tr, s, debug=cfg.run.debug) or s
+        # 마침표 제거(문장 끝에 있는 것만 가볍게)
+        ko = ko.replace(".", "").replace("。", "")
+        step_lines.append(
+            "<li style=\"margin:0 0 14px 0;\">"
+            + f"{ko}<div style='font-size:13px;opacity:.82;margin-top:10px;'>실패 포인트: 상태를 보며 천천히<br/><br/>상태 기준: 향과 농도를 먼저 확인</div>"
+            + "</li>"
+        )
 
     src = (recipe.get("source") or "").strip()
     yt = (recipe.get("youtube") or "").strip()
-    src_html = "-"
-    if src:
-        src_html = f"<a href='{html.escape(src)}' target='_blank' rel='nofollow noopener'>source</a>"
-    elif yt:
-        src_html = f"<a href='{html.escape(yt)}' target='_blank' rel='nofollow noopener'>youtube</a>"
 
-    body = "\n".join([
-        para([intro]),
-        f"<h2><b>{html.escape(_remove_periods('이 메뉴를 편하게 만드는 기준'))}</b></h2>",
-        para(sec1_lines),
-        f"<h2><b>{html.escape(_remove_periods('실패 포인트와 상태 기준  흐름대로'))}</b></h2>",
-        para(sec2_lines),
-        f"<h2><b>{html.escape(_remove_periods('내 생활에 맞게 계속 가는 방법'))}</b></h2>",
-        para(sec3_lines),
-        f"<p style='opacity:.6;font-size:13px;'>출처  {src_html}  {now.astimezone(KST).strftime('%Y-%m-%d')}</p>",
-    ])
-    body = _remove_periods(body)
-    body = _safe_space_rhythm(body)
-    return body
+    body = f"""
+<div data-wrap='1' style="line-height:1.9;font-size:16px;letter-spacing:-0.2px;word-break:keep-all;">
+  <p data-intro="1" style="margin:0 0 18px 0;">
+    오늘은 너무 어렵게 말고  흐름만 잡고 가는 레시피로 정리해볼게요<br/><br/>
+    재료는 아래 목록 기준으로 보고  과정은 상태를 보면서 따라가면 됩니다
+  </p>
+
+  <div data-sec="1">
+    <p style="margin:0 0 14px 0;"><strong>재료 먼저 보고 마음을 가볍게 잡는 쪽으로요</strong></p>
+    <p style="margin:0 0 18px 0;">
+      저는 레시피를 볼 때  재료부터 훑고 나서 마음을 정리하는 편이에요<br/><br/>
+      막상 해보면  재료가 복잡해서가 아니라  중간에 급해져서 흔들리는 경우가 많더라고요
+    </p>
+    {ingredients_html}
+    <p style="margin:0 0 18px 0;">
+      이 메뉴는 완벽하게 하려는 순간부터 손이 꼬일 수 있어서  기준만 잡고 가는 게 편합니다<br/><br/>
+      오늘은 내 입맛에 맞게  마지막에만 조절한다  이 마음으로 시작해보시면 좋아요
+    </p>
+  </div>
+
+  <div data-sec="2">
+    <p style="margin:0 0 14px 0;"><strong>만드는 과정은 단계보다 상태가 더 중요하더라고요</strong></p>
+    <p style="margin:0 0 18px 0;">
+      시간 온도 숫자보다  향  농도  식감  이런 상태가 훨씬 정확할 때가 많아요<br/><br/>
+      아래 과정은 순서 그대로 따라가되  중간중간 잠깐 멈추고 상태를 확인하는 느낌으로 가면 안정적입니다
+    </p>
+    <ol data-steps="1" style="margin:10px 0 18px 18px;">
+      {''.join(step_lines)}
+    </ol>
+  </div>
+
+  <div data-sec="3">
+    <p style="margin:0 0 14px 0;"><strong>마무리는 내 입맛 기준 하나만 남겨두면 다음이 편해요</strong></p>
+    <p style="margin:0 0 18px 0;">
+      저는 요리에서 가장 좋은 변화가  다음에 다시 할 수 있을 만큼 부담이 줄어드는 거라고 생각해요<br/><br/>
+      그래서 한 번 만들 때도  완벽보다  내가 다음에 또 할 수 있는 흐름을 남겨두는 편이에요
+    </p>
+    <p style="margin:0 0 18px 0;">
+      다음에 하실 때는  간을 어디서 잡는지  딱 그 지점만 메모해두면  그 다음부터 훨씬 편해집니다<br/><br/>
+      혹시 {title_ko} 하실 때  가장 헷갈리는 포인트가 뭐였는지  친구처럼 한 번 얘기해주시면 저도 참고할게요
+    </p>
+    <p style="opacity:.65;font-size:13px;margin:0 0 10px 0;">
+      출처: {f"<a href='{src}' target='_blank' rel='nofollow noopener'>{src}</a>" if src else "-"}
+      {" | " + f"<a href='{yt}' target='_blank' rel='nofollow noopener'>YouTube</a>" if yt else ""}
+    </p>
+  </div>
+</div>
+""".strip()
+
+    # 제목은 Seed 우선
+    title_final = (title_seed or f"{title_ko} 레시피").replace(".", "").replace("。", "")
+    return title_final, body
 
 
 # -----------------------------
-# Main flow helpers
+# Recipe pick
 # -----------------------------
 def pick_recipe(cfg: AppConfig, existing: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     if existing and existing.get("recipe_id") and not cfg.run.force_new:
         return fetch_recipe_by_id(str(existing["recipe_id"]))
 
     recent_ids = set(get_recent_recipe_ids(cfg.sqlite_path, cfg.run.avoid_repeat_days))
+    prefer_areas = set([a.lower() for a in (cfg.naver.prefer_areas or [])])
 
     for _ in range(max(1, cfg.run.max_tries)):
         cand = fetch_random_recipe()
@@ -1084,62 +982,13 @@ def pick_recipe(cfg: AppConfig, existing: Optional[Dict[str, Any]]) -> Dict[str,
             continue
         if rid in recent_ids:
             continue
+        if prefer_areas:
+            area = (cand.get("area") or "").strip().lower()
+            if area and (area not in prefer_areas):
+                continue
         return cand
 
-    raise RuntimeError("레시피를 가져오지 못했습니다(중복 회피/시도 횟수 초과).")
-
-
-def pick_thumbnail_url(cfg: AppConfig, recipe: Dict[str, Any], keyword_ko: str) -> str:
-    thumb = (recipe.get("thumb") or "").strip()
-    if cfg.thumb.provider == "pexels" and cfg.thumb.pexels_api_key:
-        q = keyword_ko or (recipe.get("title") or "food")
-        u = pexels_search_image(cfg.thumb.pexels_api_key, q, style=cfg.thumb.pexels_style, debug=cfg.run.debug)
-        if u:
-            return u
-    return thumb
-
-
-def generate_homefeed_body_openai(cfg: AppConfig, recipe: Dict[str, Any], keyword_ko: str, now: datetime) -> str:
-    client = OpenAI(api_key=cfg.openai.api_key)
-    inst, user_in = _build_homefeed_prompt(cfg, recipe, keyword_ko, now)
-
-    for attempt in range(4):
-        resp = _openai_call_with_retry(
-            client=client,
-            model=cfg.openai.model,
-            instructions=inst,
-            input_text=user_in,
-            max_retries=cfg.run.openai_max_retries,
-            debug=cfg.run.debug,
-        )
-        text = (resp.output_text or "").strip()
-        text = _remove_periods(text)
-        text = _safe_space_rhythm(text)
-
-        ok, metrics, body = _extract_sections_and_validate(text)
-        if cfg.run.debug:
-            print("[VALIDATE] attempt", attempt + 1, metrics, "ok=", ok)
-        if ok:
-            return body
-
-        cfg.naver.random_level = max(0, min(3, cfg.naver.random_level + (1 if attempt == 1 else 0)))
-        inst, user_in = _build_homefeed_prompt(cfg, recipe, keyword_ko, now)
-
-    return text
-
-
-def ko_keyword_from_recipe(cfg: AppConfig, recipe: Dict[str, Any]) -> str:
-    if cfg.naver.keywords:
-        return cfg.naver.keywords[0]
-
-    title_en = (recipe.get("title") or "").strip()
-    if not title_en:
-        return "오늘 레시피"
-    ko = free_translate_text(cfg.free_tr, title_en, debug=cfg.run.debug) if cfg.free_tr.url else title_en
-    ko = re.sub(r"\s+", " ", (ko or "").strip())
-    if len(ko) > 18:
-        ko = ko[:18].strip()
-    return _remove_periods(ko) or "오늘 레시피"
+    raise RuntimeError("레시피를 가져오지 못했습니다(중복 회피/필터/시도 횟수 초과).")
 
 
 # -----------------------------
@@ -1172,57 +1021,123 @@ def run(cfg: AppConfig) -> None:
     recipe_id = recipe.get("id", "")
     recipe_title_en = recipe.get("title", "") or "Daily Recipe"
 
-    keyword_ko = ko_keyword_from_recipe(cfg, recipe)
+    # 제목 키워드(기본은 레시피명 번역 시도)
+    recipe_title_ko_guess = free_translate_text(cfg.free_tr, recipe_title_en, debug=cfg.run.debug) or recipe_title_en
+    kw_list = [k.strip() for k in (cfg.naver.keywords_csv or "").split(",") if k.strip()]
+    title_keyword = kw_list[0] if kw_list else recipe_title_ko_guess
 
-    hook_title = build_hook_title(keyword_ko, cfg)
+    title_seed = make_hook_title(title_keyword, random_level=cfg.naver.random_level)
+    ingredients_html = build_ingredients_html(cfg, recipe)
 
-    try:
-        body_html = generate_homefeed_body_openai(cfg, recipe, keyword_ko, now)
-    except Exception as e:
-        if _is_insufficient_quota_error(e):
-            print("[WARN] OpenAI quota depleted → fallback long template")
-        else:
-            print("[WARN] OpenAI failed → fallback long template:", repr(e))
-        body_html = _fallback_long_html(cfg, recipe, keyword_ko, now)
-
-    body_html = _remove_periods(body_html)
-
-    thumb_url = pick_thumbnail_url(cfg, recipe, keyword_ko)
-
+    # 썸네일 업로드 (기본: TheMealDB thumb)
     media_id: Optional[int] = None
     media_url: str = ""
+    thumb_url = (recipe.get("thumb") or "").strip()
+
     if cfg.run.upload_thumb and thumb_url:
         try:
-            media_id, media_url = wp_upload_media(cfg.wp, thumb_url, filename_hint=f"thumb-{date_str}-{slot}{suffix}.jpg")
+            media_id, media_url = wp_upload_media(cfg.wp, thumb_url, filename_hint=f"recipe-{date_str}-{slot}{suffix}.jpg")
         except Exception as e:
             if cfg.run.debug:
                 print("[WARN] media upload failed:", repr(e))
 
     featured = media_id if (cfg.run.set_featured and media_id) else None
 
+    # OpenAI: 네이버 홈피드형 글 생성 (글자수/형식 미달 시 재생성)
+    title_ko = ""
+    body_html = ""
+    used_fallback = False
+
+    for attempt in range(max(1, cfg.run.naver_text_tries)):
+        try:
+            client = OpenAI(api_key=cfg.openai.api_key)
+            inst, user_in = _naver_prompt(cfg, recipe, now, title_seed=title_seed, ingredients_html=ingredients_html)
+
+            # attempt 힌트(부족하면 더 늘리게)
+            if attempt > 0:
+                inst = inst + f"\n\n[추가 지시]\n이전 출력이 길이 또는 형식 조건을 못 맞췄다  섹션별 글자수를 더 늘리고  <p> 를 더 자주 써서 여백을 더 줘라"
+
+            resp = _openai_call_with_retry(
+                client=client,
+                model=cfg.openai.model,
+                instructions=inst,
+                input_text=user_in,
+                max_retries=cfg.run.openai_max_retries,
+                debug=cfg.run.debug,
+            )
+
+            text = (resp.output_text or "").strip()
+            lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+            if len(lines) < 2:
+                raise RuntimeError("OpenAI 응답이 너무 짧습니다(제목/본문 분리 실패).")
+
+            title_ko = lines[0].replace(".", "").replace("。", "").strip()
+            body_html = "\n".join(lines[1:]).strip()
+
+            # 가독성 래퍼 강제
+            body_html = wrap_readable(body_html)
+
+            # 재료 목록이 혹시 빠졌으면 강제 삽입(섹션1 앞쪽에 끼워넣기)
+            if "data-ingredients='1'" not in body_html and "data-ingredients=\"1\"" not in body_html:
+                body_html = body_html.replace("</div>", ingredients_html + "</div>", 1)
+
+            ok, reason = validate_longform(body_html)
+            if cfg.run.debug:
+                print(f"[TEXT] validate attempt={attempt+1} ok={ok} reason={reason}")
+            if ok:
+                break
+        except Exception as e:
+            if _is_insufficient_quota_error(e):
+                if cfg.run.debug:
+                    print("[WARN] OpenAI quota depleted")
+                used_fallback = True
+                break
+            if cfg.run.debug:
+                print("[WARN] OpenAI generation failed:", repr(e))
+            # 다음 attempt 재시도
+            if attempt == cfg.run.naver_text_tries - 1:
+                used_fallback = True
+
+    if used_fallback or not body_html:
+        title_ko, body_html = build_korean_simple_with_free_translate(
+            cfg,
+            recipe,
+            now,
+            title_seed=title_seed,
+            ingredients_html=ingredients_html,
+        )
+
+    # 모델 제목이 Seed랑 너무 다르면 Seed로 교체(키워드 선두 보장)
+    if title_keyword and (not title_ko.startswith(title_keyword)):
+        title_ko = title_seed
+
+    # 본문에 이미지 삽입(업로드 성공하면 WP URL 우선)
     if cfg.run.embed_image_in_body:
         img = media_url or thumb_url
         if img:
-            alt = html.escape(_remove_periods(hook_title))
-            body_html = f'<p><img src="{html.escape(img)}" alt="{alt}" style="max-width:100%;height:auto;border-radius:14px;"></p>\n' + body_html
+            img_block = (
+                f"<p style=\"margin:0 0 18px 0;\">"
+                f"<img src=\"{img}\" alt=\"{title_ko}\" style=\"max-width:100%;height:auto;border-radius:12px;\"/>"
+                f"</p>"
+            )
+            body_html = body_html.replace("<div data-wrap='1'", img_block + "<div data-wrap='1'", 1)
 
-    wp_title = _remove_periods(f"{date_str} {slot_label} | {hook_title}")
+    title = f"{date_str} {slot_label} 레시피 | {title_ko}".replace("..", ".").strip()
 
     if cfg.run.dry_run:
-        print("[DRY_RUN] 발행 생략 미리보기")
-        print("TITLE:", wp_title)
+        print("[DRY_RUN] 발행 생략. 미리보기 ↓")
+        print("TITLE:", title)
         print("SLUG:", slug)
-        ok, metrics, _ = _extract_sections_and_validate(body_html)
-        print("[BODY_VALIDATE]", metrics, "ok=", ok)
-        print(body_html[:2000] + ("\n...(truncated)" if len(body_html) > 2000 else ""))
+        print(body_html[:2500] + ("\n...(truncated)" if len(body_html) > 2500 else ""))
         return
 
+    # 발행/업데이트
     if wp_post_id and not cfg.run.force_new:
-        new_id, wp_link = wp_update_post(cfg.wp, wp_post_id, wp_title, body_html, featured_media=featured)
+        new_id, wp_link = wp_update_post(cfg.wp, wp_post_id, title, body_html, featured_media=featured)
         save_post_meta(cfg.sqlite_path, date_key, slot, recipe_id, recipe_title_en, new_id, wp_link, media_id, media_url)
         print("OK(updated):", new_id, wp_link)
     else:
-        new_id, wp_link = wp_create_post(cfg.wp, wp_title, slug, body_html, featured_media=featured)
+        new_id, wp_link = wp_create_post(cfg.wp, title, slug, body_html, featured_media=featured)
         save_post_meta(cfg.sqlite_path, date_key, slot, recipe_id, recipe_title_en, new_id, wp_link, media_id, media_url)
         print("OK(created):", new_id, wp_link)
 
