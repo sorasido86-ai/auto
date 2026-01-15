@@ -1,0 +1,55 @@
+name: Daily Recipe to WordPress (Naver-friendly)
+
+on:
+  workflow_dispatch:
+  schedule:
+    # 매일 09:10 KST = 00:10 UTC
+    - cron: "10 0 * * *"
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run bot
+        env:
+          WP_BASE_URL: ${{ secrets.WP_BASE_URL }}
+          WP_USER: ${{ secrets.WP_USER }}
+          WP_APP_PASS: ${{ secrets.WP_APP_PASS }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+
+          # 선택(원하면 Secrets 또는 여기 고정)
+          WP_STATUS: publish
+          WP_CATEGORY_IDS: "7"
+          # WP_TAG_IDS: "1,2,3"
+
+          RUN_SLOT: day
+          STRICT_KOREAN: "1"
+          PREFER_KOREAN_AREA: "1"
+          NAVER_COPY_MODE: "1"
+          # DEFAULT_THUMB_URL: "https://.../default.jpg"
+
+          SQLITE_PATH: data/daily_recipe.sqlite3
+          DEBUG: "0"
+        run: |
+          mkdir -p data
+          python daily_recipe_to_wp_naver.py
+
+      - name: Upload sqlite artifact (optional)
+        uses: actions/upload-artifact@v4
+        with:
+          name: daily_recipe_sqlite
+          path: data/daily_recipe.sqlite3
+          if-no-files-found: ignore
