@@ -1,9 +1,13 @@
 # -*- coding: utf-8 -*-
 """
-daily_korean_recipe_to_wp.py (완전 통합/완성본)
+daily_korean_recipe_to_wp.py (완전 통합/네이버 친화 강화 버전)
 - "한식 레시피만" 매일 자동 업로드 (WordPress)
 - 1순위: 식품안전나라(식약처) COOKRCP01 OpenAPI 레시피 DB (MFDS_API_KEY 필요)
 - 2순위(폴백): 코드 내장 한식 레시피(한국어)
+
+★ 네이버(블로그) 복사/붙여넣기 최적화(중요)
+- NAVER_STYLE=1: 스타일/스크립트 최소화, 스캔 가능한 구조(요약/체크리스트/FAQ/해시태그/댓글질문) 강화
+- SCHEMA_MODE=comment|script|off (기본 comment): 복붙 시 화면에 안 보이게 주석 처리(네이버에서 script는 제거될 수 있음)
 
 ★ 요청 반영(중요)
 - 레시피 이미지가 비어도 DEFAULT_THUMB_URL 기본 이미지가 반드시 썸네일 후보가 되도록 처리
@@ -46,6 +50,13 @@ OpenAI로 블로거톤 강화(선택):
   - SET_FEATURED=1 (기본 1)
   - EMBED_IMAGE_IN_BODY=1 (기본 1)
   - REUSE_MEDIA_BY_SEARCH=1 (기본 1) : 같은 파일명/검색으로 기존 미디어 재사용(중복 업로드 방지)
+
+네이버형 본문 옵션(추천):
+  - NAVER_STYLE=1 (기본 1)
+  - HASHTAG_COUNT=12 (기본 12)
+  - EMBED_STEP_IMAGES=1 (기본 1) : MFDS 과정이미지 일부 본문에 추가(원격링크)
+  - ADD_FAQ=1 (기본 1)
+  - ADD_INTERNAL_LINKS=1 (기본 1)
 """
 
 from __future__ import annotations
@@ -53,6 +64,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import html
+import json
 import os
 import random
 import re
@@ -216,6 +228,16 @@ class ImageConfig:
 
 
 @dataclass
+class ContentConfig:
+    naver_style: bool = True
+    schema_mode: str = "comment"  # comment|script|off
+    hashtag_count: int = 12
+    embed_step_images: bool = True
+    add_faq: bool = True
+    add_internal_links: bool = True
+
+
+@dataclass
 class OpenAIConfig:
     use_openai: bool = False
     api_key: str = ""
@@ -228,6 +250,7 @@ class AppConfig:
     run: RunConfig
     recipe: RecipeSourceConfig
     img: ImageConfig
+    content: ContentConfig
     openai: OpenAIConfig
     sqlite_path: str
 
@@ -244,6 +267,10 @@ def load_cfg() -> AppConfig:
     run_slot = (_env("RUN_SLOT", "day") or "day").lower()
     if run_slot not in ("day", "am", "pm"):
         run_slot = "day"
+
+    schema_mode = (_env("SCHEMA_MODE", "comment") or "comment").lower()
+    if schema_mode not in ("comment", "script", "off"):
+        schema_mode = "comment"
 
     return AppConfig(
         wp=WordPressConfig(
@@ -272,6 +299,14 @@ def load_cfg() -> AppConfig:
             embed_image_in_body=_env_bool("EMBED_IMAGE_IN_BODY", True),
             default_thumb_url=_env("DEFAULT_THUMB_URL", ""),
             reuse_media_by_search=_env_bool("REUSE_MEDIA_BY_SEARCH", True),
+        ),
+        content=ContentConfig(
+            naver_style=_env_bool("NAVER_STYLE", True),
+            schema_mode=schema_mode,
+            hashtag_count=_env_int("HASHTAG_COUNT", 12),
+            embed_step_images=_env_bool("EMBED_STEP_IMAGES", True),
+            add_faq=_env_bool("ADD_FAQ", True),
+            add_internal_links=_env_bool("ADD_INTERNAL_LINKS", True),
         ),
         openai=OpenAIConfig(
             use_openai=_env_bool("USE_OPENAI", False),
@@ -311,6 +346,8 @@ def print_safe_cfg(cfg: AppConfig) -> None:
     print("[CFG] DEFAULT_THUMB_URL:", "SET" if cfg.img.default_thumb_url else "EMPTY")
     print("[CFG] UPLOAD_THUMB:", cfg.img.upload_thumb, "| SET_FEATURED:", cfg.img.set_featured, "| EMBED_IMAGE_IN_BODY:", cfg.img.embed_image_in_body)
     print("[CFG] REUSE_MEDIA_BY_SEARCH:", cfg.img.reuse_media_by_search)
+    print("[CFG] NAVER_STYLE:", cfg.content.naver_style, "| SCHEMA_MODE:", cfg.content.schema_mode, "| HASHTAG_COUNT:", cfg.content.hashtag_count)
+    print("[CFG] EMBED_STEP_IMAGES:", cfg.content.embed_step_images, "| ADD_FAQ:", cfg.content.add_faq, "| ADD_INTERNAL_LINKS:", cfg.content.add_internal_links)
     print("[CFG] USE_OPENAI:", cfg.openai.use_openai, "| OPENAI_API_KEY:", ok(cfg.openai.api_key), "| OPENAI_MODEL:", cfg.openai.model)
 
 
@@ -431,18 +468,42 @@ def get_recent_recipe_ids(path: str, days: int) -> List[Tuple[str, str]]:
     return out
 
 
+def get_recent_wp_links(path: str, limit: int = 3) -> List[Tuple[str, str]]:
+    con = sqlite3.connect(path)
+    cur = con.cursor()
+    cur.execute(
+        """
+        SELECT wp_link, recipe_title
+        FROM daily_posts
+        WHERE wp_link IS NOT NULL AND wp_link != ''
+        ORDER BY created_at DESC
+        LIMIT ?
+        """,
+        (limit,),
+    )
+    rows = cur.fetchall()
+    con.close()
+    out: List[Tuple[str, str]] = []
+    for link, title in rows:
+        if link:
+            out.append((str(link), str(title or "이전 레시피")))
+    return out
+
+
 # -----------------------------
 # WordPress REST
 # -----------------------------
 def wp_auth_header(user: str, app_pass: str) -> Dict[str, str]:
     token = base64.b64encode(f"{user}:{app_pass}".encode("utf-8")).decode("utf-8")
-    return {"Authorization": f"Basic {token}", "User-Agent": "daily-korean-recipe-bot/1.0"}
+    return {"Authorization": f"Basic {token}", "User-Agent": "daily-korean-recipe-bot/1.1"}
 
 
-def wp_create_post(cfg: WordPressConfig, title: str, slug: str, html_body: str) -> Tuple[int, str]:
+def wp_create_post(cfg: WordPressConfig, title: str, slug: str, html_body: str, excerpt: str = "") -> Tuple[int, str]:
     url = cfg.base_url.rstrip("/") + "/wp-json/wp/v2/posts"
     headers = {**wp_auth_header(cfg.user, cfg.app_pass), "Content-Type": "application/json"}
     payload: Dict[str, Any] = {"title": title, "slug": slug, "content": html_body, "status": cfg.status}
+    if excerpt:
+        payload["excerpt"] = excerpt
     if cfg.category_ids:
         payload["categories"] = cfg.category_ids
     if cfg.tag_ids:
@@ -455,10 +516,12 @@ def wp_create_post(cfg: WordPressConfig, title: str, slug: str, html_body: str) 
     return int(data["id"]), str(data.get("link") or "")
 
 
-def wp_update_post(cfg: WordPressConfig, post_id: int, title: str, html_body: str, featured_media: int = 0) -> Tuple[int, str]:
+def wp_update_post(cfg: WordPressConfig, post_id: int, title: str, html_body: str, featured_media: int = 0, excerpt: str = "") -> Tuple[int, str]:
     url = cfg.base_url.rstrip("/") + f"/wp-json/wp/v2/posts/{post_id}"
     headers = {**wp_auth_header(cfg.user, cfg.app_pass), "Content-Type": "application/json"}
     payload: Dict[str, Any] = {"title": title, "content": html_body, "status": cfg.status}
+    if excerpt:
+        payload["excerpt"] = excerpt
     if featured_media:
         payload["featured_media"] = featured_media
     if cfg.category_ids:
@@ -474,7 +537,6 @@ def wp_update_post(cfg: WordPressConfig, post_id: int, title: str, html_body: st
 
 
 def wp_find_media_by_search(cfg: WordPressConfig, search: str) -> Optional[Tuple[int, str]]:
-    # /wp/v2/media?search=... 로 조회 (중복 업로드 방지용)
     url = cfg.base_url.rstrip("/") + "/wp-json/wp/v2/media"
     headers = wp_auth_header(cfg.user, cfg.app_pass)
     params = {"search": search, "per_page": 10}
@@ -487,7 +549,6 @@ def wp_find_media_by_search(cfg: WordPressConfig, search: str) -> Optional[Tuple
         return None
     if not isinstance(items, list) or not items:
         return None
-    # 가장 첫 항목 사용
     it = items[0]
     mid = int(it.get("id") or 0)
     src = str(it.get("source_url") or "")
@@ -497,7 +558,6 @@ def wp_find_media_by_search(cfg: WordPressConfig, search: str) -> Optional[Tuple
 
 
 def wp_upload_media_from_url(cfg: WordPressConfig, image_url: str, filename: str) -> Tuple[int, str]:
-    # download
     r = requests.get(image_url, timeout=35)
     if r.status_code != 200 or not r.content:
         raise RuntimeError(f"Image download failed: {r.status_code}")
@@ -505,7 +565,6 @@ def wp_upload_media_from_url(cfg: WordPressConfig, image_url: str, filename: str
     content = r.content
     ctype = (r.headers.get("Content-Type", "") or "").split(";")[0].strip().lower()
 
-    # fallback mime
     if not ctype:
         if filename.lower().endswith(".png"):
             ctype = "image/png"
@@ -686,10 +745,53 @@ def get_recipe_by_id(cfg: AppConfig, source: str, recipe_id: str) -> Optional[Re
 
 
 # -----------------------------
-# Blog rendering
+# Blog rendering helpers
 # -----------------------------
 def _esc(s: str) -> str:
     return html.escape(s or "")
+
+
+def _clean_title_for_tags(title: str) -> List[str]:
+    t = re.sub(r"[^0-9가-힣a-zA-Z\s]", " ", title or "")
+    toks = [x.strip() for x in t.split() if x.strip()]
+    # 너무 짧은 토큰 제거 + 중복 제거
+    out: List[str] = []
+    seen = set()
+    for x in toks:
+        if len(x) <= 1:
+            continue
+        k = x.lower()
+        if k in seen:
+            continue
+        seen.add(k)
+        out.append(x)
+    return out
+
+
+def build_hashtags(cfg: AppConfig, recipe: Recipe) -> str:
+    base = [
+        "한식레시피", "집밥", "오늘뭐먹지", "간단요리", "초간단레시피",
+        "자취요리", "밥도둑", "국물요리", "반찬", "요리기록"
+    ]
+    title_tokens = _clean_title_for_tags(recipe.title)
+    # 제목 토큰 일부를 해시태그로(너무 많지 않게)
+    for tok in title_tokens[:5]:
+        base.append(tok.replace(" ", ""))
+    # 중복 제거 & 길이 제한
+    uniq: List[str] = []
+    seen = set()
+    for x in base:
+        x = re.sub(r"\s+", "", x)
+        if not x:
+            continue
+        k = x.lower()
+        if k in seen:
+            continue
+        seen.add(k)
+        uniq.append(x)
+
+    n = max(5, min(20, cfg.content.hashtag_count))
+    return " ".join([f"#{x}" for x in uniq[:n]])
 
 
 def choose_thumb_url(cfg: AppConfig, recipe: Recipe) -> str:
@@ -697,54 +799,194 @@ def choose_thumb_url(cfg: AppConfig, recipe: Recipe) -> str:
     return (recipe.image_url or "").strip() or (cfg.img.default_thumb_url or "").strip()
 
 
-def build_body_html(cfg: AppConfig, now: datetime, run_slot_label: str, recipe: Recipe, display_img_url: str = "") -> str:
-    title = recipe.title.strip()
+def build_recipe_schema_json(recipe: Recipe, image_url: str, now: datetime) -> str:
+    data = {
+        "@context": "https://schema.org",
+        "@type": "Recipe",
+        "name": recipe.title.strip(),
+        "image": [image_url] if image_url else [],
+        "datePublished": now.astimezone(KST).isoformat(),
+        "recipeCuisine": "Korean",
+        "recipeCategory": "Korean Recipe",
+        "recipeIngredient": recipe.ingredients or [],
+        "recipeInstructions": [{"@type": "HowToStep", "text": s} for s in (recipe.steps or [])],
+    }
+    return json.dumps(data, ensure_ascii=False)
 
+
+def build_schema_block(cfg: AppConfig, recipe: Recipe, image_url: str, now: datetime) -> str:
+    mode = cfg.content.schema_mode
+    if mode == "off":
+        return ""
+    schema_json = build_recipe_schema_json(recipe, image_url, now)
+    if mode == "script":
+        # WP에는 좋지만, 네이버 복붙 시 사라지거나 불필요할 수 있음
+        return f'<script type="application/ld+json">{_esc(schema_json)}</script>'
+    # comment(default): 네이버 복붙 시 화면에 안 보이게
+    return f"<!-- RECIPE_SCHEMA_JSONLD: {_esc(schema_json)} -->"
+
+
+def pick_benefit_phrase(title: str) -> str:
+    # 과장X, 클릭 유도는 하되 담백하게
+    phrases = [
+        "실패 확률 낮게 정리",
+        "재료 간단 버전",
+        "초보도 가능한 레시피",
+        "맛 보장 포인트만 콕",
+        "집밥으로 딱 좋은 메뉴",
+        "10분~20분 완성",
+    ]
+    # 제목에 국/찌개가 있으면 국물 포인트
+    if any(k in title for k in ["국", "찌개", "탕"]):
+        phrases.append("국물맛 깔끔하게")
+    if any(k in title for k in ["볶음", "조림"]):
+        phrases.append("간 딱 맞게")
+    return random.choice(phrases)
+
+
+def build_naver_hook(title: str) -> str:
+    # 네이버에서 “첫 3줄”이 중요하다고 가정하고, 짧게 후킹
+    hook_lines = [
+        f"{title}는 재료만 맞추면 실패 확률이 확 줄어요.",
+        "오늘은 ‘어렵게 말고, 진짜 해먹을 수 있게’ 정리했습니다.",
+        "바쁜 날에도 그대로 따라 하면 맛이 나오는 포인트만 담았어요.",
+    ]
+    return " ".join(hook_lines)
+
+
+def build_body_html(
+    cfg: AppConfig,
+    now: datetime,
+    run_slot_label: str,
+    recipe: Recipe,
+    display_img_url: str = "",
+    recent_links: Optional[List[Tuple[str, str]]] = None,
+) -> Tuple[str, str]:
+    """
+    returns: (body_html, excerpt)
+    """
+    title = recipe.title.strip()
+    benefit = pick_benefit_phrase(title)
+
+    # excerpt(네이버/워드프레스 미리보기용 짧은 요약)
+    excerpt = f"{title} 레시피. {benefit} 중심으로 재료/순서를 보기 쉽게 정리했습니다."
+    excerpt = excerpt[:140]
+
+    # 공통: 스크립트/스타일 최소화(복붙 안정)
+    schema_block = build_schema_block(cfg, recipe, display_img_url, now)
+
+    # 이미지(본문 상단 1장 고정)
     img_html = ""
     if cfg.img.embed_image_in_body and display_img_url:
-        img_html = f"""
-        <p style="margin:14px 0;">
-          <img src="{_esc(display_img_url)}" alt="{_esc(title)}"
-               style="max-width:100%;height:auto;border-radius:10px;" />
-        </p>
-        """
+        if cfg.content.naver_style:
+            img_html = f'<p><img src="{_esc(display_img_url)}" alt="{_esc(title)}"/></p>'
+        else:
+            img_html = f"""
+            <p style="margin:14px 0;">
+              <img src="{_esc(display_img_url)}" alt="{_esc(title)}"
+                   style="max-width:100%;height:auto;border-radius:10px;" />
+            </p>
+            """
 
-    disclosure = f'<p style="padding:10px;border-left:4px solid #111;background:#f7f7f7;">{_esc(DISCLOSURE)}</p>'
+    # 네이버형 구성(후킹 → 본론(정보/재료/순서) → 클릭유도 → 댓글유도)
+    disclosure = f"<p>{_esc(DISCLOSURE)}</p>" if cfg.content.naver_style else f'<p style="padding:10px;border-left:4px solid #111;background:#f7f7f7;">{_esc(DISCLOSURE)}</p>'
     head = f"<p>기준시각: <b>{_esc(now.astimezone(KST).strftime('%Y-%m-%d %H:%M'))}</b> / 슬롯: <b>{_esc(run_slot_label)}</b></p>"
-    note = f'<p style="font-size:13px;opacity:.85;">{_esc(SEO_NOTE)}<br/>{_esc(SOURCE_NOTE)}</p>'
+    note = f"<p>{_esc(SEO_NOTE)}<br/>{_esc(SOURCE_NOTE)}</p>" if cfg.content.naver_style else f'<p style="font-size:13px;opacity:.85;">{_esc(SEO_NOTE)}<br/>{_esc(SOURCE_NOTE)}</p>'
 
     hook = f"""
     <h2>{_esc(title)} 레시피</h2>
-    <p>
-      오늘은 <b>{_esc(title)}</b>로 갑니다 🙂<br/>
-      재료는 단순하게, 과정은 실패 확률 낮게 정리했어요. (바쁜 날에도 OK!)
-    </p>
+    <p><b>오늘의 포인트</b>: {_esc(benefit)}</p>
+    <p>{_esc(build_naver_hook(title))}</p>
     """
 
-    ing_li = "".join([f"<li>{_esc(x)}</li>" for x in recipe.ingredients]) or "<li>재료 정보가 비어있어요.</li>"
-    ingredients = f"<h3>재료 준비</h3><ul>{ing_li}</ul>"
-
-    step_ol = "".join([f"<li style='margin:6px 0;'>{_esc(s)}</li>" for s in recipe.steps]) or "<li>조리 과정 정보가 비어있어요.</li>"
-    steps = f"<h3>만드는 법</h3><ol>{step_ol}</ol>"
-
-    tips = """
-    <h3>실패 줄이는 팁</h3>
+    quick = """
+    <h3>한눈에 보기</h3>
     <ul>
-      <li>간은 마지막에 한 번 더 잡아주면 실패 확률이 확 줄어요.</li>
-      <li>시간이 없으면 재료를 크게 썰어도 괜찮아요. 대신 충분히 끓이기!</li>
-      <li>매운맛은 고춧가루/고추장으로 단계적으로 조절하면 깔끔합니다.</li>
+      <li>✅ 재료: 집에 있는 것 위주로</li>
+      <li>✅ 간 맞추기: 마지막에 한 번만 조절</li>
+      <li>✅ 실패 줄이기: ‘타이밍’만 지키면 끝</li>
     </ul>
     """
 
-    closing = """
-    <hr/>
-    <p style="opacity:.85;">
-      저장해두면 다음에 바로 꺼내 쓰기 좋아요 🙂<br/>
-      내일 레시피도 1개씩 업데이트됩니다.
-    </p>
+    # 재료
+    ing_li = "".join([f"<li>{_esc(x)}</li>" for x in recipe.ingredients]) or "<li>재료 정보가 비어있어요.</li>"
+    ingredients = f"<h3>재료 준비(체크리스트)</h3><ul>{ing_li}</ul>"
+
+    # 조리순서 (문단 길이/가독성 강화)
+    step_ol = "".join([f"<li>{_esc(s)}</li>" for s in recipe.steps]) or "<li>조리 과정 정보가 비어있어요.</li>"
+    steps = f"<h3>만드는 법(조리 순서)</h3><ol>{step_ol}</ol>"
+
+    # 과정 이미지(있으면 1~3장만 추가)
+    step_imgs_html = ""
+    if cfg.content.embed_step_images and recipe.step_images:
+        imgs = recipe.step_images[:3]
+        li = "".join([f'<li><img src="{_esc(u)}" alt="{_esc(title)} 과정사진"/></li>' for u in imgs if u.startswith("http")])
+        if li:
+            step_imgs_html = f"<h3>과정 사진</h3><ul>{li}</ul>"
+
+    tips = """
+    <h3>실패 줄이는 꿀팁 3가지</h3>
+    <ul>
+      <li>불 조절은 ‘중불 → 약불’로만 잡아도 결과가 훨씬 안정적이에요.</li>
+      <li>간은 꼭 마지막에! 중간에 맞추면 짜질 확률이 큽니다.</li>
+      <li>향신/양념은 한 번에 많이 넣지 말고 ‘조금씩 추가’가 정답.</li>
+    </ul>
     """
 
-    return disclosure + head + img_html + note + hook + ingredients + steps + tips + closing
+    variations = """
+    <h3>응용/대체 아이디어</h3>
+    <ul>
+      <li>단맛이 필요하면 설탕 대신 올리고당을 아주 소량만 추가해보세요.</li>
+      <li>더 칼칼하게: 고춧가루는 마지막에 1/2큰술 추가가 깔끔합니다.</li>
+      <li>아이 버전: 매운 양념은 줄이고 간장/육수 비율로 맛을 맞추세요.</li>
+    </ul>
+    """
+
+    storage = """
+    <h3>보관 & 재가열</h3>
+    <ul>
+      <li>냉장: 밀폐 용기에 담아 1~2일 내 섭취 권장</li>
+      <li>재가열: 한 번 끓인 뒤 간을 마지막에 조절</li>
+    </ul>
+    """
+
+    faq = ""
+    if cfg.content.add_faq:
+        faq = f"""
+        <h3>자주 묻는 질문(FAQ)</h3>
+        <ul>
+          <li><b>Q.</b> 간이 심심해요. 언제 보강하나요?<br/><b>A.</b> 끓임/졸임이 끝난 ‘마지막’에 국간장/소금으로 조절하세요.</li>
+          <li><b>Q.</b> 재료가 하나 빠졌는데 대체 가능해요?<br/><b>A.</b> 핵심은 ‘간/불/시간’이라서 1~2개는 대체해도 맛이 크게 무너지지 않아요.</li>
+          <li><b>Q.</b> 다음엔 더 맛있게 하려면?<br/><b>A.</b> 오늘 만든 뒤 “내 입맛 기준”으로 간/매운맛만 메모해두면 다음번이 쉬워집니다.</li>
+        </ul>
+        """
+
+    # 내부 링크(지난 글 3개)
+    more = ""
+    if cfg.content.add_internal_links and recent_links:
+        items = "".join([f"<li><a href='{_esc(link)}'>{_esc(t)}</a></li>" for link, t in recent_links if link])
+        if items:
+            more = f"<h3>지난 레시피 더 보기</h3><ul>{items}</ul>"
+
+    hashtags = build_hashtags(cfg, recipe)
+
+    # 클릭/댓글 유도(너가 원하는 구조 반영)
+    cta = """
+    <h3>저장 포인트</h3>
+    <p>이 글은 <b>저장</b>해두면 다음에 “오늘 뭐 먹지?” 할 때 바로 꺼내 쓰기 좋아요 🙂</p>
+    """
+    comment_prompt = f"""
+    <h3>댓글 질문</h3>
+    <p><b>{_esc(title)}</b> 만들 때 여러분은 어떤 재료를 추가하는 편인가요? (예: 버섯/두부/대파 등) 댓글로 추천해줘요!</p>
+    """
+
+    closing = f"""
+    <hr/>
+    <p>{_esc(hashtags)}</p>
+    """
+
+    body = schema_block + disclosure + head + img_html + note + hook + quick + ingredients + steps + step_imgs_html + tips + variations + storage + faq + more + cta + comment_prompt + closing
+    return body, excerpt
 
 
 def generate_with_openai(cfg: AppConfig, recipe: Recipe, base_html: str) -> Optional[str]:
@@ -794,7 +1036,6 @@ def ensure_media(cfg: AppConfig, image_url: str, stable_name: str) -> Tuple[int,
     if not image_url:
         return 0, ""
 
-    # 파일명 결정(고정): 같은 URL이면 같은 이름을 쓰게 해서 search 재사용 유리
     h = hashlib.sha1(image_url.encode("utf-8")).hexdigest()[:12]
     ext = ".jpg"
     u = image_url.lower()
@@ -811,6 +1052,13 @@ def ensure_media(cfg: AppConfig, image_url: str, stable_name: str) -> Tuple[int,
 
     mid, murl = wp_upload_media_from_url(cfg.wp, image_url, filename)
     return mid, murl
+
+
+def build_post_title(date_str: str, slot_label: str, recipe_title: str) -> str:
+    # 네이버에 복붙해도 어색하지 않게 "날짜"는 뒤로 빼고, 앞은 키워드 중심
+    benefit = pick_benefit_phrase(recipe_title)
+    # 예: "돼지고기 김치찌개 레시피 | 실패 확률 낮게 정리 (2026-01-15 오늘)"
+    return f"{recipe_title} 레시피 | {benefit} ({date_str} {slot_label})"
 
 
 # -----------------------------
@@ -839,14 +1087,13 @@ def run(cfg: AppConfig) -> None:
 
     assert chosen is not None
 
-    title = f"{date_str} 한식 레시피 - {chosen.title} ({slot_label})"
+    title = build_post_title(date_str, slot_label, chosen.title)
     slug = f"korean-recipe-{date_str}-{slot}"
 
     # ★ 핵심: 레시피 이미지가 없으면 기본 이미지로 대체
     thumb_url = choose_thumb_url(cfg, chosen)
 
     if not chosen.image_url and not cfg.img.default_thumb_url:
-        # 기본 이미지가 없으면 '이미지 없는 글'이 될 수 밖에 없어서 경고
         print("[WARN] recipe image empty AND DEFAULT_THUMB_URL empty → featured 이미지 없이 발행될 수 있어요.")
 
     # WP 업로드 성공 시 media_url을 쓰고, 실패하면 thumb_url(직접URL)로라도 본문 삽입
@@ -865,7 +1112,8 @@ def run(cfg: AppConfig) -> None:
 
     display_img_url = (media_url or thumb_url or "").strip()
 
-    body_html = build_body_html(cfg, now, slot_label, chosen, display_img_url=display_img_url)
+    recent_links = get_recent_wp_links(cfg.sqlite_path, limit=3) if cfg.content.add_internal_links else []
+    body_html, excerpt = build_body_html(cfg, now, slot_label, chosen, display_img_url=display_img_url, recent_links=recent_links)
 
     upgraded = generate_with_openai(cfg, chosen, body_html)
     if upgraded:
@@ -879,18 +1127,30 @@ def run(cfg: AppConfig) -> None:
 
     featured_id = media_id if (cfg.img.set_featured and media_id) else 0
 
-    if today_meta and today_meta.get("wp_post_id"):
-        post_id = int(today_meta["wp_post_id"])
-        wp_post_id, wp_link = wp_update_post(cfg.wp, post_id, title, body_html, featured_media=featured_id)
-        print("OK(updated):", wp_post_id, wp_link)
-    else:
-        wp_post_id, wp_link = wp_create_post(cfg.wp, title, slug, body_html)
+    try:
+        if today_meta and today_meta.get("wp_post_id"):
+            post_id = int(today_meta["wp_post_id"])
+            wp_post_id, wp_link = wp_update_post(cfg.wp, post_id, title, body_html, featured_media=featured_id, excerpt=excerpt)
+            print("OK(updated):", wp_post_id, wp_link)
+        else:
+            wp_post_id, wp_link = wp_create_post(cfg.wp, title, slug, body_html, excerpt=excerpt)
+            if featured_id:
+                try:
+                    wp_post_id, wp_link = wp_update_post(cfg.wp, wp_post_id, title, body_html, featured_media=featured_id, excerpt=excerpt)
+                except Exception:
+                    pass
+            print("OK(created):", wp_post_id, wp_link)
+    except Exception as e:
+        # 업데이트 실패(삭제됨/권한/ID불일치 등) 시 새로 생성 시도
+        if cfg.run.debug:
+            print("[WARN] post create/update failed, fallback to create:", repr(e))
+        wp_post_id, wp_link = wp_create_post(cfg.wp, title, slug, body_html, excerpt=excerpt)
         if featured_id:
             try:
-                wp_post_id, wp_link = wp_update_post(cfg.wp, wp_post_id, title, body_html, featured_media=featured_id)
+                wp_post_id, wp_link = wp_update_post(cfg.wp, wp_post_id, title, body_html, featured_media=featured_id, excerpt=excerpt)
             except Exception:
                 pass
-        print("OK(created):", wp_post_id, wp_link)
+        print("OK(created-fallback):", wp_post_id, wp_link)
 
     save_post_meta(
         cfg.sqlite_path,
