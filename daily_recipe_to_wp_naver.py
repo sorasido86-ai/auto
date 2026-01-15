@@ -726,8 +726,8 @@ def generate_korean_blog_human(
     tag_line = " ".join(tags[:12])
 
     # naver_copy_mode면 줄바꿈이 더 보이도록 문단을 잘게 쪼갬
-    hook_html = f"<p>{_escape_html(hook).replace('\\n', '<br/>')}</p>" if hook else ""
-    closing_html = f"<p>{_escape_html(closing).replace('\\n', '<br/>')}</p>" if closing else ""
+    hook_html = f"<p>{_escape_html(hook).replace('\n', '<br/>')}</p>" if hook else ""
+    closing_html = f"<p>{_escape_html(closing).replace('\n', '<br/>')}</p>" if closing else ""
 
     body = (
         hook_html
