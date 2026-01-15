@@ -1,30 +1,58 @@
-name: Daily Recipe to WordPress (Naver-friendly)
+name: Daily Recipe to WordPress (NaverStyle)
 
 on:
-  schedule:
-    # 매일 09:10 KST = 00:10 UTC
-    - cron: "10 0 * * *"
   workflow_dispatch:
+    inputs:
+      run_slot:
+        description: "day / am / pm"
+        required: true
+        default: "day"
+  schedule:
+    # 09:10 KST (00:10 UTC)
+    - cron: "10 0 * * *"
+    # 18:10 KST (09:10 UTC)
+    - cron: "10 9 * * *"
 
 jobs:
-  run:
+  post:
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Setup Python
+      - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
+      - name: Cache sqlite
+        uses: actions/cache@v4
+        with:
+          path: data
+          key: daily-recipe-sqlite
+          restore-keys: |
+            daily-recipe-sqlite
+
       - name: Install deps
         run: |
           python -m pip install --upgrade pip
-          pip install requests openai
+          pip install "openai>=1.0.0" requests
 
-      - name: Prepare data dir
-        run: mkdir -p data
+      - name: Decide RUN_SLOT (schedule vs manual)
+        id: slot
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "RUN_SLOT=${{ inputs.run_slot }}" >> $GITHUB_ENV
+          else
+            # schedule: distinguish by UTC hour (0 => am, 9 => pm)
+            HOUR=$(date -u +%H)
+            if [ "$HOUR" -lt 06 ]; then
+              echo "RUN_SLOT=am" >> $GITHUB_ENV
+            else
+              echo "RUN_SLOT=pm" >> $GITHUB_ENV
+            fi
+          fi
 
       - name: Run bot
         env:
@@ -33,33 +61,37 @@ jobs:
           WP_APP_PASS: ${{ secrets.WP_APP_PASS }}
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
 
-          # 옵션(원하면 secrets 또는 repository variables로 옮겨도 됨)
+          # Recommended
           WP_STATUS: "publish"
           WP_CATEGORY_IDS: "7"
           WP_TAG_IDS: ""
-          SQLITE_PATH: "data/daily_recipe.sqlite3"
 
-          RUN_SLOT: "day"
+          SQLITE_PATH: "data/daily_recipe.sqlite3"
+          DEBUG: "0"
+          DRY_RUN: "0"
           FORCE_NEW: "0"
           AVOID_REPEAT_DAYS: "90"
           MAX_TRIES: "20"
-          OPENAI_MODEL: "gpt-5.2"
+
+          OPENAI_MODEL: "gpt-4.1-mini"
           OPENAI_MAX_RETRIES: "3"
-          STRICT_KOREAN: "1"
 
-          RANDOMIZE_LEVEL: "2"
-          UPLOAD_THUMB: "1"
-          SET_FEATURED: "1"
-          EMBED_IMAGE_IN_BODY: "1"
-          DEFAULT_THUMB_URL: ""
+          # Naver style + title random
+          NAVER_RANDOM_LEVEL: "2"
+          NAVER_EXPERIENCE_LEVEL: "2"
+          NAVER_TITLE_MODE: "random"
+          NAVER_TITLE_WEIGHTS: "35,30,20,15"
+          TITLE_NUMBER_EXAMPLES: "3가지,5분,10분,1번,2번"
 
-          # 무료번역 폴백(선택)
-          FREE_TRANSLATE_URL: "https://libretranslate.de/translate"
-          FREE_TRANSLATE_API_KEY: ""
-          FREE_TRANSLATE_SOURCE: "en"
-          FREE_TRANSLATE_TARGET: "ko"
+          # Optional keywords (first keyword becomes the "main keyword" for title)
+          # NAVER_KEYWORDS: "집밥 레시피,오늘메뉴,간단요리"
 
-          DRY_RUN: "0"
-          DEBUG: "0"
+          # Thumbnail high quality (optional)
+          THUMB_PROVIDER: "themealdb"
+          # THUMB_PROVIDER: "pexels"
+          # PEXELS_API_KEY: ${{ secrets.PEXELS_API_KEY }}
+          # PEXELS_STYLE: "clean"
+
         run: |
-          python daily_recipe_to_wp_naver.py
+          mkdir -p data
+          python daily_recipe_to_wp_naverstyle.py
