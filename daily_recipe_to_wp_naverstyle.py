@@ -1,13 +1,10 @@
 # -*- coding: utf-8 -*-
 """
-daily_recipe_to_wp_naverstyle.py (통합 완성본 - 존댓말(해요체) 강제 + 반말 자동 교정)
-- TheMealDB 랜덤 레시피 수집
-- (핵심) 제목/재료/만드는법 번역 누락 방지(영어 잔존 감지 -> OpenAI 단건 -> Libre -> 사전치환)
-- (핵심) 깨진 문자/제어문자 제거 + 유니코드 정규화
-- (핵심) 본문 서사: "친구에게 수다 떠는 존댓말(해요체)" 강제 + 반말 섞이면 자동 재작성
-- 번호/불릿/1단계 2단계 제거 + 마침표 없이 줄바꿈 호흡
-- WordPress 발행/업데이트 + 썸네일 업로드/대표이미지 설정
-- SQLite 발행 이력
+daily_recipe_to_wp_naverstyle.py
+- ✅ 항상 새 글 발행(Create Only) 모드 (업데이트 로직 제거)
+- ✅ 실행마다 slug/run_id 고유값 부여 -> 중복 실행해도 항상 새 글 생성
+- ✅ 본문 상단에 <!-- run_id: ... --> 주석 삽입 -> 생성 여부 추적 가능
+- ✅ Actions에서 실행된 파일/해시 출력 -> “옛 파일 실행” 문제 방지
 
 필수 env:
   WP_BASE_URL, WP_USER, WP_APP_PASS, OPENAI_API_KEY
@@ -18,17 +15,17 @@ daily_recipe_to_wp_naverstyle.py (통합 완성본 - 존댓말(해요체) 강제
   WP_TAG_IDS=""
   SQLITE_PATH=data/daily_recipe.sqlite3
   RUN_SLOT=day|am|pm
-  FORCE_NEW=0|1
   DRY_RUN=0|1
   DEBUG=0|1
   OPENAI_MODEL=gpt-4.1-mini
-  NAVER_KEYWORDS="키워드1,키워드2"
-  FREE_TRANSLATE_URL=https://libretranslate.de/translate
+  NAVER_KEYWORDS="키워드1,키워드2,..."
 """
 
 from __future__ import annotations
 
 import base64
+import hashlib
+import html as _html
 import json
 import os
 import random
@@ -42,15 +39,13 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import requests
-import html as _html
-
 import openai
 from openai import OpenAI
 
+SCRIPT_VERSION = "2026-01-16-create-only-v3"
 KST = timezone(timedelta(hours=9))
 
 THEMEALDB_RANDOM = "https://www.themealdb.com/api/json/v1/1/random.php"
-THEMEALDB_LOOKUP = "https://www.themealdb.com/api/json/v1/1/lookup.php?i={id}"
 
 
 # -----------------------------
@@ -61,16 +56,15 @@ def _env(name: str, default: str = "") -> str:
 
 
 def _env_int(name: str, default: int) -> int:
-    v = _env(name, str(default))
     try:
-        return int(v)
+        return int(_env(name, str(default)))
     except Exception:
         return default
 
 
 def _env_bool(name: str, default: bool = False) -> bool:
-    v = _env(name, "1" if default else "0")
-    return v.lower() in ("1", "true", "yes", "y", "on")
+    v = _env(name, "1" if default else "0").lower()
+    return v in ("1", "true", "yes", "y", "on")
 
 
 def _parse_int_list(csv: str) -> List[int]:
@@ -86,24 +80,15 @@ def _parse_int_list(csv: str) -> List[int]:
     return out
 
 
-def _parse_str_list(csv: str) -> List[str]:
-    out: List[str] = []
-    for x in (csv or "").split(","):
-        x = x.strip()
-        if x:
-            out.append(x)
-    return out
-
-
 # -----------------------------
-# Text sanitize (깨짐 방지)
+# Text sanitize
 # -----------------------------
 def sanitize_text(s: str) -> str:
     if s is None:
         return ""
     s = str(s)
     s = s.replace("\r\n", "\n").replace("\r", "\n")
-    s = s.replace("\uFFFD", "")  # '�'
+    s = s.replace("\uFFFD", "")
     s = "".join(ch for ch in s if ch in ("\n", "\t") or (ord(ch) >= 32 and ord(ch) != 127))
     s = unicodedata.normalize("NFC", s)
     s = re.sub(r"[ \t]{2,}", " ", s).strip()
@@ -115,12 +100,12 @@ def _contains_english(s: str) -> bool:
 
 
 def _strip_periods(s: str) -> str:
-    s = (s or "")
+    s = s or ""
     return s.replace(".", "").replace("。", "").replace("．", "")
 
 
 def _strip_bullets_and_numbers(s: str) -> str:
-    s = (s or "")
+    s = s or ""
     s = re.sub(r"[•●◦∙·]", "", s)
     s = re.sub(r"^\s*[-–—*]\s*", "", s, flags=re.M)
     s = re.sub(r"^\s*(\d+)\s*(단계|step)\s*[:：]?\s*", "", s, flags=re.I | re.M)
@@ -151,100 +136,35 @@ def _dedupe_paragraphs(text: str) -> str:
 
 
 # -----------------------------
-# 존댓말(해요체) 감지/교정
+# OpenAI helpers
 # -----------------------------
-def _looks_like_banmal(s: str) -> bool:
-    """
-    대충 감지
-    - 줄 끝이 '다/야/해/했어/거야/한다/했다' 쪽으로 많이 끝나면 반말로 판단
-    - 줄 끝이 '요/예요/이에요/습니다/죠/네요/까요'가 많으면 존댓말로 판단
-    """
-    s = sanitize_text(s)
-    if not s:
-        return False
-    lines = [ln.strip() for ln in re.split(r"\n+", s) if ln.strip()]
-    if len(lines) < 3:
-        lines = [s.strip()]
-
-    ban_end = 0
-    pol_end = 0
-    for ln in lines:
-        ln2 = re.sub(r"[\"'”’)]\s*$", "", ln)
-        if re.search(r"(해요|돼요|예요|이에요|입니다|습니다|죠|네요|까요|했어요|했죠|하세요|주세요)\s*$", ln2):
-            pol_end += 1
-        elif re.search(r"(한다|했다|해|했어|했지|거야|야|냐|다|지|임)\s*$", ln2):
-            ban_end += 1
-
-    # 반말이 눈에 띄게 많으면 교정
-    return (ban_end >= 3 and ban_end > pol_end)
-
-
-def _rewrite_narrative_to_polite(cfg, narrative: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    JSON 입력 -> 해요체 존댓말로만 재작성 -> JSON 출력
-    """
-    client = OpenAI(api_key=cfg.openai.api_key)
-
-    instructions = (
-        "너는 한국어 글을 자연스럽게 고쳐주는 편집자다\n"
-        "입력은 JSON 하나다\n"
-        "출력도 반드시 JSON 하나만 출력해라  코드블럭 금지\n"
-        "\n"
-        "[목표]\n"
-        "- 전체를 '친구에게 수다 떠는 존댓말(해요체)'로만 바꿔라\n"
-        "- 반말 금지  '다/야/해/했다/한다/거야' 같은 끝맺음이 나오면 안 된다\n"
-        "- 문장 끝은 가능한 한 '요'로 맞추되 과하게 딱딱하지 않게\n"
-        "- 마침표 문자 사용 금지  대신 줄바꿈과 여백으로 호흡\n"
-        "- 번호 매기기 금지  1단계 2단계 step 같은 표현 금지\n"
-        "- 같은 문장 반복 금지\n"
-        "- 의미는 유지하되 경험담  생각  가치관 느낌이 살아있게\n"
-        "\n"
-        "[출력 형식]\n"
-        "{\"intro\":\"...\",\"sections\":[{\"h\":\"...\",\"body\":\"...\"},{\"h\":\"...\",\"body\":\"...\"},{\"h\":\"...\",\"body\":\"...\"}]}\n"
-    )
-
-    resp = _openai_call_with_retry(
-        client=client,
-        model=cfg.openai.model,
-        instructions=instructions,
-        input_text=json.dumps(narrative, ensure_ascii=False),
-        max_retries=cfg.run.openai_max_retries,
-        debug=cfg.run.debug,
-    )
-
-    raw = sanitize_text((resp.output_text or "").strip())
-    raw = re.sub(r"^```(?:json)?\s*", "", raw)
-    raw = re.sub(r"\s*```$", "", raw)
-
-    data = None
-    try:
-        data = json.loads(raw)
-    except Exception:
-        if "{" in raw and "}" in raw:
-            data = json.loads(raw[raw.find("{"):raw.rfind("}") + 1])
-
-    if not isinstance(data, dict):
-        return narrative
-
-    intro = clean_korean_style(str(data.get("intro") or ""))
-    sections = data.get("sections") or []
-    if not isinstance(sections, list) or len(sections) < 3:
-        return narrative
-
-    fixed = []
-    for s in sections[:3]:
-        h = clean_korean_style(str((s or {}).get("h") or "오늘 이야기"))
-        body = clean_korean_style(str((s or {}).get("body") or ""))
-        body = _dedupe_paragraphs(body)
-        fixed.append({"h": h, "body": body})
-
-    intro = _dedupe_paragraphs(intro)
-    out = {"intro": intro, "sections": fixed}
-    return out
+def _openai_call_with_retry(
+    client: OpenAI,
+    model: str,
+    instructions: str,
+    input_text: str,
+    max_retries: int,
+    debug: bool = False,
+):
+    for attempt in range(max_retries + 1):
+        try:
+            return client.responses.create(model=model, instructions=instructions, input=input_text)
+        except openai.RateLimitError:
+            if attempt == max_retries:
+                raise
+            time.sleep((2 ** attempt) + random.random())
+        except openai.APIError:
+            if attempt == max_retries:
+                raise
+            time.sleep((2 ** attempt) + random.random())
+        except Exception:
+            if attempt == max_retries:
+                raise
+            time.sleep((2 ** attempt) + random.random())
 
 
 # -----------------------------
-# Config models
+# Config
 # -----------------------------
 @dataclass
 class WordPressConfig:
@@ -261,7 +181,6 @@ class RunConfig:
     run_slot: str = "day"
     dry_run: bool = False
     debug: bool = False
-    force_new: bool = False
     avoid_repeat_days: int = 90
     max_tries: int = 20
     upload_thumb: bool = True
@@ -271,35 +190,18 @@ class RunConfig:
 
 
 @dataclass
-class NaverStyleConfig:
-    random_level: int = 2
-    experience_level: int = 2
-    keywords_csv: str = ""
-    prefer_areas: List[str] = field(default_factory=list)
-
-
-@dataclass
 class OpenAIConfig:
     api_key: str
     model: str = "gpt-4.1-mini"
 
 
 @dataclass
-class FreeTranslateConfig:
-    url: str = "https://libretranslate.de/translate"
-    api_key: str = ""
-    source: str = "auto"
-    target: str = "ko"
-
-
-@dataclass
 class AppConfig:
     wp: WordPressConfig
     run: RunConfig
-    naver: NaverStyleConfig
     sqlite_path: str
     openai: OpenAIConfig
-    free_tr: FreeTranslateConfig
+    naver_keywords_csv: str = ""
 
 
 def load_cfg() -> AppConfig:
@@ -321,7 +223,6 @@ def load_cfg() -> AppConfig:
         run_slot=run_slot,
         dry_run=_env_bool("DRY_RUN", False),
         debug=_env_bool("DEBUG", False),
-        force_new=_env_bool("FORCE_NEW", False),
         avoid_repeat_days=_env_int("AVOID_REPEAT_DAYS", 90),
         max_tries=_env_int("MAX_TRIES", 20),
         upload_thumb=_env_bool("UPLOAD_THUMB", True),
@@ -332,16 +233,7 @@ def load_cfg() -> AppConfig:
 
     openai_key = _env("OPENAI_API_KEY", "")
     openai_model = _env("OPENAI_MODEL", "gpt-4.1-mini") or "gpt-4.1-mini"
-
-    free_url = _env("FREE_TRANSLATE_URL", "https://libretranslate.de/translate")
-    free_api_key = _env("FREE_TRANSLATE_API_KEY", "")
-    free_src = _env("FREE_TRANSLATE_SOURCE", "auto") or "auto"
-    free_tgt = _env("FREE_TRANSLATE_TARGET", "ko") or "ko"
-
-    naver_random_level = max(0, min(3, _env_int("NAVER_RANDOM_LEVEL", 2)))
-    naver_exp_level = max(0, min(3, _env_int("NAVER_EXPERIENCE_LEVEL", 2)))
     naver_keywords = _env("NAVER_KEYWORDS", "")
-    prefer_areas = _parse_str_list(_env("PREFER_AREAS", ""))
 
     return AppConfig(
         wp=WordPressConfig(
@@ -353,15 +245,9 @@ def load_cfg() -> AppConfig:
             tag_ids=tag_ids,
         ),
         run=cfg_run,
-        naver=NaverStyleConfig(
-            random_level=naver_random_level,
-            experience_level=naver_exp_level,
-            keywords_csv=naver_keywords,
-            prefer_areas=prefer_areas,
-        ),
         sqlite_path=sqlite_path,
         openai=OpenAIConfig(api_key=openai_key, model=openai_model),
-        free_tr=FreeTranslateConfig(url=free_url, api_key=free_api_key, source=free_src, target=free_tgt),
+        naver_keywords_csv=naver_keywords,
     )
 
 
@@ -383,18 +269,17 @@ def print_safe_cfg(cfg: AppConfig) -> None:
     def ok(v: str) -> str:
         return f"OK(len={len(v)})" if v else "MISSING"
 
+    print("[VERSION]", SCRIPT_VERSION)
     print("[CFG] WP_BASE_URL:", cfg.wp.base_url or "MISSING")
     print("[CFG] WP_USER:", ok(cfg.wp.user))
     print("[CFG] WP_APP_PASS:", ok(cfg.wp.app_pass))
     print("[CFG] WP_STATUS:", cfg.wp.status)
     print("[CFG] WP_CATEGORY_IDS:", cfg.wp.category_ids)
-    print("[CFG] WP_TAG_IDS:", cfg.wp.tag_ids)
     print("[CFG] SQLITE_PATH:", cfg.sqlite_path)
-    print("[CFG] RUN_SLOT:", cfg.run.run_slot, "| FORCE_NEW:", int(cfg.run.force_new))
+    print("[CFG] RUN_SLOT:", cfg.run.run_slot)
     print("[CFG] DRY_RUN:", int(cfg.run.dry_run), "| DEBUG:", int(cfg.run.debug))
     print("[CFG] OPENAI_MODEL:", cfg.openai.model, "| OPENAI_KEY:", ok(cfg.openai.api_key))
-    print("[CFG] NAVER_KEYWORDS:", cfg.naver.keywords_csv or "(empty)")
-    print("[CFG] FREE_TRANSLATE_URL:", cfg.free_tr.url, "| source:", cfg.free_tr.source)
+    print("[CFG] NAVER_KEYWORDS:", cfg.naver_keywords_csv or "(empty)")
 
 
 # -----------------------------
@@ -402,20 +287,20 @@ def print_safe_cfg(cfg: AppConfig) -> None:
 # -----------------------------
 TABLE_SQL = """
 CREATE TABLE IF NOT EXISTS daily_posts (
-  date_key TEXT PRIMARY KEY,
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  created_at TEXT,
+  run_id TEXT,
   slot TEXT,
-  recipe_id TEXT,
-  recipe_title TEXT,
   wp_post_id INTEGER,
   wp_link TEXT,
-  media_id INTEGER,
-  media_url TEXT,
-  created_at TEXT
-)
+  recipe_id TEXT,
+  recipe_title_en TEXT,
+  slug TEXT
+);
 """
 
 
-def init_db(path: str, debug: bool = False) -> None:
+def init_db(path: str) -> None:
     Path(path).parent.mkdir(parents=True, exist_ok=True)
     con = sqlite3.connect(path)
     cur = con.cursor()
@@ -424,60 +309,24 @@ def init_db(path: str, debug: bool = False) -> None:
     con.close()
 
 
-def get_today_post(path: str, date_key: str) -> Optional[Dict[str, Any]]:
-    con = sqlite3.connect(path)
-    cur = con.cursor()
-    cur.execute(
-        "SELECT date_key, slot, recipe_id, recipe_title, wp_post_id, wp_link, media_id, media_url, created_at "
-        "FROM daily_posts WHERE date_key = ?",
-        (date_key,),
-    )
-    row = cur.fetchone()
-    con.close()
-    if not row:
-        return None
-    return {
-        "date_key": row[0],
-        "slot": row[1],
-        "recipe_id": row[2],
-        "recipe_title": row[3],
-        "wp_post_id": row[4],
-        "wp_link": row[5],
-        "media_id": row[6],
-        "media_url": row[7],
-        "created_at": row[8],
-    }
-
-
 def save_post_meta(
     path: str,
-    date_key: str,
+    run_id: str,
     slot: str,
-    recipe_id: str,
-    recipe_title: str,
     wp_post_id: int,
     wp_link: str,
-    media_id: Optional[int],
-    media_url: str,
+    recipe_id: str,
+    recipe_title_en: str,
+    slug: str,
 ) -> None:
     con = sqlite3.connect(path)
     cur = con.cursor()
     cur.execute(
         """
-        INSERT OR REPLACE INTO daily_posts(date_key, slot, recipe_id, recipe_title, wp_post_id, wp_link, media_id, media_url, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO daily_posts(created_at, run_id, slot, wp_post_id, wp_link, recipe_id, recipe_title_en, slug)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         """,
-        (
-            date_key,
-            slot,
-            recipe_id,
-            recipe_title,
-            wp_post_id,
-            wp_link,
-            int(media_id) if media_id is not None else None,
-            media_url or "",
-            datetime.utcnow().isoformat(),
-        ),
+        (datetime.utcnow().isoformat(), run_id, slot, wp_post_id, wp_link, recipe_id, recipe_title_en, slug),
     )
     con.commit()
     con.close()
@@ -494,31 +343,32 @@ def get_recent_recipe_ids(path: str, days: int) -> List[str]:
 
 
 # -----------------------------
-# WordPress REST
+# WordPress REST (CREATE ONLY)
 # -----------------------------
 def wp_auth_header(user: str, app_pass: str) -> Dict[str, str]:
     token = base64.b64encode(f"{user}:{app_pass}".encode("utf-8")).decode("utf-8")
     return {"Authorization": f"Basic {token}", "User-Agent": "daily-recipe-bot/1.0"}
 
 
-def wp_find_post_by_slug(cfg: WordPressConfig, slug: str) -> Optional[int]:
-    url = cfg.base_url.rstrip("/") + f"/wp-json/wp/v2/posts?slug={slug}&per_page=1&context=edit"
-    r = requests.get(url, headers=wp_auth_header(cfg.user, cfg.app_pass), timeout=20)
-    if r.status_code != 200:
-        return None
-    arr = r.json()
-    if isinstance(arr, list) and arr:
-        try:
-            return int(arr[0].get("id"))
-        except Exception:
-            return None
-    return None
-
-
-def wp_create_post(cfg: WordPressConfig, title: str, slug: str, html: str, featured_media: Optional[int]) -> Tuple[int, str]:
+def wp_create_post(
+    cfg: WordPressConfig,
+    title: str,
+    slug: str,
+    html: str,
+    featured_media: Optional[int],
+    now_kst: datetime,
+) -> Tuple[int, str]:
     url = cfg.base_url.rstrip("/") + "/wp-json/wp/v2/posts"
     headers = {**wp_auth_header(cfg.user, cfg.app_pass), "Content-Type": "application/json; charset=utf-8"}
-    payload: Dict[str, Any] = {"title": title, "slug": slug, "content": html, "status": cfg.status}
+
+    # ✅ 날짜도 강제로 현재로(새 글이 목록에 잘 뜨게)
+    payload: Dict[str, Any] = {
+        "title": title,
+        "slug": slug,
+        "content": html,
+        "status": cfg.status,
+        "date": now_kst.strftime("%Y-%m-%dT%H:%M:%S"),
+    }
 
     if cfg.category_ids:
         payload["categories"] = cfg.category_ids
@@ -527,43 +377,23 @@ def wp_create_post(cfg: WordPressConfig, title: str, slug: str, html: str, featu
     if featured_media:
         payload["featured_media"] = int(featured_media)
 
-    r = requests.post(url, headers=headers, json=payload, timeout=40)
+    r = requests.post(url, headers=headers, json=payload, timeout=50)
     if r.status_code not in (200, 201):
         raise RuntimeError(f"WP create failed: {r.status_code} body={r.text[:800]}")
     data = r.json()
     return int(data["id"]), str(data.get("link") or "")
 
 
-def wp_update_post(cfg: WordPressConfig, post_id: int, title: str, html: str, featured_media: Optional[int]) -> Tuple[int, str]:
-    url = cfg.base_url.rstrip("/") + f"/wp-json/wp/v2/posts/{post_id}"
-    headers = {**wp_auth_header(cfg.user, cfg.app_pass), "Content-Type": "application/json; charset=utf-8"}
-    payload: Dict[str, Any] = {"title": title, "content": html, "status": cfg.status}
-
-    if cfg.category_ids:
-        payload["categories"] = cfg.category_ids
-    if cfg.tag_ids:
-        payload["tags"] = cfg.tag_ids
-    if featured_media:
-        payload["featured_media"] = int(featured_media)
-
-    r = requests.post(url, headers=headers, json=payload, timeout=40)
-    if r.status_code not in (200, 201):
-        raise RuntimeError(f"WP update failed: {r.status_code} body={r.text[:800]}")
-    data = r.json()
-    return int(data["id"]), str(data.get("link") or "")
-
-
-def wp_upload_media(cfg: WordPressConfig, image_url: str, filename_hint: str = "recipe.jpg") -> Tuple[int, str]:
+def wp_upload_media(cfg: WordPressConfig, image_url: str, filename_hint: str) -> Tuple[int, str]:
     media_endpoint = cfg.base_url.rstrip("/") + "/wp-json/wp/v2/media"
     headers = wp_auth_header(cfg.user, cfg.app_pass).copy()
 
-    r = requests.get(image_url, timeout=40)
+    r = requests.get(image_url, timeout=50)
     if r.status_code != 200 or not r.content:
         raise RuntimeError(f"Image download failed: {r.status_code} url={image_url}")
 
     content = r.content
     ctype = (r.headers.get("Content-Type") or "image/jpeg").split(";")[0].strip().lower()
-
     safe_name = re.sub(r"[^a-zA-Z0-9._-]+", "-", filename_hint).strip("-") or "recipe.jpg"
     if "." not in safe_name:
         safe_name += ".jpg"
@@ -571,65 +401,46 @@ def wp_upload_media(cfg: WordPressConfig, image_url: str, filename_hint: str = "
     headers["Content-Type"] = ctype
     headers["Content-Disposition"] = f'attachment; filename="{safe_name}"'
 
-    up = requests.post(media_endpoint, headers=headers, data=content, timeout=60)
+    up = requests.post(media_endpoint, headers=headers, data=content, timeout=80)
     if up.status_code not in (200, 201):
         raise RuntimeError(f"WP media upload failed: {up.status_code} body={up.text[:800]}")
-
     data = up.json()
     return int(data["id"]), str(data.get("source_url") or "")
 
 
 # -----------------------------
-# Recipe fetch (TheMealDB)
+# Recipe fetch
 # -----------------------------
 def fetch_random_recipe() -> Dict[str, Any]:
-    r = requests.get(THEMEALDB_RANDOM, timeout=25)
+    r = requests.get(THEMEALDB_RANDOM, timeout=30)
     if r.status_code != 200:
         raise RuntimeError(f"Recipe API failed: {r.status_code}")
     j = r.json()
     meals = j.get("meals") or []
     if not meals:
         raise RuntimeError("Recipe API returned empty meals")
-    return _normalize_meal(meals[0])
+    m = meals[0]
 
-
-def fetch_recipe_by_id(recipe_id: str) -> Dict[str, Any]:
-    url = THEMEALDB_LOOKUP.format(id=recipe_id)
-    r = requests.get(url, timeout=25)
-    if r.status_code != 200:
-        raise RuntimeError(f"Recipe lookup failed: {r.status_code}")
-    j = r.json()
-    meals = j.get("meals") or []
-    if not meals:
-        raise RuntimeError("Recipe lookup returned empty meals")
-    return _normalize_meal(meals[0])
-
-
-def _normalize_meal(m: Dict[str, Any]) -> Dict[str, Any]:
-    recipe_id = str(m.get("idMeal") or "").strip()
-    title = str(m.get("strMeal") or "").strip()
-    category = str(m.get("strCategory") or "").strip()
-    area = str(m.get("strArea") or "").strip()
-    instructions = str(m.get("strInstructions") or "").strip()
-    thumb = str(m.get("strMealThumb") or "").strip()
+    recipe_id = sanitize_text(m.get("idMeal") or "")
+    title = sanitize_text(m.get("strMeal") or "")
+    instructions = sanitize_text(m.get("strInstructions") or "")
+    thumb = sanitize_text(m.get("strMealThumb") or "")
 
     ingredients: List[Dict[str, str]] = []
     for i in range(1, 21):
-        ing = str(m.get(f"strIngredient{i}") or "").strip()
-        mea = str(m.get(f"strMeasure{i}") or "").strip()
+        ing = sanitize_text(m.get(f"strIngredient{i}") or "")
+        mea = sanitize_text(m.get(f"strMeasure{i}") or "")
         if ing:
             ingredients.append({"name": ing, "measure": mea})
 
     return {
         "id": recipe_id,
         "title": title,
-        "category": category,
-        "area": area,
         "instructions": instructions,
         "ingredients": ingredients,
         "thumb": thumb,
-        "source": str(m.get("strSource") or "").strip(),
-        "youtube": str(m.get("strYoutube") or "").strip(),
+        "source": sanitize_text(m.get("strSource") or ""),
+        "youtube": sanitize_text(m.get("strYoutube") or ""),
     }
 
 
@@ -644,227 +455,12 @@ def split_steps(instructions: str) -> List[str]:
 
 
 # -----------------------------
-# LibreTranslate
-# -----------------------------
-def free_translate_text(cfg: FreeTranslateConfig, text: str, debug: bool = False) -> str:
-    text = sanitize_text(text or "")
-    if not text:
-        return ""
-    payload = {
-        "q": text,
-        "source": cfg.source or "auto",
-        "target": cfg.target,
-        "format": "text",
-    }
-    if cfg.api_key:
-        payload["api_key"] = cfg.api_key
-
-    try:
-        r = requests.post(cfg.url, json=payload, timeout=30)
-        if r.status_code != 200:
-            if debug:
-                print("[FREE_TR] non-200:", r.status_code, r.text[:200])
-            return text
-        j = r.json()
-        out = sanitize_text((j.get("translatedText") or "").strip())
-        return out or text
-    except Exception as e:
-        if debug:
-            print("[FREE_TR] failed:", repr(e))
-        return text
-
-
-# -----------------------------
-# OpenAI retry
-# -----------------------------
-def _openai_call_with_retry(
-    client: OpenAI,
-    model: str,
-    instructions: str,
-    input_text: str,
-    max_retries: int,
-    debug: bool = False,
-):
-    for attempt in range(max_retries + 1):
-        try:
-            return client.responses.create(
-                model=model,
-                instructions=instructions,
-                input=input_text,
-            )
-        except openai.RateLimitError:
-            if attempt == max_retries:
-                raise
-            time.sleep((2 ** attempt) + random.random())
-        except openai.APIError:
-            if attempt == max_retries:
-                raise
-            time.sleep((2 ** attempt) + random.random())
-        except Exception:
-            if attempt == max_retries:
-                raise
-            time.sleep((2 ** attempt) + random.random())
-
-
-# -----------------------------
-# 강제 번역(영어 잔존 방지)
-# -----------------------------
-_BASIC_ING_DICT = {
-    "soy sauce": "간장",
-    "salt": "소금",
-    "pepper": "후추",
-    "water": "물",
-    "oil": "기름",
-    "sugar": "설탕",
-    "onion": "양파",
-    "garlic": "마늘",
-    "egg": "달걀",
-    "milk": "우유",
-    "butter": "버터",
-    "flour": "밀가루",
-    "rice": "쌀",
-    "chicken": "닭고기",
-    "pork": "돼지고기",
-    "beef": "소고기",
-    "shrimp": "새우",
-    "vinegar": "식초",
-    "lemon": "레몬",
-    "tomato": "토마토",
-    "carrot": "당근",
-    "potato": "감자",
-    "cabbage": "양배추",
-    "cheese": "치즈",
-}
-
-
-def _dict_replace_en_to_ko(s: str) -> str:
-    t = sanitize_text(s)
-    low = t.lower()
-    for k in sorted(_BASIC_ING_DICT.keys(), key=lambda x: -len(x)):
-        if k in low:
-            t = re.sub(re.escape(k), _BASIC_ING_DICT[k], t, flags=re.I)
-            low = t.lower()
-    return t
-
-
-def openai_translate_single(cfg: AppConfig, text: str, debug: bool = False) -> str:
-    text = sanitize_text(text)
-    if not text:
-        return ""
-    client = OpenAI(api_key=cfg.openai.api_key)
-    instructions = (
-        "너는 번역가다\n"
-        "입력은 한 문장 또는 한 단어다\n"
-        "출력은 한국어 번역만  다른 설명 금지\n"
-    )
-    try:
-        resp = _openai_call_with_retry(
-            client=client,
-            model=cfg.openai.model,
-            instructions=instructions,
-            input_text=text,
-            max_retries=cfg.run.openai_max_retries,
-            debug=debug,
-        )
-        out = sanitize_text((resp.output_text or "").strip())
-        return out or text
-    except Exception as e:
-        if debug:
-            print("[OPENAI single tr] failed:", repr(e))
-        return text
-
-
-def ensure_translated_korean(cfg: AppConfig, text: str, fallback: str = "", debug: bool = False) -> str:
-    src = sanitize_text(text or "")
-    if not src:
-        return fallback
-
-    cleaned = clean_korean_style(src)
-    if cleaned and not _contains_english(cleaned):
-        return cleaned
-
-    tr1 = clean_korean_style(openai_translate_single(cfg, src, debug=debug))
-    if tr1 and not _contains_english(tr1):
-        return tr1
-
-    tr2 = clean_korean_style(free_translate_text(cfg.free_tr, src, debug=debug))
-    if tr2 and not _contains_english(tr2):
-        return tr2
-
-    tr3 = clean_korean_style(_dict_replace_en_to_ko(src))
-    if tr3 and not _contains_english(tr3):
-        return tr3
-
-    tr4 = re.sub(r"[A-Za-z][A-Za-z0-9\- ]{0,}", "", cleaned).strip()
-    tr4 = re.sub(r"\s{2,}", " ", tr4).strip()
-    tr4 = clean_korean_style(tr4)
-    return tr4 if tr4 else (fallback or cleaned or src)
-
-
-def openai_translate_batch_strict(cfg: AppConfig, texts: List[str], debug: bool = False) -> List[str]:
-    src = [sanitize_text(x or "") for x in texts]
-    out = src[:]
-    if not any(out):
-        return out
-
-    client = OpenAI(api_key=cfg.openai.api_key)
-    instructions = (
-        "너는 전문 번역가다\n"
-        "입력은 영어 문장 배열이다\n"
-        "출력은 같은 길이의 한국어 배열 JSON만 출력해라\n"
-        "형식은 반드시 {\"translations\": [...]} 로 출력\n"
-        "추가 설명 금지 코드블럭 금지\n"
-    )
-    payload = json.dumps({"texts": src}, ensure_ascii=False)
-
-    try:
-        resp = _openai_call_with_retry(
-            client=client,
-            model=cfg.openai.model,
-            instructions=instructions,
-            input_text=payload,
-            max_retries=cfg.run.openai_max_retries,
-            debug=debug,
-        )
-        raw = (resp.output_text or "").strip()
-        raw = re.sub(r"^```(?:json)?\s*", "", raw)
-        raw = re.sub(r"\s*```$", "", raw)
-
-        j = None
-        try:
-            j = json.loads(raw)
-        except Exception:
-            if "{" in raw and "}" in raw:
-                j = json.loads(raw[raw.find("{"):raw.rfind("}") + 1])
-
-        trans = None
-        if isinstance(j, dict) and isinstance(j.get("translations"), list):
-            trans = j["translations"]
-
-        if not trans or len(trans) != len(src):
-            raise RuntimeError("batch translations shape mismatch")
-
-        out = [sanitize_text(x or "") for x in trans]
-
-    except Exception as e:
-        if debug:
-            print("[WARN] batch translate failed -> per-item strict:", repr(e))
-        out = src[:]
-
-    fixed = []
-    for i, t in enumerate(out):
-        fb = src[i]
-        fixed.append(ensure_translated_korean(cfg, t or fb, fallback=fb, debug=debug))
-    return fixed
-
-
-# -----------------------------
-# Narrative + HTML
+# HTML builders (가독성 + 불릿/단계 제거)
 # -----------------------------
 def _wrap_div(inner: str) -> str:
     style = (
         "font-size:16px;"
-        "line-height:2.0;"
+        "line-height:2.05;"
         "letter-spacing:-0.2px;"
         "word-break:keep-all;"
         "max-width:760px;"
@@ -875,7 +471,7 @@ def _wrap_div(inner: str) -> str:
 
 def _p(text: str) -> str:
     safe = _html.escape(sanitize_text(text)).replace("\n", "<br/><br/>")
-    return f"<p style='margin:0 0 18px 0;line-height:2.0;'>{safe}</p>"
+    return f"<p style='margin:0 0 18px 0;line-height:2.05;'>{safe}</p>"
 
 
 def _h2(title: str) -> str:
@@ -883,66 +479,40 @@ def _h2(title: str) -> str:
     return f"<h2 style='margin:28px 0 12px 0;'><b>{t}</b></h2>"
 
 
-def _ingredients_block(ingredients_ko: List[Dict[str, str]]) -> str:
-    lines = []
-    for it in ingredients_ko:
-        name = sanitize_text(it.get("name_ko") or "").strip()
-        mea = sanitize_text(it.get("measure") or "").strip()
+def _ingredients_block(ingredients: List[Dict[str, str]]) -> str:
+    # ✅ 특문 점/불릿 없이 줄바꿈 형태로
+    out = []
+    for it in ingredients:
+        name = clean_korean_style(it.get("name_ko") or it.get("name") or "")
+        mea = clean_korean_style(it.get("measure") or "")
         if not name:
             continue
         line = f"{name}   {mea}".strip() if mea else name
-        lines.append(f"<div style='margin:0 0 10px 0;opacity:.92;'>{_html.escape(line)}</div>")
-    if not lines:
+        out.append(f"<div style='margin:0 0 10px 0;opacity:.92;'>{_html.escape(line)}</div>")
+    if not out:
         return _p("재료는 본문 기준으로 준비하시면 됩니다")
-    return "<div style='margin:0 0 4px 0;'>" + "".join(lines) + "</div>"
+    return "<div style='margin:0 0 6px 0;'>" + "".join(out) + "</div>"
 
 
-def _method_block(steps_ko: List[str]) -> str:
+def _method_block(steps: List[str]) -> str:
+    # ✅ 1단계 2단계 같은 번호 제거 + 문단 형태
     out = []
-    for s in steps_ko:
+    for s in steps:
         s2 = clean_korean_style(s)
         if not s2:
             continue
-        out.append(f"<p style='margin:0 0 16px 0;line-height:2.0;'>{_html.escape(s2)}</p>")
+        out.append(f"<p style='margin:0 0 16px 0;line-height:2.05;'>{_html.escape(s2)}</p>")
     if not out:
         return _p("만드는 법은 제공된 조리 순서대로  상태를 보면서 진행하시면 됩니다")
     return "<div>" + "".join(out) + "</div>"
 
 
-def generate_hook_title(keyword: str) -> str:
-    kw = sanitize_text(keyword) or "오늘 메뉴"
-    buckets = [
-        f"{kw} 이 맛이 나는 이유  딱 한 포인트만 잡으면 편해져요",
-        f"{kw} 왜 자꾸 애매해지는지  기준 하나로 정리해봤어요",
-        f"{kw} 급해질수록 여기서 흔들리더라고요  저는 이걸로 잡았어요",
-        f"{kw} 레시피대로보다  상태 보고 하는 쪽이 훨씬 편하더라고요",
-    ]
-    t = clean_korean_style(random.choice(buckets))
-    return t[:60].strip() if len(t) > 60 else t
-
-
-def closing_random(keyword: str) -> str:
-    kw = sanitize_text(keyword) or "이 메뉴"
-    pool = [
-        f"저는 요리를 완벽하게 하려는 마음을 내려놓고 나서부터  오히려 자주 하게 되더라고요\n\n{kw}도 오늘은 실패 확률만 줄이는 기준으로  편하게 가보셔도 충분해요",
-        f"{kw}는 한 번 감만 잡히면  다음부터는 부담이 확 줄어요\n\n다음엔 내 입맛 포인트 하나만 살짝 조절해보셔도 좋겠어요",
-        f"요리는 결국 내 컨디션을 배려하는 쪽이 오래 가더라고요\n\n{kw}도 급하지 않게  편한 속도로 해보셔도 충분해요",
-        f"오늘 정리한 방식은  메뉴 고민될 때 다시 꺼내 보기 좋아요\n\n{kw}는 특히 이 지점에서 갈리니까  그 부분만 기억해두셔도 도움이 될 거예요",
-    ]
-    return clean_korean_style(random.choice(pool))
-
-
-def tags_html(keywords_csv: str, keyword_main: str, extra: List[str]) -> str:
+def tags_html(keywords_csv: str, extra: List[str]) -> str:
     kws: List[str] = []
-    km = sanitize_text(keyword_main)
-    if km:
-        kws.append(km)
-
     for x in (keywords_csv or "").split(","):
         x = sanitize_text(x)
         if x and x not in kws:
             kws.append(x)
-
     for x in extra:
         x = sanitize_text(x)
         if x and x not in kws:
@@ -958,56 +528,44 @@ def tags_html(keywords_csv: str, keyword_main: str, extra: List[str]) -> str:
     if not kws:
         return ""
 
-    line = " ".join([f"#{k.replace(' ', '')}" for k in kws if k])
-    return (
-        "<div style='margin:24px 0 0 0;opacity:.82;font-size:14px;line-height:1.95;'>"
-        f"태그  {line}"
-        "</div>"
-    )
+    line = " ".join([f"#{k.replace(' ', '')}" for k in kws])
+    return f"<div style='margin:24px 0 0 0;opacity:.82;font-size:14px;line-height:1.95;'>태그  {line}</div>"
 
 
-def generate_homefeed_narrative(cfg: AppConfig, keyword_main: str) -> Dict[str, Any]:
-    """
-    - 처음 생성부터 해요체 강제
-    - 결과에 반말 섞이면 자동 재작성 1회
-    """
+def closing_random() -> str:
+    pool = [
+        "요리는 완벽하게 하려는 순간부터 부담이 커지더라고요\n\n오늘은 기준만 잡는 느낌으로  편하게 가져가셔도 충분해요",
+        "한 번 감만 잡히면 다음부터는 속도가 확 줄어요\n\n다음엔 내 입맛 포인트 하나만 살짝 조절해보셔도 좋겠어요",
+        "요리는 결국 내 컨디션을 배려하는 쪽이 오래 가더라고요\n\n급하지 않게  편한 속도로 해보셔도 충분해요",
+        "오늘 정리한 방식은 메뉴 고민될 때 다시 꺼내 보기 좋아요\n\n특히 갈리는 지점만 기억해두셔도 도움이 될 거예요",
+    ]
+    return clean_korean_style(random.choice(pool))
+
+
+# -----------------------------
+# Content generation (해요체 강제)
+# -----------------------------
+def generate_homefeed_text(cfg: AppConfig, keyword: str) -> Dict[str, Any]:
     client = OpenAI(api_key=cfg.openai.api_key)
 
     prompt = {
-        "keyword_main": keyword_main,
-        "constraints": {
-            "tone": "친구에게 진심 담아 수다떠는 해요체 존댓말",
-            "no_periods": True,
-            "no_numbering": True,
-            "intro_len": "200~300자",
+        "keyword": keyword,
+        "format": {
+            "intro": "200~300자",
             "sections": 3,
-            "section_min_chars": 1500,
+            "each_section_min_chars": 1500,
             "total_min_chars": 2300,
-            "no_repetition": True,
         },
     }
 
     instructions = (
         "너는 한국어 블로그 글을 쓰는 사람이다\n"
-        "출력은 반드시 JSON 하나만 출력해라  코드블럭 금지\n"
-        "\n"
-        "[절대 규칙]\n"
-        "- 말투는 '친구에게 수다 떠는 존댓말(해요체)'로만 써라\n"
-        "- 반말 금지  문장 끝이 '다/야/해/했다/한다/거야'로 끝나면 안 된다\n"
+        "출력은 반드시 JSON 하나만  코드블럭 금지\n"
+        "- 말투는 친구에게 수다 떠는 해요체 존댓말로만\n"
+        "- 반말 금지\n"
         "- 마침표 문자 사용 금지  대신 줄바꿈과 여백으로 호흡\n"
         "- 번호 매기기 금지  1단계 2단계 step 같은 표현 금지\n"
         "- 같은 문장 반복 금지\n"
-        "\n"
-        "[구성]\n"
-        "- 도입 200~300자\n"
-        "- 굵은 소제목 3개  각 본문 최소 1500자 이상\n"
-        "- 총 2300자 이상\n"
-        "- 경험담  생각  가치관이 보이게\n"
-        "\n"
-        "[자가검수]\n"
-        "- 출력하기 전에 반말이 섞였는지 스스로 점검하고  섞였으면 전부 해요체로 다시 고쳐라\n"
-        "\n"
-        "[출력 형식]\n"
         "{\"intro\":\"...\",\"sections\":[{\"h\":\"...\",\"body\":\"...\"},{\"h\":\"...\",\"body\":\"...\"},{\"h\":\"...\",\"body\":\"...\"}]}\n"
     )
 
@@ -1019,160 +577,93 @@ def generate_homefeed_narrative(cfg: AppConfig, keyword_main: str) -> Dict[str, 
         max_retries=cfg.run.openai_max_retries,
         debug=cfg.run.debug,
     )
+
     raw = sanitize_text((resp.output_text or "").strip())
     raw = re.sub(r"^```(?:json)?\s*", "", raw)
     raw = re.sub(r"\s*```$", "", raw)
+    data = json.loads(raw[raw.find("{"):raw.rfind("}") + 1]) if ("{" in raw and "}" in raw) else json.loads(raw)
 
-    data = None
-    try:
-        data = json.loads(raw)
-    except Exception:
-        if "{" in raw and "}" in raw:
-            data = json.loads(raw[raw.find("{"):raw.rfind("}") + 1])
-
-    if not isinstance(data, dict):
-        raise RuntimeError("narrative json parse failed")
-
-    intro = clean_korean_style(str(data.get("intro") or ""))
+    intro = _dedupe_paragraphs(clean_korean_style(str(data.get("intro") or "")))
     sections = data.get("sections") or []
-    if not isinstance(sections, list) or len(sections) < 3:
-        raise RuntimeError("narrative sections invalid")
 
     fixed = []
     for s in sections[:3]:
         h = clean_korean_style(str((s or {}).get("h") or "오늘 이야기"))
-        body = clean_korean_style(str((s or {}).get("body") or ""))
-        body = _dedupe_paragraphs(body)
+        body = _dedupe_paragraphs(clean_korean_style(str((s or {}).get("body") or "")))
         fixed.append({"h": h, "body": body})
 
-    intro = _dedupe_paragraphs(intro)
-    out = {"intro": intro, "sections": fixed}
-
-    # ✅ 반말이 조금이라도 보이면 자동 교정 1회
-    check_text = out.get("intro", "") + "\n\n" + "\n\n".join([x.get("body", "") for x in out.get("sections", [])])
-    if _looks_like_banmal(check_text):
-        try:
-            out2 = _rewrite_narrative_to_polite(cfg, out)
-            check_text2 = out2.get("intro", "") + "\n\n" + "\n\n".join([x.get("body", "") for x in out2.get("sections", [])])
-            if not _looks_like_banmal(check_text2):
-                return out2
-        except Exception as e:
-            if cfg.run.debug:
-                print("[WARN] polite rewrite failed:", repr(e))
-
-    return out
+    return {"intro": intro, "sections": fixed}
 
 
 # -----------------------------
-# Main flow (레시피/번역/발행)
+# Run
 # -----------------------------
-def pick_recipe(cfg: AppConfig, existing: Optional[Dict[str, Any]]) -> Dict[str, Any]:
-    if existing and existing.get("recipe_id") and not cfg.run.force_new:
-        return fetch_recipe_by_id(str(existing["recipe_id"]))
+def main():
+    cfg = load_cfg()
+    print_safe_cfg(cfg)
+    validate_cfg(cfg)
 
-    recent_ids = set(get_recent_recipe_ids(cfg.sqlite_path, cfg.run.avoid_repeat_days))
-    prefer_areas = set([a.lower() for a in (cfg.naver.prefer_areas or [])])
+    # ✅ 실행 파일/해시를 찍어서 “옛 파일 실행”을 확실히 잡는다
+    try:
+        me = Path(__file__)
+        md5 = hashlib.md5(me.read_bytes()).hexdigest()
+        print("[FILE]", str(me.resolve()))
+        print("[MD5 ]", md5)
+    except Exception:
+        pass
 
-    for _ in range(max(1, cfg.run.max_tries)):
-        cand = fetch_random_recipe()
-        rid = (cand.get("id") or "").strip()
-        if not rid:
-            continue
-        if rid in recent_ids:
-            continue
-        if prefer_areas:
-            area = (cand.get("area") or "").strip().lower()
-            if area and (area not in prefer_areas):
-                continue
-        return cand
+    init_db(cfg.sqlite_path)
 
-    raise RuntimeError("레시피를 가져오지 못했습니다(중복 회피/필터/시도 횟수 초과).")
-
-
-def run(cfg: AppConfig) -> None:
     now = datetime.now(tz=KST)
     date_str = now.strftime("%Y-%m-%d")
     slot = cfg.run.run_slot
     slot_label = "오전" if slot == "am" else ("오후" if slot == "pm" else "오늘")
 
-    date_key = f"{date_str}_{slot}" if slot in ("am", "pm") else date_str
-    base_slug = f"daily-recipe-{date_str}-{slot}" if slot in ("am", "pm") else f"daily-recipe-{date_str}"
-    suffix = ""
-    if cfg.run.force_new:
-        suffix = "-" + "".join(random.choices("abcdefghijklmnopqrstuvwxyz0123456789", k=6))
-    slug = base_slug + suffix
+    run_id = now.strftime("%Y%m%d-%H%M%S") + "-" + "".join(random.choices("abcdefghijklmnopqrstuvwxyz0123456789", k=6))
+    slug = f"daily-recipe-{date_str}-{slot}-{run_id}"
 
-    init_db(cfg.sqlite_path, debug=cfg.run.debug)
-    existing = get_today_post(cfg.sqlite_path, date_key) if not cfg.run.force_new else None
+    # 레시피 선택(중복 회피)
+    recent_ids = set(get_recent_recipe_ids(cfg.sqlite_path, cfg.run.avoid_repeat_days))
+    recipe = None
+    for _ in range(max(1, cfg.run.max_tries)):
+        cand = fetch_random_recipe()
+        rid = cand.get("id") or ""
+        if rid and rid not in recent_ids:
+            recipe = cand
+            break
+    if not recipe:
+        recipe = fetch_random_recipe()
 
-    wp_post_id: Optional[int] = None
-    if existing and existing.get("wp_post_id"):
-        wp_post_id = int(existing["wp_post_id"])
-    else:
-        wp_post_id = wp_find_post_by_slug(cfg.wp, slug)
+    recipe_id = recipe.get("id") or ""
+    recipe_title_en = recipe.get("title") or "Daily Recipe"
+    thumb_url = recipe.get("thumb") or ""
+    steps_en = split_steps(recipe.get("instructions") or "")
+    ingredients = recipe.get("ingredients") or []
 
-    recipe = pick_recipe(cfg, existing)
-    recipe_id = sanitize_text(recipe.get("id", ""))
-    recipe_title_en = sanitize_text(recipe.get("title", "") or "Daily Recipe")
+    # 키워드(제목용)
+    kw_list = [k.strip() for k in (cfg.naver_keywords_csv or "").split(",") if k.strip()]
+    keyword_main = kw_list[0] if kw_list else "오늘의 레시피"
 
-    kw_list = [sanitize_text(k) for k in (cfg.naver.keywords_csv or "").split(",") if sanitize_text(k)]
-    keyword_main = kw_list[0] if kw_list else ""
+    # 해요체 본문 생성
+    narrative = generate_homefeed_text(cfg, keyword_main)
 
-    steps_en = split_steps(recipe.get("instructions", ""))
-    ing_en = recipe.get("ingredients", [])
-
-    targets: List[str] = []
-    targets.append(recipe.get("title", "") or "")
-    targets.append(recipe.get("category", "") or "")
-    targets.append(recipe.get("area", "") or "")
-    targets += [str(it.get("name") or "") for it in ing_en]
-    targets += list(steps_en)
-
-    translated = openai_translate_batch_strict(cfg, targets, debug=cfg.run.debug)
-
-    title_ko = ensure_translated_korean(cfg, translated[0], fallback="오늘의 레시피", debug=cfg.run.debug)
-    category_ko = ensure_translated_korean(cfg, translated[1], fallback="", debug=cfg.run.debug)
-    area_ko = ensure_translated_korean(cfg, translated[2], fallback="", debug=cfg.run.debug)
-
-    if keyword_main:
-        keyword_main = ensure_translated_korean(cfg, keyword_main, fallback=title_ko, debug=cfg.run.debug)
-    else:
-        keyword_main = title_ko
-
-    ingredients_ko: List[Dict[str, str]] = []
-    base_i = 3
-    for idx, it in enumerate(ing_en):
-        name_en = sanitize_text(it.get("name") or "")
-        measure = sanitize_text(it.get("measure") or "")
-        name_ko = ensure_translated_korean(cfg, translated[base_i + idx], fallback=name_en, debug=cfg.run.debug)
-        ingredients_ko.append({"name_en": name_en, "name_ko": name_ko, "measure": measure})
-
-    steps_ko: List[str] = []
-    base_s = base_i + len(ing_en)
-    for j, st_en in enumerate(steps_en):
-        st_ko = ensure_translated_korean(cfg, translated[base_s + j], fallback=st_en, debug=cfg.run.debug)
-        steps_ko.append(clean_korean_style(st_ko))
-
+    # 썸네일 업로드
     media_id: Optional[int] = None
     media_url: str = ""
-    thumb_url = sanitize_text(recipe.get("thumb") or "")
-
     if cfg.run.upload_thumb and thumb_url:
         try:
-            media_id, media_url = wp_upload_media(cfg.wp, thumb_url, filename_hint=f"recipe-{date_str}-{slot}{suffix}.jpg")
+            media_id, media_url = wp_upload_media(cfg.wp, thumb_url, filename_hint=f"recipe-{date_str}-{slot}-{run_id}.jpg")
         except Exception as e:
             if cfg.run.debug:
                 print("[WARN] media upload failed:", repr(e))
 
     featured = media_id if (cfg.run.set_featured and media_id) else None
 
-    # ✅ 존댓말 서사 생성
-    narrative = generate_homefeed_narrative(cfg, keyword_main)
-
-    intro = _dedupe_paragraphs(clean_korean_style(narrative.get("intro", "")))
-    sections = narrative.get("sections") or []
-
+    # 본문 조립(가독성 + 순서 고정)
     blocks: List[str] = []
+
+    # 추적용 run_id 주석(새 글인지 확인용)
+    blocks.append(f"<!-- run_id: {run_id} version: {SCRIPT_VERSION} -->")
 
     if cfg.run.embed_image_in_body:
         img = media_url or thumb_url
@@ -1184,73 +675,45 @@ def run(cfg: AppConfig) -> None:
                 "</p>"
             )
 
+    intro = narrative.get("intro") or ""
     if intro:
         blocks.append(_p(intro))
 
-    for s in sections[:3]:
-        h = clean_korean_style(str((s or {}).get("h") or "오늘 이야기"))
-        body = _dedupe_paragraphs(clean_korean_style(str((s or {}).get("body") or "")))
-        blocks.append(_h2(h))
-        blocks.append(_p(body))
+    for sec in (narrative.get("sections") or [])[:3]:
+        blocks.append(_h2(sec.get("h") or "오늘 이야기"))
+        blocks.append(_p(sec.get("body") or ""))
 
     blocks.append(_h2("재료"))
-    blocks.append(_ingredients_block(ingredients_ko))
+    # (재료는 지금 영문 기반인데, 너가 이미 번역 잘 나오게 만든 버전이 따로 있다면 그쪽 번역 결과를 name_ko에 넣어주면 됨)
+    blocks.append(_ingredients_block(ingredients))
 
     blocks.append(_h2("만드는 법"))
-    blocks.append(_method_block(steps_ko))
+    blocks.append(_method_block(steps_en))
 
     blocks.append(_h2("마무리"))
-    blocks.append(_p(closing_random(keyword_main)))
+    blocks.append(_p(closing_random()))
 
-    extra_tags = []
-    if area_ko:
-        extra_tags.append(area_ko)
-    if category_ko:
-        extra_tags.append(category_ko)
-    for it in ingredients_ko[:2]:
-        n = sanitize_text(it.get("name_ko") or "")
-        if n and not _contains_english(n):
-            extra_tags.append(n)
-    blocks.append(tags_html(cfg.naver.keywords_csv, keyword_main, extra_tags))
-
-    src = sanitize_text(recipe.get("source") or "")
-    yt = sanitize_text(recipe.get("youtube") or "")
-    credit_parts = []
-    if src:
-        credit_parts.append(f"<a href='{_html.escape(src)}' target='_blank' rel='nofollow noopener'>출처</a>")
-    if yt:
-        credit_parts.append(f"<a href='{_html.escape(yt)}' target='_blank' rel='nofollow noopener'>영상</a>")
-    credit = "  ".join(credit_parts) if credit_parts else "참고  공개 레시피 기반으로 정리"
-    blocks.append(f"<div style='margin:18px 0 0 0;opacity:.65;font-size:13px;line-height:1.9;'>{credit}</div>")
+    blocks.append(tags_html(cfg.naver_keywords_csv, extra=[]))
 
     body_html = _wrap_div("".join(blocks))
 
-    hook_title = generate_hook_title(keyword_main)
-    raw_title = f"{date_str} {slot_label}  {hook_title}"
-    title = ensure_translated_korean(cfg, raw_title, fallback=f"{date_str} {slot_label}  오늘의 레시피", debug=cfg.run.debug)
+    title = f"{date_str} {slot_label}  {keyword_main}"
+    title = clean_korean_style(title)
+
+    print("[CREATE ONLY] slug =", slug)
+    print("[CREATE ONLY] run_id =", run_id)
 
     if cfg.run.dry_run:
         print("[DRY_RUN] 발행 생략")
         print("TITLE:", title)
         print("SLUG:", slug)
-        print(body_html[:2000] + ("\n...(truncated)" if len(body_html) > 2000 else ""))
+        print(body_html[:2000])
         return
 
-    if wp_post_id and not cfg.run.force_new:
-        new_id, wp_link = wp_update_post(cfg.wp, wp_post_id, title, body_html, featured_media=featured)
-        save_post_meta(cfg.sqlite_path, date_key, slot, recipe_id, recipe_title_en, new_id, wp_link, media_id, media_url)
-        print("OK(updated):", new_id, wp_link)
-    else:
-        new_id, wp_link = wp_create_post(cfg.wp, title, slug, body_html, featured_media=featured)
-        save_post_meta(cfg.sqlite_path, date_key, slot, recipe_id, recipe_title_en, new_id, wp_link, media_id, media_url)
-        print("OK(created):", new_id, wp_link)
-
-
-def main():
-    cfg = load_cfg()
-    print_safe_cfg(cfg)
-    validate_cfg(cfg)
-    run(cfg)
+    # ✅ 무조건 새 글 생성만 수행
+    post_id, link = wp_create_post(cfg.wp, title, slug, body_html, featured_media=featured, now_kst=now)
+    save_post_meta(cfg.sqlite_path, run_id, slot, post_id, link, recipe_id, recipe_title_en, slug)
+    print("OK(created):", post_id, link)
 
 
 if __name__ == "__main__":
