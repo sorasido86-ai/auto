@@ -1,0 +1,75 @@
+name: Daily Recipe Naverstyle to WordPress
+
+on:
+  schedule:
+    # 매일 09:10 KST = 00:10 UTC
+    - cron: "10 0 * * *"
+  workflow_dispatch:
+    inputs:
+      run_slot:
+        description: "day / am / pm"
+        required: false
+        default: "day"
+
+concurrency:
+  group: daily-recipe-naverstyle
+  cancel-in-progress: true
+
+jobs:
+  post:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests openai
+
+      - name: Show files (debug)
+        run: |
+          pwd
+          ls -al
+          find . -maxdepth 3 -type f -name "daily_recipe_to_wp_naverstyle_FINAL.py" -print
+
+      - name: Run bot
+        env:
+          WP_BASE_URL: ${{ secrets.WP_BASE_URL }}
+          WP_USER: ${{ secrets.WP_USER }}
+          WP_APP_PASS: ${{ secrets.WP_APP_PASS }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+
+          WP_STATUS: ${{ secrets.WP_STATUS }}
+          WP_CATEGORY_IDS: ${{ secrets.WP_CATEGORY_IDS }}
+          WP_TAG_IDS: ${{ secrets.WP_TAG_IDS }}
+
+          SQLITE_PATH: "data/daily_recipe.sqlite3"
+
+          RUN_SLOT: ${{ github.event.inputs.run_slot || 'day' }}
+          DRY_RUN: "0"
+          DEBUG: "0"
+
+          # ✅ 중복 실행해도 항상 새 글
+          FORCE_NEW: "1"
+
+          # 글 스타일/키워드
+          NAVER_RANDOM_LEVEL: "2"
+          NAVER_KEYWORDS: ${{ secrets.NAVER_KEYWORDS }}
+          PREFER_AREAS: ${{ secrets.PREFER_AREAS }}
+
+          # 고퀄 썸네일 (선택)
+          PEXELS_API_KEY: ${{ secrets.PEXELS_API_KEY }}
+
+          # 모델
+          OPENAI_MODEL: ${{ secrets.OPENAI_MODEL }}
+          OPENAI_MAX_RETRIES: "3"
+
+        run: |
+          mkdir -p data
+          python daily_recipe_to_wp_naverstyle_FINAL.py
