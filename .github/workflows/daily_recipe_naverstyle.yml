@@ -1,22 +1,15 @@
-name: Daily Recipe Naverstyle to WordPress
+name: Daily NaverStyle Recipe to WordPress
 
 on:
-  schedule:
-    # 매일 09:10 KST = 00:10 UTC
-    - cron: "10 0 * * *"
   workflow_dispatch:
-    inputs:
-      run_slot:
-        description: "day / am / pm"
-        required: false
-        default: "day"
-
-concurrency:
-  group: daily-recipe-naverstyle
-  cancel-in-progress: true
+  schedule:
+    # KST 09:15 = UTC 00:15
+    - cron: "15 0 * * *"
+    # KST 21:15 = UTC 12:15
+    - cron: "15 12 * * *"
 
 jobs:
-  post:
+  run:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -32,11 +25,14 @@ jobs:
           python -m pip install --upgrade pip
           pip install requests openai
 
-      - name: Show files (debug)
-        run: |
-          pwd
-          ls -al
-          find . -maxdepth 3 -type f -name "daily_recipe_to_wp_naverstyle_FINAL.py" -print
+      # SQLite 캐시(중복 회피/기록 유지)
+      - name: Cache sqlite
+        uses: actions/cache@v4
+        with:
+          path: data
+          key: naverstyle-sqlite-${{ github.repository }}-${{ github.ref_name }}
+          restore-keys: |
+            naverstyle-sqlite-${{ github.repository }}-
 
       - name: Run bot
         env:
@@ -48,28 +44,23 @@ jobs:
           WP_STATUS: ${{ secrets.WP_STATUS }}
           WP_CATEGORY_IDS: ${{ secrets.WP_CATEGORY_IDS }}
           WP_TAG_IDS: ${{ secrets.WP_TAG_IDS }}
-
           SQLITE_PATH: "data/daily_recipe.sqlite3"
 
-          RUN_SLOT: ${{ github.event.inputs.run_slot || 'day' }}
-          DRY_RUN: "0"
-          DEBUG: "0"
-
-          # ✅ 중복 실행해도 항상 새 글
-          FORCE_NEW: "1"
-
-          # 글 스타일/키워드
-          NAVER_RANDOM_LEVEL: "2"
-          NAVER_KEYWORDS: ${{ secrets.NAVER_KEYWORDS }}
-          PREFER_AREAS: ${{ secrets.PREFER_AREAS }}
-
-          # 고퀄 썸네일 (선택)
-          PEXELS_API_KEY: ${{ secrets.PEXELS_API_KEY }}
-
-          # 모델
           OPENAI_MODEL: ${{ secrets.OPENAI_MODEL }}
           OPENAI_MAX_RETRIES: "3"
 
+          RUN_SLOT: "day"
+          FORCE_NEW: "1"
+          DRY_RUN: "0"
+          DEBUG: "0"
+
+          NAVER_MAIN_KEYWORD: ${{ secrets.NAVER_MAIN_KEYWORD }}
+          NAVER_KEYWORDS: ${{ secrets.NAVER_KEYWORDS }}
+          PREFER_AREAS: ${{ secrets.PREFER_AREAS }}
+
+          PEXELS_API_KEY: ${{ secrets.PEXELS_API_KEY }}
+
         run: |
           mkdir -p data
+          ls -al
           python daily_recipe_to_wp_naverstyle_FINAL.py
