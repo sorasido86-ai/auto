@@ -25,7 +25,6 @@ jobs:
           python -m pip install --upgrade pip
           pip install requests openai
 
-      # SQLite 캐시(중복 회피/기록 유지)
       - name: Cache sqlite
         uses: actions/cache@v4
         with:
