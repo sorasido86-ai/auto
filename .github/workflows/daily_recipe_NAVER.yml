@@ -1,4 +1,4 @@
-name: Daily Recipe to WordPress (NaverStyle)
+name: Daily Recipe (Naver Style) to WordPress
 
 on:
   workflow_dispatch:
@@ -7,25 +7,20 @@ on:
         description: "day | am | pm"
         required: false
         default: "day"
-      force_new:
-        description: "0 | 1"
-        required: false
-        default: "0"
 
   schedule:
-    # KST 09:10 = UTC 00:10
-    - cron: "10 0 * * *"
-    # KST 18:10 = UTC 09:10
-    - cron: "10 9 * * *"
+    # KST 09:15 (UTC 00:15)
+    - cron: "15 0 * * *"
+    # KST 19:15 (UTC 10:15)
+    - cron: "15 10 * * *"
 
 concurrency:
-  group: daily-recipe-naverstyle-${{ github.ref }}
+  group: daily-recipe-to-wp
   cancel-in-progress: true
 
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
 
     steps:
       - name: Checkout
@@ -39,34 +34,7 @@ jobs:
       - name: Install deps
         run: |
           python -m pip install --upgrade pip
-          pip install "openai>=1.0.0" requests
-
-      - name: Resolve RUN_SLOT
-        run: |
-          RUN_SLOT="day"
-          FORCE_NEW="0"
-
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            RUN_SLOT="${{ github.event.inputs.run_slot }}"
-            FORCE_NEW="${{ github.event.inputs.force_new }}"
-          else
-            if [ "${{ github.event.schedule }}" = "10 0 * * *" ]; then
-              RUN_SLOT="am"
-            fi
-            if [ "${{ github.event.schedule }}" = "10 9 * * *" ]; then
-              RUN_SLOT="pm"
-            fi
-          fi
-
-          echo "RUN_SLOT=$RUN_SLOT" >> $GITHUB_ENV
-          echo "FORCE_NEW=$FORCE_NEW" >> $GITHUB_ENV
-          echo "RUN_SLOT=$RUN_SLOT  FORCE_NEW=$FORCE_NEW"
-
-      - name: Debug files
-        run: |
-          pwd
-          ls -al
-          test -f daily_recipe_to_wp_naverstyle.py || (echo "ERROR: daily_recipe_to_wp_naverstyle.py not found in repo root" && exit 2)
+          pip install requests openai
 
       - name: Run bot
         env:
@@ -75,38 +43,50 @@ jobs:
           WP_APP_PASS: ${{ secrets.WP_APP_PASS }}
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
 
-          # 선택
           WP_STATUS: ${{ secrets.WP_STATUS }}
           WP_CATEGORY_IDS: ${{ secrets.WP_CATEGORY_IDS }}
           WP_TAG_IDS: ${{ secrets.WP_TAG_IDS }}
 
-          # 봇 옵션
           SQLITE_PATH: "data/daily_recipe.sqlite3"
-          RUN_SLOT: ${{ env.RUN_SLOT }}
-          FORCE_NEW: ${{ env.FORCE_NEW }}
-          DRY_RUN: "0"
-          DEBUG: "0"
-          AVOID_REPEAT_DAYS: "90"
-          MAX_TRIES: "20"
-          OPENAI_MODEL: "gpt-4.1-mini"
-          OPENAI_MAX_RETRIES: "2"
 
-          # 네이버 톤/랜덤화
           NAVER_RANDOM_LEVEL: "2"
           NAVER_EXPERIENCE_LEVEL: "2"
-          NAVER_LONGFORM: "1"
           NAVER_KEYWORDS: ${{ secrets.NAVER_KEYWORDS }}
           PREFER_AREAS: ${{ secrets.PREFER_AREAS }}
 
-          # 고퀄 썸네일 (있으면 사용)
-          PEXELS_API_KEY: ${{ secrets.PEXELS_API_KEY }}
+          OPENAI_MODEL: ${{ secrets.OPENAI_MODEL }}
+          OPENAI_MAX_RETRIES: "3"
 
-          # 무료번역 폴백
-          FREE_TRANSLATE_URL: ${{ secrets.FREE_TRANSLATE_URL }}
-          FREE_TRANSLATE_API_KEY: ${{ secrets.FREE_TRANSLATE_API_KEY }}
-          FREE_TRANSLATE_SOURCE: ${{ secrets.FREE_TRANSLATE_SOURCE }}
-          FREE_TRANSLATE_TARGET: ${{ secrets.FREE_TRANSLATE_TARGET }}
+          FREE_TRANSLATE_URL: "https://libretranslate.de/translate"
+          FREE_TRANSLATE_SOURCE: "en"
+          FREE_TRANSLATE_TARGET: "ko"
 
+          DEBUG: "0"
+          DRY_RUN: "0"
+          FORCE_NEW: "0"
         run: |
           mkdir -p data
+
+          # RUN_SLOT 자동 결정 (schedule일 때)
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            RUN_SLOT="${{ inputs.run_slot }}"
+          else
+            if [ "${{ github.event.schedule }}" = "15 0 * * *" ]; then
+              RUN_SLOT="am"
+            else
+              RUN_SLOT="pm"
+            fi
+          fi
+
+          echo "RUN_SLOT=$RUN_SLOT"
+          export RUN_SLOT="$RUN_SLOT"
+
+          # 파일 존재 확인
+          ls -al
+          if [ ! -f "daily_recipe_to_wp_naverstyle.py" ]; then
+            echo "ERROR: daily_recipe_to_wp_naverstyle.py not found in repo root"
+            find . -maxdepth 3 -type f -name "*.py" -print
+            exit 2
+          fi
+
           python daily_recipe_to_wp_naverstyle.py
