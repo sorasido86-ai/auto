@@ -1,9 +1,13 @@
-name: Daily Recipe to WordPress (Naver Style)
+name: Daily Recipe to WordPress (Naver Feed Style)
 
 on:
   workflow_dispatch:
   schedule:
-    - cron: "0 22 * * *" # 07:00 KST 매일
+    - cron: "0 22 * * *" # 07:00 KST
+
+concurrency:
+  group: daily-recipe-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   post:
