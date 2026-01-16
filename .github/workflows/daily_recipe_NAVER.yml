@@ -1,27 +1,17 @@
-name: Daily Recipe (Naver Style) to WordPress
+name: Daily Recipe (Create Only)
 
 on:
   workflow_dispatch:
-    inputs:
-      run_slot:
-        description: "day | am | pm"
-        required: false
-        default: "day"
-
   schedule:
-    # KST 09:15 (UTC 00:15)
-    - cron: "15 0 * * *"
-    # KST 19:15 (UTC 10:15)
-    - cron: "15 10 * * *"
+    - cron: "0 1,7 * * *"   # KST 10:00, 16:00 (UTC 기준) 필요하면 바꿔요
 
 concurrency:
-  group: daily-recipe-to-wp
-  cancel-in-progress: true
+  group: daily-recipe-create-only
+  cancel-in-progress: false
 
 jobs:
   run:
     runs-on: ubuntu-latest
-
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -31,10 +21,25 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install deps
+      - name: Install
         run: |
-          python -m pip install --upgrade pip
+          python -V
+          pip install -U pip
           pip install requests openai
+
+      - name: Debug - show target file
+        run: |
+          pwd
+          ls -al
+          echo "---- target ----"
+          test -f daily_recipe_to_wp_naverstyle.py && echo "FOUND daily_recipe_to_wp_naverstyle.py" || (echo "NOT FOUND" && exit 2)
+          python - <<'PY'
+          import hashlib, pathlib
+          p = pathlib.Path("daily_recipe_to_wp_naverstyle.py")
+          print("PATH:", p.resolve())
+          print("MD5 :", hashlib.md5(p.read_bytes()).hexdigest())
+          print("HEAD:", p.read_text(encoding="utf-8", errors="ignore").splitlines()[0:5])
+          PY
 
       - name: Run bot
         env:
@@ -42,51 +47,14 @@ jobs:
           WP_USER: ${{ secrets.WP_USER }}
           WP_APP_PASS: ${{ secrets.WP_APP_PASS }}
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-
-          WP_STATUS: ${{ secrets.WP_STATUS }}
-          WP_CATEGORY_IDS: ${{ secrets.WP_CATEGORY_IDS }}
-          WP_TAG_IDS: ${{ secrets.WP_TAG_IDS }}
-
+          WP_STATUS: "publish"
+          WP_CATEGORY_IDS: "7"
           SQLITE_PATH: "data/daily_recipe.sqlite3"
-
-          NAVER_RANDOM_LEVEL: "2"
-          NAVER_EXPERIENCE_LEVEL: "2"
-          NAVER_KEYWORDS: ${{ secrets.NAVER_KEYWORDS }}
-          PREFER_AREAS: ${{ secrets.PREFER_AREAS }}
-
-          OPENAI_MODEL: ${{ secrets.OPENAI_MODEL }}
-          OPENAI_MAX_RETRIES: "3"
-
-          FREE_TRANSLATE_URL: "https://libretranslate.de/translate"
-          FREE_TRANSLATE_SOURCE: "en"
-          FREE_TRANSLATE_TARGET: "ko"
-
-          DEBUG: "0"
+          RUN_SLOT: "day"
           DRY_RUN: "0"
-          FORCE_NEW: "0"
+          DEBUG: "1"
+          OPENAI_MODEL: "gpt-4.1-mini"
+          NAVER_KEYWORDS: ${{ secrets.NAVER_KEYWORDS }}
         run: |
           mkdir -p data
-
-          # RUN_SLOT 자동 결정 (schedule일 때)
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            RUN_SLOT="${{ inputs.run_slot }}"
-          else
-            if [ "${{ github.event.schedule }}" = "15 0 * * *" ]; then
-              RUN_SLOT="am"
-            else
-              RUN_SLOT="pm"
-            fi
-          fi
-
-          echo "RUN_SLOT=$RUN_SLOT"
-          export RUN_SLOT="$RUN_SLOT"
-
-          # 파일 존재 확인
-          ls -al
-          if [ ! -f "daily_recipe_to_wp_naverstyle.py" ]; then
-            echo "ERROR: daily_recipe_to_wp_naverstyle.py not found in repo root"
-            find . -maxdepth 3 -type f -name "*.py" -print
-            exit 2
-          fi
-
           python daily_recipe_to_wp_naverstyle.py
