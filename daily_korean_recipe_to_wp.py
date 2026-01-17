@@ -726,13 +726,23 @@ def pick_recipe_mfds(cfg: AppConfig, recent_pairs: List[Tuple[str, str]]) -> Opt
 
     used = set(recent_pairs)
     keywords = ["김치", "된장", "고추장", "국", "찌개", "볶음", "전", "조림", "비빔", "나물", "탕", "죽", "김밥", "떡"]
-    for _ in range(cfg.run.max_tries):
-        kw = random.choice(keywords)
-        try:
-            rows = mfds_fetch_by_param(cfg.recipe.mfds_api_key, "RCP_NM", kw, start=1, end=60)
-        except Exception:
-            rows = []
+    # MFDS가 느리거나 장애가 있을 때, 무한정 오래 기다리지 않도록 시간 예산을 둡니다.
+    # MFDS_BUDGET_SECONDS: MFDS 시도에 쓸 총 시간(초). 0이면 비활성 (기본 30)
+    budget = _env_int("MFDS_BUDGET_SECONDS", 30)
+    t0 = time.time()
 
+    for i in range(cfg.run.max_tries):
+        if budget > 0 and (time.time() - t0) > budget:
+            if cfg.run.debug:
+                print(f"[MFDS] budget exceeded ({budget}s) -> fallback to local")
+            break
+        kw = random.choice(keywords)
+        if cfg.run.debug:
+            elapsed = int(time.time() - t0)
+            print(f"[MFDS] try {i+1}/{cfg.run.max_tries} kw={kw} elapsed={elapsed}s")
+        rows = mfds_fetch_by_param(cfg.recipe.mfds_api_key, "RCP_NM", kw, start=1, end=60)
+        if cfg.run.debug:
+            print(f"[MFDS] rows={len(rows) if isinstance(rows, list) else 0}")
         random.shuffle(rows)
         for row in rows:
             try:
