@@ -82,6 +82,7 @@ import random
 import re
 import sqlite3
 import sys
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -642,18 +643,44 @@ def _is_korean_recipe_name(name: str, strict: bool = True) -> bool:
 
 
 def mfds_fetch_by_param(api_key: str, param: str, value: str, start: int = 1, end: int = 60) -> List[Dict[str, Any]]:
+    """MFDS OpenAPI 호출.
+
+    - 외부 API(foodsafetykorea)가 종종 느리거나 끊기는 경우가 있어, 타임아웃/일시 오류는 예외로 터뜨리지 않고
+      빈 결과([])로 처리해 로컬 레시피 폴백이 가능하도록 한다.
+    - 환경변수로 조정 가능:
+        MFDS_TIMEOUT (초, 기본 35)
+        MFDS_RETRIES (재시도 횟수, 기본 2)
+    """
     base = f"https://openapi.foodsafetykorea.go.kr/api/{api_key}/COOKRCP01/json/{start}/{end}"
     url = f"{base}/{param}={quote(value)}"
-    r = requests.get(url, timeout=35)
-    if r.status_code != 200:
-        return []
-    try:
-        data = r.json()
-    except Exception:
-        return []
-    co = data.get("COOKRCP01") or {}
-    rows = co.get("row") or []
-    return rows if isinstance(rows, list) else []
+
+    timeout = _env_int("MFDS_TIMEOUT", 35)
+    retries = _env_int("MFDS_RETRIES", 2)
+
+    last_err: Exception | None = None
+    for attempt in range(retries + 1):
+        try:
+            r = requests.get(url, timeout=timeout)
+            # 429/5xx 는 잠깐 쉬고 재시도
+            if r.status_code in (429, 500, 502, 503, 504):
+                last_err = RuntimeError(f"MFDS transient status={r.status_code}")
+                raise last_err
+            if r.status_code != 200:
+                return []
+            try:
+                data = r.json()
+            except Exception:
+                return []
+            co = data.get("COOKRCP01") or {}
+            rows = co.get("row") or []
+            return rows if isinstance(rows, list) else []
+        except Exception as e:
+            # requests 예외/임시오류 -> 재시도 후 포기
+            last_err = e
+            if attempt < retries:
+                time.sleep(1.2 * (attempt + 1))
+                continue
+            return []
 
 
 def mfds_row_to_recipe(row: Dict[str, Any]) -> Recipe:
