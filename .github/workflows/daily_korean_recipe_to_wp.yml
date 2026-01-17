@@ -23,7 +23,7 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install requests openai
+          pip install requests
 
       - name: Run bot
         env:
@@ -31,16 +31,12 @@ jobs:
           WP_USER: ${{ secrets.WP_USER }}
           WP_APP_PASS: ${{ secrets.WP_APP_PASS }}
 
-          # Optional sources
+          # Optional
           MFDS_API_KEY: ${{ secrets.MFDS_API_KEY }}
           DEFAULT_THUMB_URL: ${{ secrets.DEFAULT_THUMB_URL }}
+          PEXELS_API_KEY: ${{ secrets.PEXELS_API_KEY }}
 
-          # OpenAI (optional)
-          USE_OPENAI: "0"
-          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-          OPENAI_MODEL: "gpt-4.1-mini"
-
-          # Publish behavior
+          # Behavior
           WP_STATUS: "publish"
           WP_CATEGORY_IDS: "7"
           WP_TAG_IDS: ""
@@ -51,30 +47,25 @@ jobs:
           DRY_RUN: "0"
           DEBUG: "0"
           AVOID_REPEAT_DAYS: "90"
-          MAX_TRIES: "20"
 
-          # MFDS stability
-          MFDS_REQ_TIMEOUT: "10"
-          MFDS_BUDGET_SECONDS: "20"
-          MFDS_MAX_FAILS: "2"
+          # MFDS 안정화
+          MFDS_TIMEOUT_SEC: "10"
+          MFDS_MAX_SECONDS: "25"
+          MFDS_RETRIES: "1"
+          MFDS_ONLY: "0"   # 1이면 MFDS 실패 시 발행을 건너뜀(워크플로우는 성공 종료)
 
           # Image
-          AUTO_IMAGE: "1"            # 기본이미지 없으면 제목 기반 자동 이미지
           UPLOAD_THUMB: "1"
           SET_FEATURED: "1"
           EMBED_IMAGE_IN_BODY: "1"
           REUSE_MEDIA_BY_SEARCH: "1"
+          AUTO_IMAGE: "1"          # DEFAULT_THUMB_URL도 없고 MFDS 이미지도 없으면 자동 이미지 생성
+          AUTO_IMAGE_PROVIDER: "unsplash"  # unsplash|pexels
 
-          # Content length (short)
-          INTRO_CHARS: "160"
-          SECTION_MIN_CHARS: "420"
-          TOTAL_MIN_CHARS: "1200"
-          HASHTAG_COUNT: "8"
-
-          # Options
-          SCHEMA_MODE: "comment"      # comment|script|off
-          ADD_FAQ: "1"
-          ADD_INTERNAL_LINKS: "0"    # 지난 레시피 링크 제거
+          # Content
+          HASHTAG_COUNT: "10"
+          ADD_FAQ: "0"
+          ADD_INTERNAL_LINKS: "0"  # 요청사항: 지난 레시피 링크 제거
 
         run: |
           python daily_korean_recipe_to_wp.py
