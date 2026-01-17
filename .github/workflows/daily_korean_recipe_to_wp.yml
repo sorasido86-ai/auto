@@ -36,6 +36,7 @@ jobs:
           # MFDS 안정화 (느릴 때 오래 끌지 않게)
           MFDS_TIMEOUT: "8"
           MFDS_RETRIES: "0"
+          MFDS_MAX_FAILS: "3"
           MFDS_BUDGET_SECONDS: "30"
           DEFAULT_THUMB_URL: ${{ secrets.DEFAULT_THUMB_URL }}
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
@@ -59,7 +60,7 @@ jobs:
           EMBED_IMAGE_IN_BODY: "1"
           REUSE_MEDIA_BY_SEARCH: "1"
           AUTO_IMAGE: "1"
-          EXTRA_IMAGE_COUNT: "2"
+          EXTRA_IMAGE_COUNT: "1"
 
           # Naver-friendly content
           NAVER_STYLE: "1"
