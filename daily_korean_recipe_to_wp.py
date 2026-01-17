@@ -165,11 +165,9 @@ LOCAL_KOREAN_RECIPES: List[Dict[str, Any]] = [
 
 KOREAN_NEGATIVE_KEYWORDS = ["파스타", "피자", "타코", "스시", "커리", "샌드위치", "버거", "샐러드"]
 
-DISCLOSURE = "※ 이 글은 레시피 데이터를 기반으로 자동 생성된 포스팅입니다"
-SOURCE_NOTE = "데이터 출처 식품안전나라 식약처 OpenAPI 레시피 DB 및 내장 레시피 폴백"
-SEO_NOTE = "오늘 뭐 먹지 고민될 때 재료 적고 실패 확률 낮은 레시피로 골라왔어요"
-
-
+DISCLOSURE = ""  # 표시하지 않음
+SOURCE_NOTE = ""  # 표시하지 않음
+SEO_NOTE = ""  # 표시하지 않음
 # -----------------------------
 # Env helpers
 # -----------------------------
@@ -238,6 +236,10 @@ class ImageConfig:
     embed_image_in_body: bool = True
     default_thumb_url: str = ""
     reuse_media_by_search: bool = True
+    # 이미지가 없는 레시피도 최소 1장 넣기 (기본: Unsplash Source)
+    auto_image: bool = True
+    # 본문에 추가로 넣을 보조 이미지 수 (대표 이미지 외)
+    extra_image_count: int = 2
 
 
 @dataclass
@@ -317,6 +319,8 @@ def load_cfg() -> AppConfig:
             embed_image_in_body=_env_bool("EMBED_IMAGE_IN_BODY", True),
             default_thumb_url=_env("DEFAULT_THUMB_URL", ""),
             reuse_media_by_search=_env_bool("REUSE_MEDIA_BY_SEARCH", True),
+            auto_image=_env_bool("AUTO_IMAGE", True),
+            extra_image_count=_env_int("EXTRA_IMAGE_COUNT", 2),
         ),
         content=ContentConfig(
             naver_style=_env_bool("NAVER_STYLE", True),
@@ -648,14 +652,14 @@ def mfds_fetch_by_param(api_key: str, param: str, value: str, start: int = 1, en
     - 외부 API(foodsafetykorea)가 종종 느리거나 끊기는 경우가 있어, 타임아웃/일시 오류는 예외로 터뜨리지 않고
       빈 결과([])로 처리해 로컬 레시피 폴백이 가능하도록 한다.
     - 환경변수로 조정 가능:
-        MFDS_TIMEOUT (초, 기본 35)
-        MFDS_RETRIES (재시도 횟수, 기본 2)
+        MFDS_TIMEOUT (초, 기본 12)
+        MFDS_RETRIES (재시도 횟수, 기본 1)
     """
     base = f"https://openapi.foodsafetykorea.go.kr/api/{api_key}/COOKRCP01/json/{start}/{end}"
     url = f"{base}/{param}={quote(value)}"
 
-    timeout = _env_int("MFDS_TIMEOUT", 35)
-    retries = _env_int("MFDS_RETRIES", 2)
+    timeout = _env_int("MFDS_TIMEOUT", 12)
+    retries = _env_int("MFDS_RETRIES", 1)
 
     last_err: Exception | None = None
     for attempt in range(retries + 1):
@@ -727,8 +731,8 @@ def pick_recipe_mfds(cfg: AppConfig, recent_pairs: List[Tuple[str, str]]) -> Opt
     used = set(recent_pairs)
     keywords = ["김치", "된장", "고추장", "국", "찌개", "볶음", "전", "조림", "비빔", "나물", "탕", "죽", "김밥", "떡"]
     # MFDS가 느리거나 장애가 있을 때, 무한정 오래 기다리지 않도록 시간 예산을 둡니다.
-    # MFDS_BUDGET_SECONDS: MFDS 시도에 쓸 총 시간(초). 0이면 비활성 (기본 30)
-    budget = _env_int("MFDS_BUDGET_SECONDS", 30)
+    # MFDS_BUDGET_SECONDS: MFDS 시도에 쓸 총 시간(초). 0이면 비활성 (기본 20)
+    budget = _env_int("MFDS_BUDGET_SECONDS", 20)
     t0 = time.time()
 
     for i in range(cfg.run.max_tries):
@@ -840,13 +844,27 @@ def _wrap_p_br(lines: List[str]) -> str:
 def _ensure_min_chars(section_html: str, min_chars: int, fillers: List[str]) -> str:
     """섹션 글자수를 min_chars 이상으로 보강
     - fillers는 마침표 없는 문장들로 준비
+    - 같은 문장이 연속으로 붙거나, 마지막(해시태그/마무리) 뒤에 덧붙어 글이 꼬이는 것을 줄임
     """
     out = section_html
+    if not fillers:
+        return out
+    pool = list(fillers)
+    random.shuffle(pool)
+    last = ""
     tries = 0
-    while _plain_len(out) < min_chars and tries < 60:
+    while _plain_len(out) < min_chars and tries < 120:
         tries += 1
-        out += _wrap_p(random.choice(fillers))
+        if not pool:
+            pool = list(fillers)
+            random.shuffle(pool)
+        pick = pool.pop()
+        if pick == last:
+            continue
+        last = pick
+        out += _wrap_p(pick)
     return out
+
 
 
 def _clean_title_for_tags(title: str) -> List[str]:
@@ -898,9 +916,60 @@ def build_hashtags(cfg: AppConfig, recipe: Recipe) -> str:
     return " ".join([f"#{x}" for x in uniq[:n]])
 
 
+def _unsplash_source_url(query: str, w: int = 1600, h: int = 900) -> str:
+    """간단한 무료 이미지 소스(원격).
+    - query 예: 'korean food,김치찌개'
+    - 다운로드/업로드 용도로도 사용 가능(리다이렉트로 실제 이미지 제공)
+    """
+    q = quote(query)
+    return f"https://source.unsplash.com/{w}x{h}/?{q}"
+
+
 def choose_thumb_url(cfg: AppConfig, recipe: Recipe) -> str:
-    # 레시피 이미지가 비어도 기본 이미지로 대체
-    return (recipe.image_url or "").strip() or (cfg.img.default_thumb_url or "").strip()
+    # 1) MFDS/로컬이 제공한 이미지
+    u = (recipe.image_url or "").strip()
+    if u:
+        return u
+    # 2) 사용자가 지정한 기본 썸네일
+    d = (cfg.img.default_thumb_url or "").strip()
+    if d:
+        return d
+    # 3) 그래도 없으면 자동 이미지(기본 on)
+    if getattr(cfg.img, 'auto_image', True):
+        return _unsplash_source_url(f"korean food,{recipe.title}")
+    return ""
+
+
+def extra_image_urls(cfg: AppConfig, recipe: Recipe, primary_url: str) -> List[str]:
+    """본문에 추가로 넣을 보조 이미지 URL 목록
+    - step_images가 있으면 그걸 우선 사용
+    - 없으면 자동 이미지 소스로 1~N장 생성
+    """
+    urls: List[str] = []
+    # MFDS 과정이미지가 있으면 그걸 먼저
+    for u in (recipe.step_images or []):
+        if u and u.startswith('http') and u != primary_url:
+            urls.append(u)
+        if len(urls) >= int(getattr(cfg.img, 'extra_image_count', 2) or 0):
+            return urls
+
+    n = int(getattr(cfg.img, 'extra_image_count', 2) or 0)
+    if n <= 0 or not getattr(cfg.img, 'auto_image', True):
+        return urls
+
+    # 자동 생성(원격)
+    queries = [
+        f"korean food,{recipe.title}",
+        f"korean home cooking,{recipe.title}",
+        "korean ingredients,home cooking",
+    ]
+    for q in queries:
+        u = _unsplash_source_url(q, 1200, 800)
+        if u != primary_url:
+            urls.append(u)
+        if len(urls) >= n:
+            break
+    return urls
 
 
 def build_recipe_schema_json(recipe: Recipe, image_url: str, now: datetime) -> str:
@@ -999,17 +1068,18 @@ def _build_intro_200_300(keyword: str) -> str:
 
 def _section_fillers(keyword: str) -> List[str]:
     kw = _no_period(keyword).strip()
+    # 끝맺음/CTA 성격 문장(저장해요, 오늘은 등)은 제외해서 글 말미가 반복되거나 꼬이지 않게
     return [
-        f"{kw}는 사실 재료보다 순서가 더 중요해요 그래서 한 번만 흐름을 잡아두면 다음부터는 눈 감고도 할 수 있어요",
+        f"{kw}는 사실 재료보다 순서가 더 중요해요 그래서 한 번만 흐름을 잡아두면 다음부터는 훨씬 편해져요",
         "중요한 건 한 번에 완벽하게 하려는 마음을 내려놓는 거예요 오늘은 안전하게 성공하는 쪽으로만 가요",
         "간은 중간에 맞추기보다 마지막에 조절하는 게 훨씬 안정적이에요 중간에 맞추면 졸아들면서 짜지기 쉬워요",
         "불을 세게 해서 빨리 끝내려고 하면 향이 날아가거나 재료가 굳을 때가 있어요 중불에서 천천히가 결국 이득이에요",
         "재료가 하나 빠져도 괜찮아요 핵심은 간 불 시간이라서 그 세 가지만 지키면 맛이 크게 무너지지 않아요",
-        "맛이 애매하면 소금이나 간장부터 더 넣기 전에 단맛이나 향을 아주 조금만 더해보는 게 의외로 해결이 빨라요",
+        "맛이 애매하면 소금이나 간장부터 더 넣기 전에 단맛이나 향을 아주 조금만 더해보는 게 해결이 빨라요",
         "처음엔 양을 줄여서 해보는 것도 좋아요 성공 경험을 한 번 만들면 다음부터 마음이 편해져요",
-        "남은 음식은 다음날이 더 맛있을 때가 있어요 대신 재가열할 때 간을 다시 보지 말고 마지막에만 살짝 잡아주세요",
-        "저는 이런 레시피는 저장해두고 장볼 때마다 하나씩 돌려보는 편이에요 그러면 식단 고민이 훨씬 줄어들어요",
-        f"오늘 {kw}는 과하게 꾸미지 않고도 충분히 만족스럽게 나오는 쪽으로 잡았어요",
+        "남은 음식은 다음날이 더 맛있을 때가 있어요 대신 재가열할 때 간은 마지막에만 살짝 잡아주세요",
+        "칼칼함은 마지막에 올리고 고소함은 시작에 깔아두는 게 좋아요 고춧가루와 참기름 타이밍이 의외로 큽니다",
+        "식감은 손대는 횟수가 적을수록 좋아요 뒤적이는 횟수를 줄이면 재료가 덜 부서지고 훨씬 깔끔해져요",
     ]
 
 
@@ -1058,15 +1128,6 @@ def build_body_html(
     img_html = ""
     if cfg.img.embed_image_in_body and display_img_url:
         img_html = f'<p><img src="{_esc(display_img_url)}" alt="{_esc(keyword)}"/></p>'
-
-    # 공통 안내
-    head_lines = [
-        DISCLOSURE,
-        f"기준시각 {now.astimezone(KST).strftime('%Y-%m-%d %H:%M')}  슬롯 {run_slot_label}",
-        SEO_NOTE,
-        SOURCE_NOTE,
-    ]
-    head_block = _wrap_p_br([_no_period(x) for x in head_lines])
 
     # --------
     # 섹션 3개
@@ -1172,8 +1233,7 @@ def build_body_html(
             for link, t in items:
                 # 링크 텍스트는 마침표 제거만, URL은 그대로
                 sec3 += f"<p><a href='{_esc(link)}'>{_esc(_no_period(t))}</a></p>"
-
-    # 저장/댓글 유도
+    # 저장/댓글 유도 (말투는 유지하되 중복/반복은 최소화)
     sec3 += _wrap_p(
         _no_period(
             "이 글은 저장해두면 진짜 편해요  다음에 오늘 뭐 먹지 할 때 고민 시간이 확 줄거든요  저는 이런 글은 장보기 전에 한 번씩만 훑어보는 편이에요"
@@ -1185,16 +1245,23 @@ def build_body_html(
         )
     )
 
-    hashtags = build_hashtags(cfg, recipe)
-    sec3 += "<hr/>" + _wrap_p(_no_period(hashtags))
-
+    # ✅ 섹션 길이 보강은 '마무리 요소'를 붙이기 전에 끝내기 (끝부분 꼬임/반복 방지)
     sec3 = _ensure_min_chars(sec3, 1500, fillers)
+
+    # 선택적으로 출처 표기 (기본 OFF)
+    if _env_bool('SHOW_SOURCE', False):
+        sec3 += _wrap_p(_no_period('레시피 참고  식품안전나라 공개 레시피 DB를 참고했어요'))
+
+    hashtags = build_hashtags(cfg, recipe)
+    sec3 += '<hr/>' + _wrap_p(_no_period(hashtags))
 
     # 본문 합치기
     body_html = schema_block
-    body_html += head_block
     body_html += _wrap_p(intro_txt)
     body_html += img_html
+    # 보조 이미지(없으면 자동 생성)
+    for u in extra_image_urls(cfg, recipe, display_img_url):
+        body_html += f"<p><img src='{_esc(u)}' alt='{_esc(keyword)} 사진'/></p>"
     body_html += sec1 + sec2 + sec3
 
     return body_html, excerpt
@@ -1304,7 +1371,7 @@ def run(cfg: AppConfig) -> None:
 
     # 레시피 이미지 없으면 기본 이미지로
     thumb_url = choose_thumb_url(cfg, chosen)
-    if not chosen.image_url and not cfg.img.default_thumb_url:
+    if (not chosen.image_url) and (not cfg.img.default_thumb_url) and (not cfg.img.auto_image):
         print("[WARN] recipe image empty AND DEFAULT_THUMB_URL empty  featured 이미지 없이 발행될 수 있어요")
 
     media_id = 0
