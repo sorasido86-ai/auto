@@ -1,24 +1,62 @@
 # -*- coding: utf-8 -*-
 """
-daily_recipe_to_wp_naverstyle_FINAL.py (통합 최종본 / 들여쓰기 오류 제거 / HTML 깨짐 방지)
-- 제목: 4가지 후킹 유형(이득/위협/궁금/비교논쟁) 중 랜덤 1개 + 키워드 포함
-- 재료/만드는 흐름: 번역 필수(JSON) + 영어 남으면 1회 재번역
-- 글: 네이버 홈피드형(도입 200~300자 + 굵은 소제목 3개 + 충분한 분량)
-- 톤: 친구에게 수다떠는 존댓말(반말 섞이면 재생성 시도)
-- 마침표/불릿/단계번호: "텍스트 노드"에서만 제거 (HTML 태그/속성/스타일 절대 보호)
-- WP: 하루 중복 실행돼도 '항상 새 글 발행'(업데이트 X) -> slug에 시간+랜덤
+daily_recipe_to_wp_naverstyle_FINAL.py (완전 통합본)
+
+- TheMealDB 랜덤 레시피 수집
+- (선택) Pexels 고퀄 음식 사진 검색(썸네일) -> PEXELS_API_KEY 필요
+- OpenAI로:
+  1) 레시피(제목/재료/방법) 한국어 번역 JSON
+  2) 네이버 홈피드형 "친구 수다 존댓말(해요체)" 본문 JSON 생성
+- WordPress 발행 (항상 새 글) + 썸네일 업로드/대표이미지 설정
+- SQLite: 최근 레시피 중복 회피용 기록
+
+필수 env (GitHub Secrets):
+  - WP_BASE_URL
+  - WP_USER
+  - WP_APP_PASS
+  - OPENAI_API_KEY
+
+권장 env:
+  - WP_STATUS=publish
+  - WP_CATEGORY_IDS="7"
+  - WP_TAG_IDS="" (선택)
+  - SQLITE_PATH=data/daily_recipe.sqlite3
+
+옵션:
+  - OPENAI_MODEL=gpt-4.1-mini (기본)
+  - OPENAI_MAX_RETRIES=3
+  - DRY_RUN=0|1
+  - DEBUG=0|1
+  - AVOID_REPEAT_DAYS=90
+  - MAX_TRIES=30
+
+네이버 스타일:
+  - NAVER_RANDOM_LEVEL=0~3 (기본 2)
+  - NAVER_EXPERIENCE_LEVEL=0~3 (기본 2)
+  - NAVER_MAIN_KEYWORD="" (비우면 레시피명(한글번역)을 키워드로 사용)
+  - NAVER_KEYWORDS="집밥,간단요리,..." (해시태그/자연스러운 키워드용)
+  - NAVER_SECTION_MIN_CHARS=1500 (기본 1500)
+  - NAVER_INTRO_MIN=200 (기본 200)
+  - NAVER_INTRO_MAX=300 (기본 300)
+
+레시피 필터:
+  - PREFER_AREAS="Korean,Japanese,Chinese" (선택)
+  - BLOCK_CATEGORIES="Dessert,Drink" (선택)
+
+썸네일 고퀄(선택):
+  - PEXELS_API_KEY=...
 """
 
 from __future__ import annotations
 
 import base64
+import html as _html
 import json
 import os
 import random
 import re
 import sqlite3
 import time
-import html as _html
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -26,15 +64,13 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import requests
 
-import openai  # 예외 타입 호환용
+import openai  # exception types
 from openai import OpenAI
 
 KST = timezone(timedelta(hours=9))
 
 THEMEALDB_RANDOM = "https://www.themealdb.com/api/json/v1/1/random.php"
-PEXELS_SEARCH = "https://api.pexels.com/v1/search"
-
-TAG_SPLIT_RE = re.compile(r"(<[^>]+>)")
+THEMEALDB_LOOKUP = "https://www.themealdb.com/api/json/v1/1/lookup.php?i={id}"
 
 
 # -----------------------------
@@ -79,12 +115,8 @@ def _parse_str_list(csv: str) -> List[str]:
     return out
 
 
-def _now_kst() -> datetime:
-    return datetime.now(tz=KST)
-
-
 # -----------------------------
-# Config
+# Config models
 # -----------------------------
 @dataclass
 class WordPressConfig:
@@ -98,23 +130,27 @@ class WordPressConfig:
 
 @dataclass
 class RunConfig:
-    run_slot: str = "day"     # day / am / pm
     dry_run: bool = False
     debug: bool = False
-    force_new: bool = True    # 항상 새 글
     avoid_repeat_days: int = 90
-    max_tries: int = 20
+    max_tries: int = 30
+    openai_max_retries: int = 3
     upload_thumb: bool = True
     set_featured: bool = True
     embed_image_in_body: bool = True
-    openai_max_retries: int = 3
 
 
 @dataclass
 class NaverStyleConfig:
-    main_keyword: str = ""      # 제목 키워드 강제 (비우면 레시피명 사용)
-    keywords_csv: str = ""      # 태그 힌트
+    random_level: int = 2
+    experience_level: int = 2
+    main_keyword: str = ""
+    keywords_csv: str = ""
     prefer_areas: List[str] = field(default_factory=list)
+    block_categories: List[str] = field(default_factory=list)
+    intro_min: int = 200
+    intro_max: int = 300
+    section_min_chars: int = 1500
 
 
 @dataclass
@@ -124,13 +160,18 @@ class OpenAIConfig:
 
 
 @dataclass
+class MediaConfig:
+    pexels_api_key: str = ""
+
+
+@dataclass
 class AppConfig:
     wp: WordPressConfig
     run: RunConfig
     naver: NaverStyleConfig
     sqlite_path: str
     openai: OpenAIConfig
-    pexels_api_key: str = ""
+    media: MediaConfig
 
 
 def load_cfg() -> AppConfig:
@@ -138,35 +179,35 @@ def load_cfg() -> AppConfig:
     wp_user = _env("WP_USER")
     wp_pass = _env("WP_APP_PASS")
     wp_status = _env("WP_STATUS", "publish") or "publish"
-
     cat_ids = _parse_int_list(_env("WP_CATEGORY_IDS", "7"))
     tag_ids = _parse_int_list(_env("WP_TAG_IDS", ""))
 
     sqlite_path = _env("SQLITE_PATH", "data/daily_recipe.sqlite3")
 
-    run_slot = (_env("RUN_SLOT", "day") or "day").lower()
-    if run_slot not in ("day", "am", "pm"):
-        run_slot = "day"
-
-    cfg_run = RunConfig(
-        run_slot=run_slot,
+    run = RunConfig(
         dry_run=_env_bool("DRY_RUN", False),
         debug=_env_bool("DEBUG", False),
-        force_new=_env_bool("FORCE_NEW", True),
         avoid_repeat_days=_env_int("AVOID_REPEAT_DAYS", 90),
-        max_tries=_env_int("MAX_TRIES", 20),
+        max_tries=_env_int("MAX_TRIES", 30),
+        openai_max_retries=_env_int("OPENAI_MAX_RETRIES", 3),
         upload_thumb=_env_bool("UPLOAD_THUMB", True),
         set_featured=_env_bool("SET_FEATURED", True),
         embed_image_in_body=_env_bool("EMBED_IMAGE_IN_BODY", True),
-        openai_max_retries=_env_int("OPENAI_MAX_RETRIES", 3),
     )
+
+    naver_random_level = max(0, min(3, _env_int("NAVER_RANDOM_LEVEL", 2)))
+    naver_exp_level = max(0, min(3, _env_int("NAVER_EXPERIENCE_LEVEL", 2)))
+    naver_main_kw = _env("NAVER_MAIN_KEYWORD", "")
+    naver_kws = _env("NAVER_KEYWORDS", "")
+    prefer_areas = _parse_str_list(_env("PREFER_AREAS", ""))
+    block_categories = _parse_str_list(_env("BLOCK_CATEGORIES", ""))
+
+    intro_min = max(120, _env_int("NAVER_INTRO_MIN", 200))
+    intro_max = max(intro_min + 20, _env_int("NAVER_INTRO_MAX", 300))
+    section_min_chars = max(700, _env_int("NAVER_SECTION_MIN_CHARS", 1500))
 
     openai_key = _env("OPENAI_API_KEY", "")
     openai_model = _env("OPENAI_MODEL", "gpt-4.1-mini") or "gpt-4.1-mini"
-
-    main_kw = _env("NAVER_MAIN_KEYWORD", "")
-    keywords_csv = _env("NAVER_KEYWORDS", "")
-    prefer_areas = _parse_str_list(_env("PREFER_AREAS", ""))
 
     pexels_key = _env("PEXELS_API_KEY", "")
 
@@ -179,15 +220,21 @@ def load_cfg() -> AppConfig:
             category_ids=cat_ids,
             tag_ids=tag_ids,
         ),
-        run=cfg_run,
+        run=run,
         naver=NaverStyleConfig(
-            main_keyword=main_kw,
-            keywords_csv=keywords_csv,
+            random_level=naver_random_level,
+            experience_level=naver_exp_level,
+            main_keyword=naver_main_kw,
+            keywords_csv=naver_kws,
             prefer_areas=prefer_areas,
+            block_categories=block_categories,
+            intro_min=intro_min,
+            intro_max=intro_max,
+            section_min_chars=section_min_chars,
         ),
         sqlite_path=sqlite_path,
         openai=OpenAIConfig(api_key=openai_key, model=openai_model),
-        pexels_api_key=pexels_key,
+        media=MediaConfig(pexels_api_key=pexels_key),
     )
 
 
@@ -216,27 +263,28 @@ def print_safe_cfg(cfg: AppConfig) -> None:
     print("[CFG] WP_CATEGORY_IDS:", cfg.wp.category_ids)
     print("[CFG] WP_TAG_IDS:", cfg.wp.tag_ids)
     print("[CFG] SQLITE_PATH:", cfg.sqlite_path)
-    print("[CFG] RUN_SLOT:", cfg.run.run_slot, "| FORCE_NEW:", int(cfg.run.force_new))
     print("[CFG] DRY_RUN:", int(cfg.run.dry_run), "| DEBUG:", int(cfg.run.debug))
     print("[CFG] OPENAI_MODEL:", cfg.openai.model, "| OPENAI_KEY:", ok(cfg.openai.api_key))
+    print("[CFG] NAVER_RANDOM_LEVEL:", cfg.naver.random_level, "| NAVER_EXPERIENCE_LEVEL:", cfg.naver.experience_level)
     print("[CFG] NAVER_MAIN_KEYWORD:", cfg.naver.main_keyword or "(auto)")
     print("[CFG] NAVER_KEYWORDS:", cfg.naver.keywords_csv or "(empty)")
+    print("[CFG] INTRO_MIN/MAX:", cfg.naver.intro_min, "/", cfg.naver.intro_max, "| SECTION_MIN_CHARS:", cfg.naver.section_min_chars)
     print("[CFG] PREFER_AREAS:", ",".join(cfg.naver.prefer_areas) if cfg.naver.prefer_areas else "(any)")
-    print("[CFG] PEXELS_API_KEY:", ok(cfg.pexels_api_key))
+    print("[CFG] BLOCK_CATEGORIES:", ",".join(cfg.naver.block_categories) if cfg.naver.block_categories else "(none)")
+    print("[CFG] PEXELS_API_KEY:", ok(cfg.media.pexels_api_key))
 
 
 # -----------------------------
-# SQLite (history)
+# SQLite: history for avoiding repeats
 # -----------------------------
-DB_SQL = """
-CREATE TABLE IF NOT EXISTS daily_posts_v2 (
+POSTS_SQL = """
+CREATE TABLE IF NOT EXISTS posts (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
-  created_at TEXT,
   recipe_id TEXT,
   recipe_title_en TEXT,
-  recipe_title_ko TEXT,
   wp_post_id INTEGER,
-  wp_link TEXT
+  wp_link TEXT,
+  created_at TEXT
 )
 """
 
@@ -245,47 +293,32 @@ def init_db(path: str) -> None:
     Path(path).parent.mkdir(parents=True, exist_ok=True)
     con = sqlite3.connect(path)
     cur = con.cursor()
-    cur.execute(DB_SQL)
+    cur.execute(POSTS_SQL)
     con.commit()
     con.close()
 
 
-def save_post_meta_v2(
-    path: str,
-    recipe_id: str,
-    recipe_title_en: str,
-    recipe_title_ko: str,
-    wp_post_id: int,
-    wp_link: str,
-) -> None:
+def save_post_row(path: str, recipe_id: str, recipe_title_en: str, wp_post_id: int, wp_link: str) -> None:
     con = sqlite3.connect(path)
     cur = con.cursor()
     cur.execute(
-        "INSERT INTO daily_posts_v2(created_at, recipe_id, recipe_title_en, recipe_title_ko, wp_post_id, wp_link) VALUES (?, ?, ?, ?, ?, ?)",
-        (
-            datetime.utcnow().isoformat(),
-            recipe_id or "",
-            recipe_title_en or "",
-            recipe_title_ko or "",
-            int(wp_post_id),
-            wp_link or "",
-        ),
+        "INSERT INTO posts(recipe_id, recipe_title_en, wp_post_id, wp_link, created_at) VALUES (?,?,?,?,?)",
+        (recipe_id, recipe_title_en, int(wp_post_id), wp_link, datetime.utcnow().isoformat()),
     )
     con.commit()
     con.close()
 
 
 def get_recent_recipe_ids(path: str, days: int) -> List[str]:
+    cutoff = (datetime.utcnow() - timedelta(days=days)).isoformat()
+    con = sqlite3.connect(path)
+    cur = con.cursor()
     try:
-        cutoff = (datetime.utcnow() - timedelta(days=days)).isoformat()
-        con = sqlite3.connect(path)
-        cur = con.cursor()
-        cur.execute("SELECT recipe_id FROM daily_posts_v2 WHERE created_at >= ? AND recipe_id IS NOT NULL", (cutoff,))
+        cur.execute("SELECT recipe_id FROM posts WHERE created_at >= ? AND recipe_id IS NOT NULL", (cutoff,))
         rows = cur.fetchall()
-        con.close()
         return [str(r[0]) for r in rows if r and r[0]]
-    except Exception:
-        return []
+    finally:
+        con.close()
 
 
 # -----------------------------
@@ -293,14 +326,14 @@ def get_recent_recipe_ids(path: str, days: int) -> List[str]:
 # -----------------------------
 def wp_auth_header(user: str, app_pass: str) -> Dict[str, str]:
     token = base64.b64encode(f"{user}:{app_pass}".encode("utf-8")).decode("utf-8")
-    return {"Authorization": f"Basic {token}", "User-Agent": "naverstyle-recipe-bot/1.0"}
+    return {"Authorization": f"Basic {token}", "User-Agent": "daily-recipe-bot/2.0"}
 
 
 def wp_create_post(cfg: WordPressConfig, title: str, slug: str, html: str, featured_media: Optional[int]) -> Tuple[int, str]:
     url = cfg.base_url.rstrip("/") + "/wp-json/wp/v2/posts"
     headers = {**wp_auth_header(cfg.user, cfg.app_pass), "Content-Type": "application/json"}
-
     payload: Dict[str, Any] = {"title": title, "slug": slug, "content": html, "status": cfg.status}
+
     if cfg.category_ids:
         payload["categories"] = cfg.category_ids
     if cfg.tag_ids:
@@ -308,40 +341,41 @@ def wp_create_post(cfg: WordPressConfig, title: str, slug: str, html: str, featu
     if featured_media:
         payload["featured_media"] = int(featured_media)
 
-    r = requests.post(url, headers=headers, json=payload, timeout=60)
+    r = requests.post(url, headers=headers, json=payload, timeout=40)
     if r.status_code not in (200, 201):
-        raise RuntimeError(f"WP create failed: {r.status_code} body={r.text[:600]}")
+        raise RuntimeError(f"WP create failed: {r.status_code} body={r.text[:800]}")
     data = r.json()
     return int(data["id"]), str(data.get("link") or "")
 
 
-def wp_upload_media(cfg: WordPressConfig, image_url: str, filename_hint: str = "thumb.jpg") -> Tuple[int, str]:
+def wp_upload_media(cfg: WordPressConfig, image_url: str, filename_hint: str = "recipe.jpg") -> Tuple[int, str]:
     media_endpoint = cfg.base_url.rstrip("/") + "/wp-json/wp/v2/media"
     headers = wp_auth_header(cfg.user, cfg.app_pass).copy()
 
-    r = requests.get(image_url, timeout=60)
+    r = requests.get(image_url, timeout=40)
     if r.status_code != 200 or not r.content:
         raise RuntimeError(f"Image download failed: {r.status_code} url={image_url}")
 
     content = r.content
     ctype = (r.headers.get("Content-Type") or "image/jpeg").split(";")[0].strip().lower()
-    safe_name = re.sub(r"[^a-zA-Z0-9._-]+", "-", filename_hint).strip("-") or "thumb.jpg"
+
+    safe_name = re.sub(r"[^a-zA-Z0-9._-]+", "-", filename_hint).strip("-") or "recipe.jpg"
     if "." not in safe_name:
         safe_name += ".jpg"
 
     headers["Content-Type"] = ctype
     headers["Content-Disposition"] = f'attachment; filename="{safe_name}"'
 
-    up = requests.post(media_endpoint, headers=headers, data=content, timeout=90)
+    up = requests.post(media_endpoint, headers=headers, data=content, timeout=60)
     if up.status_code not in (200, 201):
-        raise RuntimeError(f"WP media upload failed: {up.status_code} body={up.text[:600]}")
+        raise RuntimeError(f"WP media upload failed: {up.status_code} body={up.text[:800]}")
 
     data = up.json()
     return int(data["id"]), str(data.get("source_url") or "")
 
 
 # -----------------------------
-# TheMealDB
+# Recipe fetch (TheMealDB)
 # -----------------------------
 def fetch_random_recipe() -> Dict[str, Any]:
     r = requests.get(THEMEALDB_RANDOM, timeout=25)
@@ -351,6 +385,18 @@ def fetch_random_recipe() -> Dict[str, Any]:
     meals = j.get("meals") or []
     if not meals:
         raise RuntimeError("Recipe API returned empty meals")
+    return _normalize_meal(meals[0])
+
+
+def fetch_recipe_by_id(recipe_id: str) -> Dict[str, Any]:
+    url = THEMEALDB_LOOKUP.format(id=recipe_id)
+    r = requests.get(url, timeout=25)
+    if r.status_code != 200:
+        raise RuntimeError(f"Recipe lookup failed: {r.status_code}")
+    j = r.json()
+    meals = j.get("meals") or []
+    if not meals:
+        raise RuntimeError("Recipe lookup returned empty meals")
     return _normalize_meal(meals[0])
 
 
@@ -371,11 +417,11 @@ def _normalize_meal(m: Dict[str, Any]) -> Dict[str, Any]:
 
     return {
         "id": recipe_id,
-        "title_en": title,
-        "category_en": category,
-        "area_en": area,
-        "instructions_en": instructions,
-        "ingredients_en": ingredients,
+        "title": title,
+        "category": category,
+        "area": area,
+        "instructions": instructions,
+        "ingredients": ingredients,
         "thumb": thumb,
         "source": str(m.get("strSource") or "").strip(),
         "youtube": str(m.get("strYoutube") or "").strip(),
@@ -387,130 +433,51 @@ def split_steps(instructions: str) -> List[str]:
     if not t:
         return []
     parts = [p.strip() for p in re.split(r"\r?\n+", t) if p.strip()]
-    if len(parts) <= 2 and len(t) > 400:
+    if len(parts) <= 2 and len(t) > 350:
         parts = [p.strip() for p in re.split(r"(?<=[.!?])\s+", t) if p.strip()]
-    return parts
+    return [p for p in parts if p]
 
 
 # -----------------------------
-# Pexels thumbnail
+# Pexels (optional high quality food image)
 # -----------------------------
-def pexels_pick_photo_url(api_key: str, query: str, debug: bool = False) -> Optional[str]:
+def pexels_search_food_image(api_key: str, query: str, debug: bool = False) -> str:
     if not api_key:
-        return None
+        return ""
     q = (query or "").strip()
     if not q:
-        return None
+        return ""
+    url = "https://api.pexels.com/v1/search"
+    headers = {"Authorization": api_key}
+    params = {"query": f"{q} food", "per_page": 10, "orientation": "landscape"}
     try:
-        headers = {"Authorization": api_key}
-        params = {"query": q, "per_page": 10, "orientation": "landscape"}
-        r = requests.get(PEXELS_SEARCH, headers=headers, params=params, timeout=25)
+        r = requests.get(url, headers=headers, params=params, timeout=25)
         if r.status_code != 200:
             if debug:
                 print("[PEXELS] non-200:", r.status_code, r.text[:200])
-            return None
+            return ""
         j = r.json()
         photos = j.get("photos") or []
         if not photos:
-            return None
-        p = random.choice(photos)
-        src = (p.get("src") or {})
-        for k in ("large2x", "original", "large", "medium"):
-            u = (src.get(k) or "").strip()
-            if u:
-                return u
-        return None
+            return ""
+        # 최대한 고해상도
+        src = photos[0].get("src") or {}
+        return str(src.get("large2x") or src.get("large") or src.get("original") or "").strip()
     except Exception as e:
         if debug:
             print("[PEXELS] failed:", repr(e))
-        return None
+        return ""
 
 
 # -----------------------------
-# Safe HTML text-node processing (태그 보호)
+# OpenAI helpers
 # -----------------------------
-def _split_html_keep_tags(html: str) -> List[str]:
-    return TAG_SPLIT_RE.split(html or "")
+def _is_insufficient_quota_error(e: Exception) -> bool:
+    s = (repr(e) or "") + " " + (str(e) or "")
+    s = s.lower()
+    return ("insufficient_quota" in s) or ("exceeded your current quota" in s) or ("check your plan and billing" in s)
 
 
-def _html_text_only(html: str) -> str:
-    return re.sub(r"<[^>]+>", "", html or "")
-
-
-def _has_english_in_text(html: str) -> bool:
-    return bool(re.search(r"[A-Za-z]", _html_text_only(html)))
-
-
-def _text_remove_bullets_and_stepnums(s: str) -> str:
-    s = re.sub(r"[•·●◦▪▫■□▶►➤]\s*", "", s)
-    s = re.sub(r"\b\d+\s*단계\b", "", s)
-    s = re.sub(r"\bstep\s*\d+\b", "", s, flags=re.I)
-    s = re.sub(r"\b\d+\)\s*", "", s)
-    s = re.sub(r"^\s*\d+\s*[):-]\s*", "", s, flags=re.M)
-    return s
-
-
-def _text_remove_periods(s: str) -> str:
-    # 숫자 소수점은 유지하고 문장 마침표 성격만 제거
-    s = re.sub(r"(?<!\d)\.(?!\d)", "", s)
-    s = s.replace("。", "")
-    return s
-
-
-def _text_remove_english_words(s: str) -> str:
-    # 2글자 이상 영단어만 제거(ml, g 같은 단위는 남을 수 있음)
-    s = re.sub(r"\b[A-Za-z]{2,}\b", "", s)
-    s = re.sub(r"\s{2,}", " ", s)
-    return s
-
-
-def clean_html_text_nodes(html: str) -> str:
-    parts = _split_html_keep_tags(html)
-    out: List[str] = []
-    for p in parts:
-        if not p:
-            continue
-        if p.startswith("<") and p.endswith(">"):
-            out.append(p)  # 태그는 그대로
-        else:
-            t = p
-            t = _text_remove_bullets_and_stepnums(t)
-            t = _text_remove_periods(t)
-            t = _text_remove_english_words(t)
-            out.append(t)
-    cleaned = "".join(out)
-    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
-    return cleaned.strip()
-
-
-def _dedupe_lines_text(s: str) -> str:
-    lines = [ln.rstrip() for ln in (s or "").splitlines()]
-    out = []
-    seen = set()
-    for ln in lines:
-        key = re.sub(r"\s+", " ", re.sub(r"<[^>]+>", "", ln).strip())
-        if not key:
-            out.append("")
-            continue
-        if key in seen:
-            continue
-        seen.add(key)
-        out.append(ln)
-    merged = "\n".join(out)
-    merged = re.sub(r"\n{3,}", "\n\n", merged)
-    return merged.strip()
-
-
-def _polite_enough(html: str) -> bool:
-    t = _html_text_only(html)
-    yo = len(re.findall(r"요(\s|$)", t))
-    seumnida = len(re.findall(r"습니다(\s|$)", t))
-    return (yo + seumnida) >= 25
-
-
-# -----------------------------
-# OpenAI helpers (들여쓰기/탭 문제 없는 버전)
-# -----------------------------
 def _openai_call_with_retry(
     client: OpenAI,
     model: str,
@@ -519,320 +486,490 @@ def _openai_call_with_retry(
     max_retries: int,
     debug: bool = False,
 ):
-    last_err: Optional[Exception] = None
+    last = None
     for attempt in range(max_retries + 1):
         try:
-            return client.responses.create(
-                model=model,
-                instructions=instructions,
-                input=input_text,
-            )
+            return client.responses.create(model=model, instructions=instructions, input=input_text)
         except openai.RateLimitError as e:
-            last_err = e
-            if attempt == max_retries:
+            last = e
+            if _is_insufficient_quota_error(e):
+                raise
+            if attempt >= max_retries:
                 raise
             sleep_s = (2 ** attempt) + random.random()
             if debug:
-                print(f"[OPENAI] RateLimit -> retry in {sleep_s:.2f}s")
+                print(f"[OPENAI] RateLimit -> retry {sleep_s:.2f}s")
             time.sleep(sleep_s)
         except openai.APIError as e:
-            last_err = e
-            if attempt == max_retries:
+            last = e
+            if attempt >= max_retries:
                 raise
             sleep_s = (2 ** attempt) + random.random()
             if debug:
-                print(f"[OPENAI] APIError -> retry in {sleep_s:.2f}s | {repr(e)}")
+                print(f"[OPENAI] APIError -> retry {sleep_s:.2f}s")
             time.sleep(sleep_s)
         except Exception as e:
-            last_err = e
-            if attempt == max_retries:
+            last = e
+            if attempt >= max_retries:
                 raise
             sleep_s = (2 ** attempt) + random.random()
             if debug:
-                print(f"[OPENAI] UnknownError -> retry in {sleep_s:.2f}s | {repr(e)}")
+                print(f"[OPENAI] Unknown -> retry {sleep_s:.2f}s | {repr(e)}")
             time.sleep(sleep_s)
-    if last_err:
-        raise last_err
-    raise RuntimeError("OpenAI call failed")
+    raise last  # pragma: no cover
 
 
-# -----------------------------
-# Title hooks (4 types random)
-# -----------------------------
-def make_hook_title(keyword: str) -> str:
-    kw = (keyword or "").strip() or "오늘 메뉴"
-
-    benefit = [
-        f"{kw}  이번에 이 기준 하나 잡으니까 맛이 달라지더라고요",
-        f"{kw}  괜히 어렵게 느껴졌는데  의외로 이 포인트가 전부였어요",
-        f"{kw}  한 번만 이렇게 해두면  다음부터는 편하게 갑니다",
-    ]
-    threat = [
-        f"{kw}  여기서 흔들리면  전체가 밍밍해지는 경우가 많아요",
-        f"{kw}  이 타이밍 놓치면  식감이 확 달라져서 아쉬워지더라고요",
-        f"{kw}  대충 넘어가면  마지막에 간이 안 잡히는 패턴이 자주 나와요",
-    ]
-    curious = [
-        f"{kw}  왜 똑같이 했는데 결과가 갈릴까요  딱 이 지점이에요",
-        f"{kw}  평소에 애매했던 포인트  오늘은 기준으로 정리해볼게요",
-        f"{kw}  어렵게 느껴지는 이유가 있더라고요  그 부분만 풀어볼게요",
-    ]
-    compare = [
-        f"{kw}  대충 따라가기 vs 기준 잡고 하기  차이가 은근 크게 납니다",
-        f"{kw}  같은 재료인데도  순서만 바꾸면 결과가 달라져요",
-        f"{kw}  한 번은 급하게  한 번은 기준대로  뭐가 달랐을까요",
-    ]
-
-    pool = random.choice([benefit, threat, curious, compare])
-    title = random.choice(pool)
-
-    title = _text_remove_periods(_text_remove_english_words(_text_remove_bullets_and_stepnums(title)))
-    title = re.sub(r"\s{2,}", " ", title).strip()
-    return title
+def _has_english(s: str) -> bool:
+    return bool(re.search(r"[A-Za-z]", s or ""))
 
 
-# -----------------------------
-# Translate recipe parts (JSON output, KO only)
-# -----------------------------
-def translate_recipe_to_korean(
+def _strip_forbidden_punct(s: str) -> str:
+    if not s:
+        return ""
+    # 마침표/물음표/느낌표 제거 + 중복 공백 정리
+    s = s.replace(".", "").replace("!", "").replace("?", "")
+    s = s.replace("。", "").replace("！", "").replace("？", "")
+    s = s.replace("•", "").replace("·", " ")
+    s = re.sub(r"\s{2,}", " ", s)
+    return s.strip()
+
+
+def _normalize_measures_ko(s: str) -> str:
+    if not s:
+        return ""
+    rep = {
+        "tsp": "작은술",
+        "tbsp": "큰술",
+        "tablespoon": "큰술",
+        "teaspoon": "작은술",
+        "cup": "컵",
+        "cups": "컵",
+        "oz": "온스",
+        "lb": "파운드",
+    }
+    out = s
+    for k, v in rep.items():
+        out = re.sub(rf"\b{k}\b", v, out, flags=re.IGNORECASE)
+    return out.strip()
+
+
+def _json_from_text(txt: str) -> Dict[str, Any]:
+    t = (txt or "").strip()
+    t = re.sub(r"^```(?:json)?\s*", "", t)
+    t = re.sub(r"\s*```$", "", t)
+    # 앞뒤 군더더기 제거
+    a = t.find("{")
+    b = t.rfind("}")
+    if a == -1 or b == -1:
+        raise ValueError("JSON object not found")
+    return json.loads(t[a : b + 1])
+
+
+def translate_recipe_parts_to_ko(
     client: OpenAI,
     model: str,
-    recipe: Dict[str, Any],
+    recipe_title_en: str,
+    ingredients_en: List[Dict[str, str]],
+    steps_en: List[str],
     max_retries: int,
     debug: bool = False,
-) -> Dict[str, Any]:
-    steps_en = split_steps(recipe.get("instructions_en", ""))
-
+) -> Tuple[str, List[Dict[str, str]], List[str]]:
     payload = {
-        "title_en": recipe.get("title_en", ""),
-        "category_en": recipe.get("category_en", ""),
-        "area_en": recipe.get("area_en", ""),
-        "ingredients_en": recipe.get("ingredients_en", []),
-        "steps_en": steps_en,
+        "title_en": recipe_title_en,
+        "ingredients_en": [
+            {"name": (it.get("name") or "").strip(), "measure": _normalize_measures_ko((it.get("measure") or "").strip())}
+            for it in (ingredients_en or [])
+        ],
+        "steps_en": [s.strip() for s in (steps_en or []) if (s or "").strip()],
+        "rules": {
+            "korean_only": True,
+            "no_bullets": True,
+            "no_step_numbers": True,
+        },
     }
 
     instructions = (
         "너는 번역가다\n"
         "반드시 한국어로만 번역한다\n"
-        "영어 단어를 남기지 않는다  고유명사는 한글로 음역한다\n"
-        "불릿 기호를 쓰지 않는다\n"
-        "1단계 2단계 같은 단계 번호를 만들지 않는다\n"
-        "마침표 기호를 쓰지 않는다\n"
         "출력은 JSON만\n"
-        "{\"title_ko\":\"...\",\"category_ko\":\"...\",\"area_ko\":\"...\",\"ingredients_ko\":[{\"name_ko\":\"...\",\"measure_ko\":\"...\"}],\"steps_ko\":[\"...\",...]}\n"
+        "영어 단어를 남기지 않는다\n"
+        "불릿 특수문자(•,-,*)를 문장 앞에 붙이지 않는다\n"
+        "1단계 2단계 같은 단계 번호를 만들지 않는다\n"
+        "형식은 반드시 아래 키를 유지한다\n"
+        '{"title_ko":"...","ingredients_ko":[{"name_ko":"...","measure_ko":"..."}],"steps_ko":["...","..."]}'
     )
 
-    def parse_json(txt: str) -> Dict[str, Any]:
-        txt = (txt or "").strip()
-        txt = re.sub(r"^```(?:json)?\s*", "", txt)
-        txt = re.sub(r"\s*```$", "", txt)
-        obj = json.loads(txt[txt.find("{"):txt.rfind("}") + 1])
+    resp = _openai_call_with_retry(
+        client=client,
+        model=model,
+        instructions=instructions,
+        input_text=json.dumps(payload, ensure_ascii=False),
+        max_retries=max_retries,
+        debug=debug,
+    )
+    obj = _json_from_text(resp.output_text or "")
 
-        obj["title_ko"] = _text_remove_periods(_text_remove_bullets_and_stepnums(str(obj.get("title_ko", "")))).strip()
-        obj["category_ko"] = _text_remove_periods(_text_remove_bullets_and_stepnums(str(obj.get("category_ko", "")))).strip()
-        obj["area_ko"] = _text_remove_periods(_text_remove_bullets_and_stepnums(str(obj.get("area_ko", "")))).strip()
+    title_ko = _strip_forbidden_punct(str(obj.get("title_ko") or "").strip())
+    ing_ko_raw = obj.get("ingredients_ko") or []
+    steps_ko_raw = obj.get("steps_ko") or []
 
-        clean_ings = []
-        for it in (obj.get("ingredients_ko") or []):
-            n = _text_remove_periods(_text_remove_bullets_and_stepnums(str(it.get("name_ko", "")))).strip()
-            m = _text_remove_periods(_text_remove_bullets_and_stepnums(str(it.get("measure_ko", "")))).strip()
-            if n:
-                clean_ings.append({"name_ko": n, "measure_ko": m})
-        obj["ingredients_ko"] = clean_ings
+    ingredients_ko: List[Dict[str, str]] = []
+    for it in ing_ko_raw:
+        name_ko = _strip_forbidden_punct(str((it or {}).get("name_ko") or "").strip())
+        mea_ko = _strip_forbidden_punct(str((it or {}).get("measure_ko") or "").strip())
+        if name_ko:
+            ingredients_ko.append({"name_ko": name_ko, "measure_ko": mea_ko})
 
-        clean_steps = []
-        for s in (obj.get("steps_ko") or []):
-            s = _text_remove_periods(_text_remove_bullets_and_stepnums(str(s))).strip()
-            if s:
-                clean_steps.append(s)
-        obj["steps_ko"] = clean_steps
+    steps_ko = [_strip_forbidden_punct(str(s or "").strip()) for s in steps_ko_raw if str(s or "").strip()]
 
-        return obj
-
-    resp = _openai_call_with_retry(client, model, instructions, json.dumps(payload, ensure_ascii=False), max_retries, debug)
-    obj = parse_json(resp.output_text or "")
-
-    # 영어가 남으면 1회 재번역
-    if re.search(r"[A-Za-z]", json.dumps(obj, ensure_ascii=False)):
+    # 마지막 안전장치: 영어 남으면 재시도 1회
+    if _has_english(title_ko) or any(_has_english(x["name_ko"] + x["measure_ko"]) for x in ingredients_ko) or any(_has_english(s) for s in steps_ko):
         if debug:
-            print("[KO_CHECK] english remains -> re-translate once")
-        payload["retry_note"] = "영어가 남았다  영어를 절대 남기지 말고 다시 번역"
-        resp2 = _openai_call_with_retry(client, model, instructions, json.dumps(payload, ensure_ascii=False), max_retries, debug)
-        obj = parse_json(resp2.output_text or "")
-
-    return obj
-
-
-# -----------------------------
-# Article generation (homefeed style)
-# -----------------------------
-def generate_naver_homefeed_article(
-    client: OpenAI,
-    model: str,
-    keyword: str,
-    dish: str,
-    max_retries: int,
-    debug: bool = False,
-) -> str:
-    payload = {
-        "keyword": keyword,
-        "dish": dish,
-        "rules": {
-            "polite_friend_tone": True,
-            "intro_chars": "200~300",
-            "three_sections": 3,
-            "no_bullets": True,
-            "no_step_numbers": True,
-            "no_periods": True,
-            "no_repeat_sentences": True,
-        },
-        "style": [
-            "친구에게 진심 담아 수다떠는 존댓말",
-            "마침표 없이 띄어쓰기와 여백으로 호흡 두기",
-            "실패 포인트와 상태 기준을 자연스럽게 섞기",
-            "체험담 느낌을 내되 실제로 해봤다고 단정하지 않기  보통 겪는 포인트처럼",
-            "뻔한 결론 문장 반복 금지",
-        ],
-    }
-
-    instructions = (
-        "너는 네이버 홈피드에 올릴 글을 쓰는 사람이다\n"
-        "출력은 HTML만\n"
-        "\n"
-        "필수 형식\n"
-        "도입부는 200~300자 정도\n"
-        "굵은 소제목 3개를 반드시 만든다  각 소제목 아래는 충분히 길게\n"
-        "친구에게 수다떠는 존댓말로만\n"
-        "마침표 기호를 쓰지 마\n"
-        "불릿 기호 금지\n"
-        "1단계 2단계 같은 단계번호 금지\n"
-        "특정 문장 반복 금지\n"
-        "\n"
-        "출력 구조\n"
-        "<p>도입</p>\n"
-        "<h2><b>소제목1</b></h2>\n"
-        "<p>본문</p>\n"
-        "<h2><b>소제목2</b></h2>\n"
-        "<p>본문</p>\n"
-        "<h2><b>소제목3</b></h2>\n"
-        "<p>본문</p>\n"
-    )
-
-    def ask(note: str = "") -> str:
-        inp = dict(payload)
-        if note:
-            inp["retry_note"] = note
-        resp = _openai_call_with_retry(
+            print("[WARN] English remains in translation -> reprompt once")
+        payload["rules"]["korean_only"] = True
+        payload["rules"]["force_remove_english"] = True
+        resp2 = _openai_call_with_retry(
             client=client,
             model=model,
-            instructions=instructions,
-            input_text=json.dumps(inp, ensure_ascii=False),
+            instructions=instructions + "\n영어가 남아 있으면 무조건 자연스러운 한국어로 바꿔서 출력해라",
+            input_text=json.dumps(payload, ensure_ascii=False),
             max_retries=max_retries,
             debug=debug,
         )
-        html = (resp.output_text or "").strip()
-        html = _dedupe_lines_text(html)
-        html = clean_html_text_nodes(html)
-        return html
+        obj2 = _json_from_text(resp2.output_text or "")
+        title_ko = _strip_forbidden_punct(str(obj2.get("title_ko") or "").strip())
+        ing_ko_raw = obj2.get("ingredients_ko") or []
+        steps_ko_raw = obj2.get("steps_ko") or []
+        ingredients_ko = []
+        for it in ing_ko_raw:
+            name_ko = _strip_forbidden_punct(str((it or {}).get("name_ko") or "").strip())
+            mea_ko = _strip_forbidden_punct(str((it or {}).get("measure_ko") or "").strip())
+            if name_ko:
+                ingredients_ko.append({"name_ko": name_ko, "measure_ko": mea_ko})
+        steps_ko = [_strip_forbidden_punct(str(s or "").strip()) for s in steps_ko_raw if str(s or "").strip()]
 
-    html = ask()
-
-    # 2회 정도 보정 시도
-    for _ in range(2):
-        plain_len = len(_html_text_only(html))
-        if not _polite_enough(html):
-            html = ask("반말이 섞였다  친구에게 수다떠는 존댓말로만 다시")
-            continue
-        if plain_len < 2600:  # 최소 2300보다 여유 있게
-            html = ask("분량이 부족하다  도입과 각 소제목 아래를 더 길게  여백과 호흡 유지")
-            continue
-        if _has_english_in_text(html):
-            html = ask("영어가 남았다  한국어만 사용  고유명사는 한글 음역")
-            continue
-        break
-
-    return html.strip()
+    return title_ko, ingredients_ko, steps_ko
 
 
 # -----------------------------
-# Ingredient / Steps rendering
+# Title hook (4 styles)
 # -----------------------------
-def render_ingredients_block(ingredients_ko: List[Dict[str, str]]) -> str:
-    lines = []
-    for it in ingredients_ko or []:
-        n = (it.get("name_ko") or "").strip()
-        m = (it.get("measure_ko") or "").strip()
-        if not n:
-            continue
-        line = f"{n}  {m}".strip() if m else n
-        line = _text_remove_periods(_text_remove_english_words(_text_remove_bullets_and_stepnums(line)))
-        line = re.sub(r"\s{2,}", " ", line).strip()
-        lines.append(f"<p style='margin:0 0 12px 0;line-height:2.0;'>{_html.escape(line)}</p>")
-    if not lines:
-        return "<p style='margin:0 0 12px 0;line-height:2.0;'>재료는 집에 있는 것 기준으로 편하게 맞추셔도 됩니다</p>"
-    return "<div style='margin:0 0 8px 0;'>" + "\n".join(lines) + "</div>"
+def build_hook_title(main_kw: str) -> str:
+    kw = (main_kw or "").strip()
+    if not kw:
+        kw = "오늘 레시피"
 
-
-def render_steps_block(steps_ko: List[str]) -> str:
-    blocks = []
-    for s in steps_ko or []:
-        s = str(s).strip()
-        if not s:
-            continue
-        s = _text_remove_periods(_text_remove_english_words(_text_remove_bullets_and_stepnums(s)))
-        s = re.sub(r"\s{2,}", " ", s).strip()
-        blocks.append(f"<p style='margin:0 0 16px 0;line-height:2.05;'>{_html.escape(s)}</p>")
-    if not blocks:
-        return "<p style='margin:0 0 16px 0;line-height:2.05;'>만드는 흐름은 제공된 순서대로  상태 보면서 진행하시면 됩니다</p>"
-    return "<div>" + "\n".join(blocks) + "</div>"
-
-
-def tags_html(keywords_csv: str, main_keyword: str, dish_keyword: str) -> str:
-    kws = []
-    for k in [main_keyword, dish_keyword]:
-        k = (k or "").strip()
-        if k:
-            kws.append(k)
-    for x in (keywords_csv or "").split(","):
-        x = x.strip()
-        if x and x not in kws:
-            kws.append(x)
-    kws = kws[:12]
-    if not kws:
-        return ""
-    line = " ".join([f"#{k.replace(' ', '')}" for k in kws if k])
-    return f"<div style='margin:22px 0 0 0;opacity:.82;font-size:14px;line-height:1.9;'>태그  {_html.escape(line)}</div>"
-
-
-def closing_random(dish: str) -> str:
-    d = (dish or "").strip() or "이 메뉴"
-    pool = [
-        f"오늘은 {d}를 완벽하게 하려는 것보다  실패 확률만 줄이는 기준으로 정리해봤어요  이렇게 기준만 잡아두면  다음에는 훨씬 마음이 편해지더라고요",
-        f"{d}는 한 번만 감이 잡히면  그 다음부터는 손이 빨라져요  다음번에는 내 입맛에 맞는 포인트 하나만 살짝 조절해보셔도 좋아요",
-        f"요리는 정답 찾기보다  내가 반복 가능한 방식으로 가져가는 게 제일 오래 가더라고요  {d}도 그렇게 편하게 가져가시면 됩니다",
-        f"메뉴 고민될 때  이런 글 하나가 있으면 진짜 편해요  {d}는 특히 이 기준만 기억해두셔도  결과가 안정됩니다",
+    profit = [
+        f"{kw}  한 번만 이렇게 잡으면  맛이 안정되는 이유",
+        f"{kw}  이 포인트 하나로  실패 확률이 확 줄었어요",
+        f"{kw}  마지막에 이거만 지키면  집밥 느낌이 딱 나요",
     ]
-    t = random.choice(pool)
-    t = _text_remove_periods(_text_remove_english_words(_text_remove_bullets_and_stepnums(t)))
-    t = re.sub(r"\s{2,}", " ", t).strip()
-    return t
+    threat = [
+        f"{kw}  여기 놓치면  맛이 반으로 떨어져요  저도 그랬어요",
+        f"{kw}  이 타이밍만 어긋나면  갑자기 망해요  처음엔 몰랐어요",
+        f"{kw}  괜히 급하게 하면  맛이 흐려져요  이 부분만 조심해요",
+    ]
+    curious = [
+        f"{kw}  왜 똑같이 해도 맛이 갈릴까요  답은 여기였어요",
+        f"{kw}  제일 많이 헷갈리는 지점  딱 한 줄로 정리했어요",
+        f"{kw}  이 메뉴  의외로 여기서 다 갈려요  그래서 정리했어요",
+    ]
+    compare = [
+        f"{kw}  외식이랑 뭐가 다를까요  집에서 살리는 포인트가 따로 있어요",
+        f"{kw}  간단해 보이는데 은근 어렵죠  차이를 만드는 쪽은 따로 있어요",
+        f"{kw}  비슷한 메뉴 많지만  결국 돈 되는 맛은 이쪽이에요",
+    ]
+
+    pick_group = random.choice([profit, threat, curious, compare])
+    title = random.choice(pick_group)
+    return _strip_forbidden_punct(title)
 
 
-def wrap_html(inner: str) -> str:
-    inner = (inner or "").strip()
-    return (
-        "<div style='max-width:760px;margin:0 auto;padding:6px 4px;'>\n"
-        f"{inner}\n"
-        "</div>"
+# -----------------------------
+# Naver-style content generation (JSON)
+# -----------------------------
+BANNED_WORDS = [
+    "타미야", "프라모델", "도색", "건담", "도료", "마감재", "스프레이", "페인트",
+    "주식", "코인", "청년도약계좌", "보험", "대출", "부동산"
+]
+
+
+def _contains_banned(s: str) -> bool:
+    t = (s or "")
+    return any(w in t for w in BANNED_WORDS)
+
+
+def generate_naver_body_json(
+    client: OpenAI,
+    model: str,
+    cfg: AppConfig,
+    main_kw: str,
+    recipe_title_ko: str,
+    ingredients_ko: List[Dict[str, str]],
+    steps_ko: List[str],
+    max_retries: int,
+    debug: bool = False,
+) -> Dict[str, Any]:
+    rnd = cfg.naver.random_level
+    exp = cfg.naver.experience_level
+
+    # 랜덤 씨드(문장 반복/AI스러운 패턴 줄이기)
+    moods = ["퇴근하고", "주말 오후에", "비 오는 날에", "바람 부는 날에", "괜히 허전한 날에", "손이 가기 싫은 날에"]
+    values = ["완벽하게 하려는 마음", "내 페이스를 지키는 느낌", "괜히 조급해지는 마음", "소소한 성취감", "오늘 하루를 다독이는 느낌"]
+    angles = ["실패 포인트를 줄이는 기준", "맛이 갈리는 한 끗", "재료 상태를 보는 방법", "간을 정리하는 순서", "식감을 살리는 타이밍"]
+
+    seed = {
+        "mood": random.choice(moods),
+        "value": random.choice(values),
+        "angle": random.choice(angles),
+        "tone": "친구에게 수다 떠는 존댓말 해요체",
+        "no_periods": True,
+        "no_step_numbers": True,
+        "no_bullets": True,
+        "intro_min": cfg.naver.intro_min,
+        "intro_max": cfg.naver.intro_max,
+        "section_min_chars": cfg.naver.section_min_chars,
+        "random_level": rnd,
+        "experience_level": exp,
+    }
+
+    kws = [k.strip() for k in (cfg.naver.keywords_csv or "").split(",") if k.strip()]
+    # 키워드는 "내용 주제"로 쓰지 말고 해시태그 후보로만 쓰게 강제
+    kw_hint = [k for k in kws if not _contains_banned(k)][:10]
+
+    payload = {
+        "main_keyword": main_kw,
+        "recipe_title_ko": recipe_title_ko,
+        "ingredients_ko": ingredients_ko,
+        "steps_ko": steps_ko,
+        "seed": seed,
+        "keywords_hint_for_hashtags_only": kw_hint,
+    }
+
+    instructions = f"""
+너는 한국어로 글을 쓰는 블로거다
+말투는 친구에게 진심 담아 수다 떠는 존댓말 해요체로만 쓴다
+반말 금지  명령형 금지  딱딱한 문서체 금지
+
+절대 규칙
+- 마침표 느낌표 물음표를 쓰지 않는다  대신 줄바꿈과 여백으로 호흡을 만든다
+- 단계 번호 1단계 2단계 같은 표기를 만들지 않는다
+- 불릿 특수문자 • - * 같은 걸 문장 앞에 붙이지 않는다
+- 영어를 섞지 않는다  반드시 한국어만
+- 레시피는 제공된 재료와 steps 내용에서만 말한다  새 재료 새 단계 추가 금지
+- 키워드는 본문 주제로 바꾸지 않는다  해시태그 후보로만 쓰고  음식 얘기를 벗어나지 않는다
+
+출력은 JSON만
+형식은 반드시 아래 키를 가진다
+{{
+  "intro": "200~300자",
+  "h2": [
+    {{"title":"굵은 소제목1","body":"{cfg.naver.section_min_chars}자 이상"}},
+    {{"title":"굵은 소제목2","body":"{cfg.naver.section_min_chars}자 이상"}},
+    {{"title":"굵은 소제목3","body":"{cfg.naver.section_min_chars}자 이상"}}
+  ],
+  "closing":"마무리 멘트",
+  "hashtags":["#해시태그", "..."]
+}}
+
+내용 구성 가이드
+- intro는 200~300자  공감 후킹  오늘 기준 한 줄  저장 강요 금지
+- h2 1은 감정  생각  가치관  왜 이 요리가 위로가 되는지  공감 중심
+- h2 2는 재료 준비 느낌  손질하면서 생기는 생각  맛 포인트  재료 목록은 따로 표시하지 말고  아래에서 코드가 붙일 거라 자연스럽게 연결 문장만
+- h2 3는 만드는 흐름  실패 포인트  상태 기준  steps를 기반으로 이야기하되  번호 없이 자연스럽게 흐름으로
+- closing은 다정하게  다음에 해먹을 때 기억할 한 줄 포함
+- 해시태그는 음식 관련으로만  최대 12개
+
+""".strip()
+
+    resp = _openai_call_with_retry(
+        client=client,
+        model=model,
+        instructions=instructions,
+        input_text=json.dumps(payload, ensure_ascii=False),
+        max_retries=max_retries,
+        debug=debug,
     )
 
+    obj = _json_from_text(resp.output_text or "")
+
+    # 간단 검증/보정
+    intro = _strip_forbidden_punct(str(obj.get("intro") or "").strip())
+    closing = _strip_forbidden_punct(str(obj.get("closing") or "").strip())
+    h2 = obj.get("h2") or []
+    hashtags = obj.get("hashtags") or []
+
+    # 금지어/영어/반말 방지(간단)
+    full_text = intro + " " + closing + " " + json.dumps(h2, ensure_ascii=False)
+    if _contains_banned(full_text):
+        raise RuntimeError("banned_topic_detected")
+    if _has_english(full_text):
+        raise RuntimeError("english_detected")
+
+    # 길이 체크(너무 짧으면 다시 생성)
+    if not (cfg.naver.intro_min <= len(intro) <= cfg.naver.intro_max):
+        raise RuntimeError("intro_length_bad")
+
+    if not isinstance(h2, list) or len(h2) != 3:
+        raise RuntimeError("h2_structure_bad")
+
+    fixed_h2 = []
+    for it in h2:
+        t = _strip_forbidden_punct(str((it or {}).get("title") or "").strip())
+        b = _strip_forbidden_punct(str((it or {}).get("body") or "").strip())
+        if len(b) < cfg.naver.section_min_chars:
+            raise RuntimeError("section_too_short")
+        fixed_h2.append({"title": t, "body": b})
+
+    fixed_tags: List[str] = []
+    for x in hashtags:
+        s = str(x or "").strip()
+        s = s.replace("##", "#")
+        if not s:
+            continue
+        if not s.startswith("#"):
+            s = "#" + s
+        s = re.sub(r"\s+", "", s)
+        s = _strip_forbidden_punct(s)
+        if _contains_banned(s):
+            continue
+        if len(s) >= 2:
+            fixed_tags.append(s)
+    fixed_tags = fixed_tags[:12]
+
+    return {"intro": intro, "h2": fixed_h2, "closing": closing, "hashtags": fixed_tags}
+
 
 # -----------------------------
-# Pick recipe (avoid repeats)
+# HTML builder (safe, readable, no broken tags)
+# -----------------------------
+def _to_html_text(s: str) -> str:
+    # escape + 줄바꿈을 <br/><br/>로
+    s = (s or "").strip()
+    s = _strip_forbidden_punct(s)
+    s = _html.escape(s)
+    # 사용자가 원하는 "호흡"을 위해 빈 줄 강화
+    s = re.sub(r"\n{3,}", "\n\n", s)
+    s = s.replace("\r\n", "\n")
+    s = s.replace("\n\n", "<br/><br/>")
+    s = s.replace("\n", "<br/>")
+    return s
+
+
+def _p(block: str, mb: int = 18) -> str:
+    return f"<p style='margin:0 0 {mb}px 0;line-height:2.05;'>{block}</p>"
+
+
+def _h2(title: str) -> str:
+    t = _html.escape(_strip_forbidden_punct(title))
+    return f"<h2 style='margin:30px 0 12px 0;'><b>{t}</b></h2>"
+
+
+def build_ingredients_block(ingredients_ko: List[Dict[str, str]]) -> str:
+    lines = []
+    for it in ingredients_ko:
+        name = (it.get("name_ko") or "").strip()
+        mea = (it.get("measure_ko") or "").strip()
+        if not name:
+            continue
+        line = name
+        if mea:
+            line = f"{name}   {mea}"
+        line = _html.escape(_strip_forbidden_punct(line))
+        # 불릿/점 같은 느낌 제거: 그냥 줄로만
+        lines.append(f"<div style='margin:0 0 10px 0;'>{line}</div>")
+
+    if not lines:
+        return _p(_html.escape("재료는 집에 있는 걸로 무리 없이 맞춰보셔도 돼요"), mb=12)
+
+    box = (
+        "<div style='padding:14px 14px 6px 14px;background:#f7f7f7;border-radius:14px;'>"
+        + "".join(lines)
+        + "</div>"
+    )
+    return box
+
+
+def build_method_block(steps_ko: List[str]) -> str:
+    # 번호 없이, 문단으로만
+    ps = []
+    for s in steps_ko:
+        s2 = _strip_forbidden_punct(s)
+        if not s2:
+            continue
+        ps.append(_p(_to_html_text(s2), mb=16))
+    if not ps:
+        return _p(_html.escape("만드는 흐름은 재료 상태 보면서 천천히 따라가시면 돼요"), mb=12)
+    return "<div>" + "".join(ps) + "</div>"
+
+
+def build_final_html(
+    title_ko: str,
+    main_kw: str,
+    body_json: Dict[str, Any],
+    ingredients_ko: List[Dict[str, str]],
+    steps_ko: List[str],
+    image_url: str,
+) -> str:
+    intro = body_json["intro"]
+    h2_list = body_json["h2"]
+    closing = body_json["closing"]
+    hashtags = body_json.get("hashtags") or []
+
+    wrap_open = "<div style='font-size:16px;line-height:2.05;letter-spacing:-0.1px;'>"
+    wrap_close = "</div>"
+
+    parts: List[str] = []
+
+    if image_url:
+        img = _html.escape(image_url)
+        alt = _html.escape(_strip_forbidden_punct(title_ko))
+        parts.append(
+            f"<p style='margin:0 0 18px 0;'><img src='{img}' alt='{alt}' "
+            f"style='max-width:100%;height:auto;border-radius:14px;'/></p>"
+        )
+
+    parts.append(_p(_to_html_text(intro), mb=18))
+
+    # h2_1
+    parts.append(_h2(h2_list[0]["title"]))
+    parts.append(_p(_to_html_text(h2_list[0]["body"]), mb=18))
+
+    # h2_2 + 재료 박스 삽입
+    parts.append(_h2(h2_list[1]["title"]))
+    parts.append(_p(_to_html_text(h2_list[1]["body"]), mb=16))
+    parts.append(_h2("재료 목록"))
+    parts.append(build_ingredients_block(ingredients_ko))
+
+    # h2_3 + 만드는 흐름 삽입
+    parts.append(_h2(h2_list[2]["title"]))
+    parts.append(_p(_to_html_text(h2_list[2]["body"]), mb=16))
+    parts.append(_h2("만드는 흐름"))
+    parts.append(build_method_block(steps_ko))
+
+    # 마무리/태그는 무조건 맨 끝
+    parts.append("<div style='height:14px;'></div>")
+    parts.append(_p(f"<b>마무리</b><br/><br/>{_to_html_text(closing)}", mb=14))
+
+    if hashtags:
+        tag_line = " ".join(hashtags[:12])
+        parts.append(_p(_html.escape(tag_line), mb=0))
+
+    html_out = wrap_open + "".join(parts) + wrap_close
+
+    # 깨진 태그 유사 문자열 제거(혹시라도)
+    html_out = re.sub(r"<\s*=\s*['\"][^>]*>", "", html_out)
+
+    return html_out
+
+
+# -----------------------------
+# Pick recipe with filters
 # -----------------------------
 def pick_recipe(cfg: AppConfig) -> Dict[str, Any]:
     recent_ids = set(get_recent_recipe_ids(cfg.sqlite_path, cfg.run.avoid_repeat_days))
-    prefer = set([a.lower() for a in (cfg.naver.prefer_areas or [])])
+    prefer_areas = set([a.lower() for a in (cfg.naver.prefer_areas or [])])
+    block_cats = set([c.lower() for c in (cfg.naver.block_categories or [])])
 
     for _ in range(max(1, cfg.run.max_tries)):
         cand = fetch_random_recipe()
@@ -841,124 +978,156 @@ def pick_recipe(cfg: AppConfig) -> Dict[str, Any]:
             continue
         if rid in recent_ids:
             continue
-        if prefer:
-            area = (cand.get("area_en") or "").strip().lower()
-            if area and (area not in prefer):
+
+        # 최소 정보 체크
+        ings = cand.get("ingredients") or []
+        steps = split_steps(cand.get("instructions") or "")
+        if len(ings) < 6 or len(steps) < 4:
+            continue
+
+        # area 필터
+        if prefer_areas:
+            area = (cand.get("area") or "").strip().lower()
+            if area and (area not in prefer_areas):
                 continue
+
+        # category 차단
+        cat = (cand.get("category") or "").strip().lower()
+        if cat and cat in block_cats:
+            continue
+
         return cand
 
-    return fetch_random_recipe()
+    raise RuntimeError("레시피를 가져오지 못했습니다(중복/필터/시도 횟수 초과)")
 
 
 # -----------------------------
 # Main
 # -----------------------------
 def run(cfg: AppConfig) -> None:
-    now = _now_kst()
+    now = datetime.now(tz=KST)
     date_str = now.strftime("%Y-%m-%d")
-    time_str = now.strftime("%H%M%S")
+    rand6 = "".join(random.choices("abcdefghijklmnopqrstuvwxyz0123456789", k=6))
 
     init_db(cfg.sqlite_path)
 
     recipe = pick_recipe(cfg)
     recipe_id = recipe.get("id", "")
-    recipe_title_en = recipe.get("title_en", "") or "Daily Recipe"
+    recipe_title_en = recipe.get("title", "") or "Daily Recipe"
+    steps_en = split_steps(recipe.get("instructions") or "")
+    ingredients_en = recipe.get("ingredients") or []
 
     client = OpenAI(api_key=cfg.openai.api_key)
 
-    # 1) 번역(재료/만드는 흐름/레시피명 번역 필수)
-    recipe_ko = translate_recipe_to_korean(
+    # 1) 번역(제목/재료/방법) 강제
+    title_ko_recipe, ingredients_ko, steps_ko = translate_recipe_parts_to_ko(
         client=client,
         model=cfg.openai.model,
-        recipe=recipe,
+        recipe_title_en=recipe_title_en,
+        ingredients_en=ingredients_en,
+        steps_en=steps_en,
         max_retries=cfg.run.openai_max_retries,
         debug=cfg.run.debug,
     )
 
-    dish_ko = (recipe_ko.get("title_ko") or "").strip() or "오늘 메뉴"
+    # 메인 키워드: 사용자가 지정하면 그걸 우선, 아니면 레시피명(한글)
+    main_kw = (cfg.naver.main_keyword or "").strip() or title_ko_recipe
 
-    # 2) 제목 키워드
-    main_kw = (cfg.naver.main_keyword or "").strip()
-    title_kw = main_kw if main_kw else dish_ko
+    # 2) 제목: 4가지 후킹 중 랜덤 + 키워드 포함
+    hook_title = build_hook_title(main_kw)
+    wp_title = hook_title  # WP 제목은 이걸로
 
-    # 3) 제목 4유형 랜덤
-    hook_title = make_hook_title(title_kw)
+    # 3) 썸네일: Pexels 우선 -> 없으면 TheMealDB
+    thumb_url = (recipe.get("thumb") or "").strip()
+    hiq = pexels_search_food_image(cfg.media.pexels_api_key, title_ko_recipe, debug=cfg.run.debug)
+    chosen_img = hiq or thumb_url
 
-    # 4) 홈피드형 본문 생성(수다 존댓말)
-    article_html = generate_naver_homefeed_article(
-        client=client,
-        model=cfg.openai.model,
-        keyword=title_kw,
-        dish=dish_ko,
-        max_retries=cfg.run.openai_max_retries,
-        debug=cfg.run.debug,
+    # 4) 본문 JSON 생성(조건 미달/금지어/영어 있으면 재생성)
+    body_json = None
+    for attempt in range(3):
+        try:
+            body_json = generate_naver_body_json(
+                client=client,
+                model=cfg.openai.model,
+                cfg=cfg,
+                main_kw=main_kw,
+                recipe_title_ko=title_ko_recipe,
+                ingredients_ko=ingredients_ko,
+                steps_ko=steps_ko,
+                max_retries=cfg.run.openai_max_retries,
+                debug=cfg.run.debug,
+            )
+            break
+        except Exception as e:
+            if cfg.run.debug:
+                print("[BODY] regen:", attempt + 1, "reason:", repr(e))
+            if attempt >= 2:
+                raise
+
+    assert body_json is not None
+
+    # 해시태그 보강: 사용자가 넣은 키워드가 있어도 "음식 관련만" 최대한
+    base_tags = ["#집밥", "#레시피", "#간단요리", "#오늘뭐먹지", "#저녁메뉴", "#혼밥", "#자취요리"]
+    extra = [k.strip() for k in (cfg.naver.keywords_csv or "").split(",") if k.strip()]
+    extra = [f"#{re.sub(r'\\s+', '', x)}" if not x.startswith("#") else x for x in extra]
+    extra = [x for x in extra if not _contains_banned(x)]
+    body_json["hashtags"] = (body_json.get("hashtags") or []) + base_tags + extra
+    # 중복 제거
+    uniq = []
+    seen = set()
+    for t in body_json["hashtags"]:
+        tt = _strip_forbidden_punct(str(t or "").strip())
+        if not tt:
+            continue
+        if not tt.startswith("#"):
+            tt = "#" + tt
+        if tt in seen:
+            continue
+        seen.add(tt)
+        uniq.append(tt)
+    body_json["hashtags"] = uniq[:12]
+
+    # 5) HTML 조립(깨진 태그 방지)
+    html_body = build_final_html(
+        title_ko=wp_title,
+        main_kw=main_kw,
+        body_json=body_json,
+        ingredients_ko=ingredients_ko,
+        steps_ko=steps_ko,
+        image_url=(chosen_img if cfg.run.embed_image_in_body else ""),
     )
 
-    # 5) 재료/만드는 흐름/마무리/태그는 "맨 뒤"에 고정 추가
-    ingredients_block = render_ingredients_block(recipe_ko.get("ingredients_ko", []))
-    steps_block = render_steps_block(recipe_ko.get("steps_ko", []))
-
-    tail: List[str] = []
-    tail.append("<h2><b>재료 목록</b></h2>")
-    tail.append(ingredients_block)
-    tail.append("<h2><b>만드는 흐름</b></h2>")
-    tail.append(steps_block)
-    tail.append("<h2><b>마무리</b></h2>")
-    tail.append(f"<p style='margin:0 0 14px 0;line-height:2.0;'>{_html.escape(closing_random(dish_ko))}</p>")
-    tail.append(tags_html(cfg.naver.keywords_csv, main_kw, dish_ko))
-
-    full_body = (article_html.strip() + "\n\n" + "\n".join(tail)).strip()
-
-    # 최종 후처리: 태그/스타일은 보호하고 텍스트만 정리(깨짐 방지)
-    full_body = _dedupe_lines_text(full_body)
-    full_body = clean_html_text_nodes(full_body)
-
-    # 6) 썸네일 (Pexels 우선, 없으면 MealDB thumb)
-    pex_query = f"{dish_ko} 음식"
-    pex_url = pexels_pick_photo_url(cfg.pexels_api_key, pex_query, debug=cfg.run.debug)
-    thumb_url = (pex_url or (recipe.get("thumb") or "").strip())
-
+    # 6) WP 업로드(항상 새 글)
     media_id: Optional[int] = None
     media_url: str = ""
-    if cfg.run.upload_thumb and thumb_url:
+
+    if cfg.run.upload_thumb and chosen_img:
         try:
-            media_id, media_url = wp_upload_media(cfg.wp, thumb_url, filename_hint=f"thumb-{date_str}-{time_str}.jpg")
+            media_id, media_url = wp_upload_media(cfg.wp, chosen_img, filename_hint=f"recipe-{date_str}-{rand6}.jpg")
         except Exception as e:
             if cfg.run.debug:
                 print("[WARN] media upload failed:", repr(e))
 
-    # 7) 본문 상단 이미지 삽입
-    if cfg.run.embed_image_in_body:
-        img = (media_url or thumb_url or "").strip()
-        if img:
-            img_tag = (
-                "<p style='margin:0 0 20px 0;'>"
-                f"<img src='{_html.escape(img)}' alt='{_html.escape(hook_title)}' "
-                "style='max-width:100%;height:auto;border-radius:14px;'/>"
-                "</p>"
-            )
-            full_body = img_tag + "\n" + full_body
+    featured = media_id if (cfg.run.set_featured and media_id) else None
 
-    full_html = wrap_html(full_body)
-
-    # 8) 항상 새 글 발행: slug에 시간+랜덤
-    rand6 = "".join(random.choices("abcdefghijklmnopqrstuvwxyz0123456789", k=6))
-    slug = f"naverstyle-{date_str}-{cfg.run.run_slot}-{time_str}-{rand6}"
+    slug = f"naverfeed-recipe-{date_str}-{rand6}"
 
     if cfg.run.dry_run:
-        print("[DRY_RUN] 발행 생략")
-        print("TITLE:", hook_title)
+        print("[DRY_RUN] 미리보기")
+        print("TITLE:", wp_title)
         print("SLUG:", slug)
-        print(full_html[:2500] + ("\n...(truncated)" if len(full_html) > 2500 else ""))
+        print(html_body[:1500] + ("\n...(truncated)" if len(html_body) > 1500 else ""))
         return
 
-    featured = media_id if (cfg.run.set_featured and media_id) else None
-    post_id, link = wp_create_post(cfg.wp, hook_title, slug, full_html, featured_media=featured)
-    save_post_meta_v2(cfg.sqlite_path, recipe_id, recipe_title_en, dish_ko, post_id, link)
+    post_id, link = wp_create_post(cfg.wp, wp_title, slug, html_body, featured_media=featured)
+    save_post_row(cfg.sqlite_path, recipe_id, recipe_title_en, post_id, link)
+
     print("OK(created):", post_id, link)
+    if cfg.run.debug:
+        print("[META] recipe_id:", recipe_id, "| recipe_title_en:", recipe_title_en)
 
 
-def main():
+def main() -> None:
     cfg = load_cfg()
     print_safe_cfg(cfg)
     validate_cfg(cfg)
