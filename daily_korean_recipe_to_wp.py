@@ -227,6 +227,10 @@ class RunConfig:
 class RecipeSourceConfig:
     mfds_api_key: str = ""  # foodsafetykorea openapi key (optional)
     strict_korean: bool = True
+    # MFDS OpenAPI가 느리거나 장애여도 작업이 오래 끌리지 않게 제한
+    mfds_timeout: int = 10          # read timeout seconds
+    mfds_retries: int = 0           # per-call retries
+    mfds_max_failures: int = 3      # 연속 실패 시 MFDS 포기 후 로컬 폴백
 
 
 @dataclass
@@ -312,6 +316,9 @@ def load_cfg() -> AppConfig:
         recipe=RecipeSourceConfig(
             mfds_api_key=_env("MFDS_API_KEY", ""),
             strict_korean=_env_bool("STRICT_KOREAN", True),
+            mfds_timeout=_env_int("MFDS_TIMEOUT", 10),
+            mfds_retries=_env_int("MFDS_RETRIES", 0),
+            mfds_max_failures=_env_int("MFDS_MAX_FAILS", 3),
         ),
         img=ImageConfig(
             upload_thumb=_env_bool("UPLOAD_THUMB", True),
@@ -646,45 +653,54 @@ def _is_korean_recipe_name(name: str, strict: bool = True) -> bool:
     return True
 
 
-def mfds_fetch_by_param(api_key: str, param: str, value: str, start: int = 1, end: int = 60) -> List[Dict[str, Any]]:
-    """MFDS OpenAPI 호출.
+def mfds_fetch_by_param(
+    api_key: str,
+    param: str,
+    value: str,
+    start: int = 1,
+    end: int = 60,
+    timeout_sec: int = 10,
+    retries: int = 0,
+) -> Tuple[List[Dict[str, Any]], bool]:
+    """MFDS OpenAPI 호출
 
-    - 외부 API(foodsafetykorea)가 종종 느리거나 끊기는 경우가 있어, 타임아웃/일시 오류는 예외로 터뜨리지 않고
-      빈 결과([])로 처리해 로컬 레시피 폴백이 가능하도록 한다.
-    - 환경변수로 조정 가능:
-        MFDS_TIMEOUT (초, 기본 12)
-        MFDS_RETRIES (재시도 횟수, 기본 1)
+    반환: (rows, ok)
+      - ok=True  : 정상 응답(200 + JSON 파싱 성공)
+      - ok=False : 타임아웃/네트워크/비정상 응답 등
+
+    외부 API(foodsafetykorea)가 느리거나 끊기는 경우가 있어
+    예외로 프로세스가 죽거나 10분씩 늘어지지 않게 안전하게 처리한다
     """
     base = f"https://openapi.foodsafetykorea.go.kr/api/{api_key}/COOKRCP01/json/{start}/{end}"
     url = f"{base}/{param}={quote(value)}"
 
-    timeout = _env_int("MFDS_TIMEOUT", 12)
-    retries = _env_int("MFDS_RETRIES", 1)
-
     last_err: Exception | None = None
-    for attempt in range(retries + 1):
+    # connect/read 분리 타임아웃
+    req_timeout = (3, max(3, int(timeout_sec)))
+
+    for attempt in range(int(retries) + 1):
         try:
-            r = requests.get(url, timeout=timeout)
+            r = requests.get(url, timeout=req_timeout)
             # 429/5xx 는 잠깐 쉬고 재시도
             if r.status_code in (429, 500, 502, 503, 504):
                 last_err = RuntimeError(f"MFDS transient status={r.status_code}")
                 raise last_err
             if r.status_code != 200:
-                return []
+                return [], False
             try:
                 data = r.json()
             except Exception:
-                return []
+                return [], False
             co = data.get("COOKRCP01") or {}
             rows = co.get("row") or []
-            return rows if isinstance(rows, list) else []
+            return (rows if isinstance(rows, list) else []), True
         except Exception as e:
             # requests 예외/임시오류 -> 재시도 후 포기
             last_err = e
             if attempt < retries:
                 time.sleep(1.2 * (attempt + 1))
                 continue
-            return []
+            return [], False
 
 
 def mfds_row_to_recipe(row: Dict[str, Any]) -> Recipe:
@@ -735,6 +751,7 @@ def pick_recipe_mfds(cfg: AppConfig, recent_pairs: List[Tuple[str, str]]) -> Opt
     budget = _env_int("MFDS_BUDGET_SECONDS", 20)
     t0 = time.time()
 
+    fail_streak = 0
     for i in range(cfg.run.max_tries):
         if budget > 0 and (time.time() - t0) > budget:
             if cfg.run.debug:
@@ -744,9 +761,27 @@ def pick_recipe_mfds(cfg: AppConfig, recent_pairs: List[Tuple[str, str]]) -> Opt
         if cfg.run.debug:
             elapsed = int(time.time() - t0)
             print(f"[MFDS] try {i+1}/{cfg.run.max_tries} kw={kw} elapsed={elapsed}s")
-        rows = mfds_fetch_by_param(cfg.recipe.mfds_api_key, "RCP_NM", kw, start=1, end=60)
+        rows, ok = mfds_fetch_by_param(
+            cfg.recipe.mfds_api_key,
+            "RCP_NM",
+            kw,
+            start=1,
+            end=60,
+            timeout_sec=cfg.recipe.mfds_timeout,
+            retries=cfg.recipe.mfds_retries,
+        )
+        if not ok:
+            fail_streak += 1
+            if cfg.run.debug:
+                print(f"[MFDS] fetch failed streak={fail_streak}")
+            if fail_streak >= cfg.recipe.mfds_max_failures:
+                if cfg.run.debug:
+                    print(f"[MFDS] too many failures -> fallback to local")
+                break
+            continue
+        fail_streak = 0
         if cfg.run.debug:
-            print(f"[MFDS] rows={len(rows) if isinstance(rows, list) else 0}")
+            print(f"[MFDS] rows={len(rows)}")
         random.shuffle(rows)
         for row in rows:
             try:
@@ -799,7 +834,17 @@ def get_recipe_by_id(cfg: AppConfig, source: str, recipe_id: str) -> Optional[Re
         return None
 
     if source == "mfds" and cfg.recipe.mfds_api_key:
-        rows = mfds_fetch_by_param(cfg.recipe.mfds_api_key, "RCP_SEQ", recipe_id, start=1, end=5)
+        rows, ok = mfds_fetch_by_param(
+            cfg.recipe.mfds_api_key,
+            "RCP_SEQ",
+            recipe_id,
+            start=1,
+            end=5,
+            timeout_sec=cfg.recipe.mfds_timeout,
+            retries=cfg.recipe.mfds_retries,
+        )
+        if not ok:
+            return None
         for row in rows:
             rcp = mfds_row_to_recipe(row)
             if rcp.recipe_id == recipe_id:
@@ -821,8 +866,11 @@ def _no_period(s: str) -> str:
     """본문 문장 마침표 제거용(가능한 범위)
     - 이미지 URL 같은 곳에는 사용하지 말 것
     """
-    s = (s or "").replace(".", "")
-    s = s.replace("。", "")
+    s = (s or "")
+    # 숫자 소수점은 의미가 있으니 '점'으로 치환
+    s = re.sub(r"(\d)\.(\d)", r"\1점\2", s)
+    # 일반 마침표는 제거
+    s = s.replace(".", "").replace("。", "")
     return s
 
 
@@ -841,6 +889,56 @@ def _wrap_p_br(lines: List[str]) -> str:
     return f"<p>{safe}</p>"
 
 
+def _norm_text_key(s: str) -> str:
+    """중복 판단용 정규화 키"""
+    s = re.sub(r"\s+", " ", (s or "").strip())
+    s = re.sub(r"[\u200b\u200c\u200d\ufeff]", "", s)
+    return s
+
+
+def _gen_dynamic_filler(keyword: str, used: set) -> str:
+    """필러 문장을 무한 생성
+    - 같은 문장이 반복되지 않게 used로 중복 제거
+    - 마침표 없이 자연스러운 호흡 위주
+    """
+    kw = _no_period(keyword).strip()
+    openers = [
+        "한 가지 더만 챙기면 훨씬 쉬워져요",
+        "여기서 자주 갈리는 포인트가 있어요",
+        "이건 해보면 체감이 바로 와요",
+        "사소한데 결과가 크게 바뀌는 팁이에요",
+        "시간 아끼는 요령 하나만 더요",
+        "실패를 줄이는 방법은 의외로 간단해요",
+    ]
+    cores = [
+        f"{kw}는 간을 빨리 맞추기보다 마지막에 한 번만 확정하는 게 좋아요",
+        f"{kw}는 불을 너무 올리면 향이 날아가서 중불 유지가 안정적이에요",
+        f"{kw}는 재료를 많이 넣기보다 핵심 재료를 정확히 쓰는 쪽이 맛이 선명해요",
+        f"{kw}는 뒤적임을 줄이면 국물도 깔끔하고 건더기도 덜 부서져요",
+        f"{kw}는 신맛 짠맛 단맛이 균형을 이루면 집밥 느낌이 확 올라가요",
+        f"{kw}는 마지막에 파나 고소한 향을 살짝 더하면 마무리가 훨씬 좋아져요",
+    ]
+    closers = [
+        "이 정도만 기억해두면 다음번이 정말 편해요",
+        "이걸 한 번만 성공하면 그 다음부터는 감으로도 가능해요",
+        "오늘은 안전하게 성공하는 쪽으로만 가요",
+        "처음엔 소량으로 연습하고 감 잡히면 양을 늘리면 돼요",
+        "딱 한 번만 메모해두면 다음엔 조절이 훨씬 쉬워져요",
+    ]
+
+    for _ in range(60):
+        s = f"{random.choice(openers)}  {random.choice(cores)}  {random.choice(closers)}"
+        s = _no_period(s)
+        k = _norm_text_key(s)
+        if k and k not in used:
+            used.add(k)
+            return s
+    # 최후의 안전장치
+    s = _no_period(f"{kw}는 순서만 잡으면 다음부터는 정말 편해져요")
+    used.add(_norm_text_key(s))
+    return s
+
+
 def _ensure_min_chars(section_html: str, min_chars: int, fillers: List[str]) -> str:
     """섹션 글자수를 min_chars 이상으로 보강
     - fillers는 마침표 없는 문장들로 준비
@@ -849,21 +947,39 @@ def _ensure_min_chars(section_html: str, min_chars: int, fillers: List[str]) -> 
     out = section_html
     if not fillers:
         return out
-    pool = list(fillers)
+
+    # 이미 들어간 문장은 중복 방지
+    used: set = set()
+    plain = re.sub(r"<[^>]+>", "\n", out)
+    for line in [x.strip() for x in plain.splitlines() if x.strip()]:
+        used.add(_norm_text_key(line))
+
+    pool = [x for x in fillers if _norm_text_key(x) not in used]
     random.shuffle(pool)
-    last = ""
+
     tries = 0
-    while _plain_len(out) < min_chars and tries < 120:
+    while _plain_len(out) < min_chars and tries < 240:
         tries += 1
-        if not pool:
-            pool = list(fillers)
-            random.shuffle(pool)
-        pick = pool.pop()
-        if pick == last:
+        if pool:
+            pick = pool.pop()
+        else:
+            # 필러가 다 소진되면 동적 생성으로 채움
+            pick = _gen_dynamic_filler(_plain_text_keyword(out) or "", used)
+        pk = _norm_text_key(pick)
+        if not pk or pk in used:
             continue
-        last = pick
-        out += _wrap_p(pick)
+        used.add(pk)
+        out += _wrap_p(_no_period(pick))
+
     return out
+
+
+def _plain_text_keyword(section_html: str) -> str:
+    """섹션 HTML에서 제목(키워드) 힌트를 대충 뽑아 동적 필러에 사용"""
+    t = re.sub(r"<[^>]+>", " ", section_html)
+    t = re.sub(r"\s+", " ", t).strip()
+    # 너무 길면 앞쪽 일부만 사용
+    return t[:40]
 
 
 
@@ -1080,6 +1196,26 @@ def _section_fillers(keyword: str) -> List[str]:
         "남은 음식은 다음날이 더 맛있을 때가 있어요 대신 재가열할 때 간은 마지막에만 살짝 잡아주세요",
         "칼칼함은 마지막에 올리고 고소함은 시작에 깔아두는 게 좋아요 고춧가루와 참기름 타이밍이 의외로 큽니다",
         "식감은 손대는 횟수가 적을수록 좋아요 뒤적이는 횟수를 줄이면 재료가 덜 부서지고 훨씬 깔끔해져요",
+        "양념은 미리 한 번 섞어두면 급할 때 실수할 확률이 확 내려가요",
+        "냄비 가장자리에서 기포가 올라오기 시작하면 그때부터 맛이 확 바뀌니까 그 구간만 놓치지 마세요",
+        "향신료나 마늘은 처음에 다 넣기보다 절반만 시작에 깔고 나머지는 끝에 얹으면 향이 더 살아나요",
+        "국물 요리는 물을 먼저 붓고 양념을 풀면 뭉치기 쉬워요 기름에 한 번 볶아주면 훨씬 안정적이에요",
+        "간이 세게 느껴지면 물만 더하지 말고 재료를 조금 더 넣는 방식이 맛이 덜 밋밋해요",
+        "매운맛은 같은 고춧가루라도 볶는 시간에 따라 체감이 달라서요 살짝만 볶아도 충분히 올라와요",
+        "고기나 해산물은 수분이 나오면서 맛이 흐려질 수 있으니 처음 간을 너무 세게 잡지 않는 게 좋아요",
+        "채소는 두 번에 나눠 넣으면 식감이 살아나요 처음엔 향 내고 나중엔 아삭함 유지용이에요",
+        "계량스푼이 없어도 괜찮아요 한 숟갈씩 천천히 올리면 결국 딱 맞게 끝나요",
+        "마지막 한 입이 깔끔하려면 불 끄고 1분만 뜸 들여보세요 맛이 차분해져요",
+        "냉장고에 있는 재료로 바꿔도 괜찮아요 대신 역할만 맞추면 돼요 단맛 신맛 감칠맛의 균형이요",
+        "김치 요리는 김치 상태가 반이니까요 신김치면 단맛을 아주 조금 챙기고 덜 신 김치면 산미를 살짝만 보완해요",
+        "된장류는 끓이는 시간이 길수록 짠맛이 올라오니 마지막에 한 번만 더 확인하는 습관이 좋아요",
+        "간장류는 향을 살리려면 불 끄기 직전에 조금 넣는 게 의외로 효과가 좋아요",
+        "국물에 기름이 너무 떠있으면 키친타월로 한 번만 찍어내도 훨씬 깔끔해요",
+        "냄새가 걱정되면 생강이나 후추를 아주 조금만 추가해도 해결되는 경우가 많아요",
+        "달걀이나 두부 같은 재료는 먼저 데우고 넣으면 부서짐이 줄어들어요",
+        "기본 양념은 집집마다 달라서요 이 레시피는 기준만 잡고 내 입맛에 맞춰 미세조정하는 게 정답이에요",
+        "요리하다가 헷갈리면 한 단계만 뒤로 가서 맛을 보세요 그게 제일 빠른 해결책이에요",
+        "그릇에 담고 마지막에 파나 깨만 올려도 분위기가 확 살아나서 만족도가 올라가요",
     ]
 
 
@@ -1233,20 +1369,12 @@ def build_body_html(
             for link, t in items:
                 # 링크 텍스트는 마침표 제거만, URL은 그대로
                 sec3 += f"<p><a href='{_esc(link)}'>{_esc(_no_period(t))}</a></p>"
-    # 저장/댓글 유도 (말투는 유지하되 중복/반복은 최소화)
-    sec3 += _wrap_p(
-        _no_period(
-            "이 글은 저장해두면 진짜 편해요  다음에 오늘 뭐 먹지 할 때 고민 시간이 확 줄거든요  저는 이런 글은 장보기 전에 한 번씩만 훑어보는 편이에요"
-        )
-    )
-    sec3 += _wrap_p(
-        _no_period(
-            f"댓글로 하나만 알려주세요  {keyword} 만들 때 여러분은 어떤 재료를 추가하는 편이세요  버섯 두부 대파 계란 같은 조합도 좋고  입맛 취향대로 추천해주시면 저도 다음 글에 반영해볼게요"
-        )
-    )
-
-    # ✅ 섹션 길이 보강은 '마무리 요소'를 붙이기 전에 끝내기 (끝부분 꼬임/반복 방지)
+    # ✅ 섹션 길이 보강은 '마무리 문장'을 붙이기 전에 끝내기 (끝부분 꼬임/반복 방지)
     sec3 = _ensure_min_chars(sec3, 1500, fillers)
+
+    # 저장/댓글 유도 (말투는 유지하되 중복/반복은 최소화)  ✅ 항상 맨 끝에 오도록
+    sec3 += _wrap_p(_no_period("이 글은 저장해두면 진짜 편해요  다음에 오늘 뭐 먹지 할 때 고민 시간이 확 줄거든요  저는 이런 글은 장보기 전에 한 번씩만 훑어보는 편이에요"))
+    sec3 += _wrap_p(_no_period(f"댓글로 하나만 알려주세요  {keyword} 만들 때 여러분은 어떤 재료를 추가하는 편이세요  버섯 두부 대파 계란 같은 조합도 좋고  입맛 취향대로 추천해주시면 저도 다음 글에 반영해볼게요"))
 
     # 선택적으로 출처 표기 (기본 OFF)
     if _env_bool('SHOW_SOURCE', False):
@@ -1383,8 +1511,7 @@ def run(cfg: AppConfig) -> None:
             if cfg.run.debug:
                 print("[IMG] media:", media_id, media_url)
         except Exception as e:
-            if cfg.run.debug:
-                print("[IMG] upload failed:", repr(e))
+            print(f"[WARN] 이미지 업로드 실패  본문 이미지 또는 대표이미지가 보이지 않을 수 있어요 ({e.__class__.__name__})")
             media_id, media_url = 0, ""
 
     display_img_url = (media_url or thumb_url or "").strip()
