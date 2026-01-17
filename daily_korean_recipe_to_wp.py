@@ -728,7 +728,11 @@ def pick_recipe_mfds(cfg: AppConfig, recent_pairs: List[Tuple[str, str]]) -> Opt
     keywords = ["김치", "된장", "고추장", "국", "찌개", "볶음", "전", "조림", "비빔", "나물", "탕", "죽", "김밥", "떡"]
     for _ in range(cfg.run.max_tries):
         kw = random.choice(keywords)
-        rows = mfds_fetch_by_param(cfg.recipe.mfds_api_key, "RCP_NM", kw, start=1, end=60)
+        try:
+            rows = mfds_fetch_by_param(cfg.recipe.mfds_api_key, "RCP_NM", kw, start=1, end=60)
+        except Exception:
+            rows = []
+
         random.shuffle(rows)
         for row in rows:
             try:
