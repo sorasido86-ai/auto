@@ -31,17 +31,16 @@ jobs:
           WP_USER: ${{ secrets.WP_USER }}
           WP_APP_PASS: ${{ secrets.WP_APP_PASS }}
 
-          # Optional
+          # Optional sources
           MFDS_API_KEY: ${{ secrets.MFDS_API_KEY }}
-          # MFDS 안정화 (느릴 때 오래 끌지 않게)
-          MFDS_TIMEOUT: "8"
-          MFDS_RETRIES: "0"
-          MFDS_MAX_FAILS: "3"
-          MFDS_BUDGET_SECONDS: "30"
           DEFAULT_THUMB_URL: ${{ secrets.DEFAULT_THUMB_URL }}
-          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
 
-          # Behavior
+          # OpenAI (optional)
+          USE_OPENAI: "0"
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          OPENAI_MODEL: "gpt-4.1-mini"
+
+          # Publish behavior
           WP_STATUS: "publish"
           WP_CATEGORY_IDS: "7"
           WP_TAG_IDS: ""
@@ -52,30 +51,30 @@ jobs:
           DRY_RUN: "0"
           DEBUG: "0"
           AVOID_REPEAT_DAYS: "90"
-          MAX_TRIES: "25"
+          MAX_TRIES: "20"
+
+          # MFDS stability
+          MFDS_REQ_TIMEOUT: "10"
+          MFDS_BUDGET_SECONDS: "20"
+          MFDS_MAX_FAILS: "2"
 
           # Image
+          AUTO_IMAGE: "1"            # 기본이미지 없으면 제목 기반 자동 이미지
           UPLOAD_THUMB: "1"
           SET_FEATURED: "1"
           EMBED_IMAGE_IN_BODY: "1"
           REUSE_MEDIA_BY_SEARCH: "1"
-          AUTO_IMAGE: "1"
-          EXTRA_IMAGE_COUNT: "1"
 
-          # Naver-friendly content
-          NAVER_STYLE: "1"
-          SCHEMA_MODE: "comment"   # comment|script|off
-          HASHTAG_COUNT: "12"
-          EMBED_STEP_IMAGES: "1"
+          # Content length (short)
+          INTRO_CHARS: "160"
+          SECTION_MIN_CHARS: "420"
+          TOTAL_MIN_CHARS: "1200"
+          HASHTAG_COUNT: "8"
+
+          # Options
+          SCHEMA_MODE: "comment"      # comment|script|off
           ADD_FAQ: "1"
-          ADD_INTERNAL_LINKS: "1"
-
-          # Title template style
-          TITLE_STYLE: "random"    # benefit|threat|curiosity|compare|random
-
-          # OpenAI (optional)
-          USE_OPENAI: "0"
-          OPENAI_MODEL: "gpt-4.1-mini"
+          ADD_INTERNAL_LINKS: "0"    # 지난 레시피 링크 제거
 
         run: |
           python daily_korean_recipe_to_wp.py
