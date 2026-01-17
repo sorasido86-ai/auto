@@ -1069,7 +1069,7 @@ def run(cfg: AppConfig) -> None:
     # 해시태그 보강: 사용자가 넣은 키워드가 있어도 "음식 관련만" 최대한
     base_tags = ["#집밥", "#레시피", "#간단요리", "#오늘뭐먹지", "#저녁메뉴", "#혼밥", "#자취요리"]
     extra = [k.strip() for k in (cfg.naver.keywords_csv or "").split(",") if k.strip()]
-    extra = [f"#{re.sub(r'\\s+', '', x)}" if not x.startswith("#") else x for x in extra]
+    extra = ["#" + re.sub(r"\s+", "", x) if not x.startswith("#") else x for x in extra]
     extra = [x for x in extra if not _contains_banned(x)]
     body_json["hashtags"] = (body_json.get("hashtags") or []) + base_tags + extra
     # 중복 제거
