@@ -1,18 +1,30 @@
 # -*- coding: utf-8 -*-
 """
-daily_korean_recipe_to_wp.py (완전 통합/네이버 친화 강화 버전)
+daily_korean_recipe_to_wp.py (완전 통합/네이버 복붙 최적화 + 홈피드형 장문 템플릿)
+
 - "한식 레시피만" 매일 자동 업로드 (WordPress)
 - 1순위: 식품안전나라(식약처) COOKRCP01 OpenAPI 레시피 DB (MFDS_API_KEY 필요)
 - 2순위(폴백): 코드 내장 한식 레시피(한국어)
 
-★ 네이버(블로그) 복사/붙여넣기 최적화(중요)
-- NAVER_STYLE=1: 스타일/스크립트 최소화, 스캔 가능한 구조(요약/체크리스트/FAQ/해시태그/댓글질문) 강화
-- SCHEMA_MODE=comment|script|off (기본 comment): 복붙 시 화면에 안 보이게 주석 처리(네이버에서 script는 제거될 수 있음)
+★ 네이버(블로그) 복사/붙여넣기 최적화
+- NAVER_STYLE=1: 스타일/스크립트 최소화, 스캔 가능한 구조 유지
+- SCHEMA_MODE=comment|script|off (기본 comment)
 
-★ 요청 반영(중요)
-- 레시피 이미지가 비어도 DEFAULT_THUMB_URL 기본 이미지가 반드시 썸네일 후보가 되도록 처리
-- 가능하면 WP media로 업로드 후 featured_media(대표이미지) 설정까지 수행
-- 업로드 실패 시에도 본문 상단 이미지는 URL로 삽입(가능한 선에서 "이미지 보이게")
+★ 제목 템플릿(4종)
+- TITLE_STYLE=benefit|threat|curiosity|compare|random (기본 random)
+  * 레시피 제목(키워드)에 맞춰 후킹형 제목 생성
+
+★ 본문 템플릿(요청 반영)
+- 도입부: 홈피드형 200~300자
+- 굵은 소제목 3개: 각 섹션 "1500자 이상" 자동 보강
+- 총 글자수는 섹션 규칙을 만족하면 자연히 2300자 이상(대부분 5000자+)이 됩니다
+- 말투: 친구에게 진심 담아 수다떠는 존댓말
+- 문장 마침표(".")는 본문 텍스트에서 최대한 제거(데이터에 포함된 경우도 정리)
+
+★ 이미지 처리(중요)
+- 레시피 이미지가 비어도 DEFAULT_THUMB_URL 기본 이미지가 반드시 썸네일 후보
+- 가능하면 WP media로 업로드 후 featured_media(대표이미지) 설정
+- 업로드 실패 시에도 본문 상단 이미지는 URL로 삽입
 
 필수 환경변수(Secrets):
   - WP_BASE_URL
@@ -28,18 +40,17 @@ daily_korean_recipe_to_wp.py (완전 통합/네이버 친화 강화 버전)
 식품안전나라 OpenAPI:
   - MFDS_API_KEY=...  (없으면 내장 레시피만)
 
-기본 이미지(중요):
+기본 이미지:
   - DEFAULT_THUMB_URL=https://.../your_default_thumb.jpg
-    -> 레시피 이미지가 없을 때 이 이미지로 "대표이미지 업로드/featured"까지 시도
 
-OpenAI로 블로거톤 강화(선택):
+OpenAI로 문장 다양화/장문 강화(선택):
   - USE_OPENAI=1
   - OPENAI_API_KEY=...
   - OPENAI_MODEL=... (기본 gpt-4.1-mini)
 
 동작 옵션:
   - RUN_SLOT=day|am|pm (기본 day)
-  - FORCE_NEW=0|1 (기본 0)  : 오늘 이미 올렸어도 새 레시피로 "교체 업데이트"
+  - FORCE_NEW=0|1 (기본 0)
   - DRY_RUN=0|1 (기본 0)
   - DEBUG=0|1 (기본 0)
   - AVOID_REPEAT_DAYS=90 (기본 90)
@@ -49,12 +60,13 @@ OpenAI로 블로거톤 강화(선택):
   - UPLOAD_THUMB=1 (기본 1)
   - SET_FEATURED=1 (기본 1)
   - EMBED_IMAGE_IN_BODY=1 (기본 1)
-  - REUSE_MEDIA_BY_SEARCH=1 (기본 1) : 같은 파일명/검색으로 기존 미디어 재사용(중복 업로드 방지)
+  - REUSE_MEDIA_BY_SEARCH=1 (기본 1)
 
-네이버형 본문 옵션(추천):
+네이버형 옵션:
   - NAVER_STYLE=1 (기본 1)
+  - SCHEMA_MODE=comment|script|off (기본 comment)
   - HASHTAG_COUNT=12 (기본 12)
-  - EMBED_STEP_IMAGES=1 (기본 1) : MFDS 과정이미지 일부 본문에 추가(원격링크)
+  - EMBED_STEP_IMAGES=1 (기본 1)
   - ADD_FAQ=1 (기본 1)
   - ADD_INTERNAL_LINKS=1 (기본 1)
 """
@@ -99,11 +111,11 @@ LOCAL_KOREAN_RECIPES: List[Dict[str, Any]] = [
             ("멸치다시마 육수(또는 물)", "700ml"),
         ],
         "steps": [
-            "냄비에 돼지고기를 넣고 중불에서 기름이 살짝 돌 때까지 볶아주세요.",
-            "신김치를 넣고 2~3분 더 볶아 김치의 신맛을 한 번 눌러줍니다.",
-            "고춧가루/다진마늘/국간장을 넣고 30초만 볶아 향을 내요.",
-            "육수를 붓고 10~12분 끓입니다.",
-            "양파를 넣고 3분, 두부를 넣고 2분 더 끓인 뒤 대파로 마무리!",
+            "냄비에 돼지고기를 넣고 중불에서 기름이 살짝 돌 때까지 볶아주세요",
+            "신김치를 넣고 2~3분 더 볶아 김치의 신맛을 한 번 눌러줍니다",
+            "고춧가루 다진마늘 국간장을 넣고 30초만 볶아 향을 내요",
+            "육수를 붓고 10~12분 끓입니다",
+            "양파를 넣고 3분 두부를 넣고 2분 더 끓인 뒤 대파로 마무리해요",
         ],
         "image_url": "",
     },
@@ -121,9 +133,9 @@ LOCAL_KOREAN_RECIPES: List[Dict[str, Any]] = [
             ("멸치다시마 육수(또는 물)", "700ml"),
         ],
         "steps": [
-            "끓는 육수에 된장을 풀고 5분 끓여요.",
-            "양파/애호박/두부 넣고 5~6분 더 끓입니다.",
-            "대파 넣고 한 번만 더 끓인 뒤 간을 보고 마무리!",
+            "끓는 육수에 된장을 풀고 5분 끓여요",
+            "양파 애호박 두부 넣고 5~6분 더 끓입니다",
+            "대파 넣고 한 번만 더 끓인 뒤 간을 보고 마무리해요",
         ],
         "image_url": "",
     },
@@ -142,9 +154,9 @@ LOCAL_KOREAN_RECIPES: List[Dict[str, Any]] = [
             ("물(또는 배즙)", "3큰술"),
         ],
         "steps": [
-            "간장/설탕/다진마늘/참기름/물/후추로 양념장을 섞어요.",
-            "고기에 양념장을 넣고 15분 이상 재워둡니다.",
-            "팬에 고기를 볶고, 양파/대파를 넣어 숨이 죽을 때까지 볶아요.",
+            "간장 설탕 다진마늘 참기름 물 후추로 양념장을 섞어요",
+            "고기에 양념장을 넣고 15분 이상 재워둡니다",
+            "팬에 고기를 볶고 양파 대파를 넣어 숨이 죽을 때까지 볶아요",
         ],
         "image_url": "",
     },
@@ -152,9 +164,9 @@ LOCAL_KOREAN_RECIPES: List[Dict[str, Any]] = [
 
 KOREAN_NEGATIVE_KEYWORDS = ["파스타", "피자", "타코", "스시", "커리", "샌드위치", "버거", "샐러드"]
 
-DISCLOSURE = "※ 이 글은 레시피 데이터를 기반으로 자동 생성된 포스팅입니다."
-SOURCE_NOTE = "데이터 출처: 식품안전나라(식약처) OpenAPI 레시피 DB 및 내장 레시피(폴백)."
-SEO_NOTE = "오늘 뭐 먹지 고민될 때, 재료 적고 실패 확률 낮은 레시피로 골라왔어요 🙂"
+DISCLOSURE = "※ 이 글은 레시피 데이터를 기반으로 자동 생성된 포스팅입니다"
+SOURCE_NOTE = "데이터 출처 식품안전나라 식약처 OpenAPI 레시피 DB 및 내장 레시피 폴백"
+SEO_NOTE = "오늘 뭐 먹지 고민될 때 재료 적고 실패 확률 낮은 레시피로 골라왔어요"
 
 
 # -----------------------------
@@ -204,7 +216,7 @@ class WordPressConfig:
 
 @dataclass
 class RunConfig:
-    run_slot: str = "day"       # day / am / pm
+    run_slot: str = "day"  # day / am / pm
     force_new: bool = False
     dry_run: bool = False
     debug: bool = False
@@ -214,7 +226,7 @@ class RunConfig:
 
 @dataclass
 class RecipeSourceConfig:
-    mfds_api_key: str = ""      # foodsafetykorea openapi key (optional)
+    mfds_api_key: str = ""  # foodsafetykorea openapi key (optional)
     strict_korean: bool = True
 
 
@@ -235,6 +247,7 @@ class ContentConfig:
     embed_step_images: bool = True
     add_faq: bool = True
     add_internal_links: bool = True
+    title_style: str = "random"  # benefit|threat|curiosity|compare|random
 
 
 @dataclass
@@ -272,6 +285,10 @@ def load_cfg() -> AppConfig:
     if schema_mode not in ("comment", "script", "off"):
         schema_mode = "comment"
 
+    title_style = (_env("TITLE_STYLE", "random") or "random").lower()
+    if title_style not in ("benefit", "threat", "curiosity", "compare", "random"):
+        title_style = "random"
+
     return AppConfig(
         wp=WordPressConfig(
             base_url=wp_base,
@@ -307,6 +324,7 @@ def load_cfg() -> AppConfig:
             embed_step_images=_env_bool("EMBED_STEP_IMAGES", True),
             add_faq=_env_bool("ADD_FAQ", True),
             add_internal_links=_env_bool("ADD_INTERNAL_LINKS", True),
+            title_style=title_style,
         ),
         openai=OpenAIConfig(
             use_openai=_env_bool("USE_OPENAI", False),
@@ -348,6 +366,7 @@ def print_safe_cfg(cfg: AppConfig) -> None:
     print("[CFG] REUSE_MEDIA_BY_SEARCH:", cfg.img.reuse_media_by_search)
     print("[CFG] NAVER_STYLE:", cfg.content.naver_style, "| SCHEMA_MODE:", cfg.content.schema_mode, "| HASHTAG_COUNT:", cfg.content.hashtag_count)
     print("[CFG] EMBED_STEP_IMAGES:", cfg.content.embed_step_images, "| ADD_FAQ:", cfg.content.add_faq, "| ADD_INTERNAL_LINKS:", cfg.content.add_internal_links)
+    print("[CFG] TITLE_STYLE:", cfg.content.title_style)
     print("[CFG] USE_OPENAI:", cfg.openai.use_openai, "| OPENAI_API_KEY:", ok(cfg.openai.api_key), "| OPENAI_MODEL:", cfg.openai.model)
 
 
@@ -365,6 +384,7 @@ REQUIRED_COLS = {
     "media_url": "TEXT",
     "created_at": "TEXT",
 }
+
 
 def init_db(path: str) -> None:
     Path(path).parent.mkdir(parents=True, exist_ok=True)
@@ -495,7 +515,7 @@ def get_recent_wp_links(path: str, limit: int = 3) -> List[Tuple[str, str]]:
 # -----------------------------
 def wp_auth_header(user: str, app_pass: str) -> Dict[str, str]:
     token = base64.b64encode(f"{user}:{app_pass}".encode("utf-8")).decode("utf-8")
-    return {"Authorization": f"Basic {token}", "User-Agent": "daily-korean-recipe-bot/1.1"}
+    return {"Authorization": f"Basic {token}", "User-Agent": "daily-korean-recipe-bot/1.2"}
 
 
 def wp_create_post(cfg: WordPressConfig, title: str, slug: str, html_body: str, excerpt: str = "") -> Tuple[int, str]:
@@ -592,7 +612,7 @@ def wp_upload_media_from_url(cfg: WordPressConfig, image_url: str, filename: str
 # -----------------------------
 @dataclass
 class Recipe:
-    source: str          # "mfds" or "local"
+    source: str  # mfds or local
     recipe_id: str
     title: str
     ingredients: List[str]
@@ -747,14 +767,50 @@ def get_recipe_by_id(cfg: AppConfig, source: str, recipe_id: str) -> Optional[Re
 # -----------------------------
 # Blog rendering helpers
 # -----------------------------
+
 def _esc(s: str) -> str:
     return html.escape(s or "")
+
+
+def _no_period(s: str) -> str:
+    """본문 문장 마침표 제거용(가능한 범위)
+    - 이미지 URL 같은 곳에는 사용하지 말 것
+    """
+    s = (s or "").replace(".", "")
+    s = s.replace("。", "")
+    return s
+
+
+def _plain_len(html_s: str) -> int:
+    t = re.sub(r"<[^>]+>", "", html_s or "")
+    t = html.unescape(t)
+    return len(t)
+
+
+def _wrap_p(txt: str) -> str:
+    return f"<p>{_esc(txt)}</p>"
+
+
+def _wrap_p_br(lines: List[str]) -> str:
+    safe = "<br/>".join([_esc(x) for x in lines if x])
+    return f"<p>{safe}</p>"
+
+
+def _ensure_min_chars(section_html: str, min_chars: int, fillers: List[str]) -> str:
+    """섹션 글자수를 min_chars 이상으로 보강
+    - fillers는 마침표 없는 문장들로 준비
+    """
+    out = section_html
+    tries = 0
+    while _plain_len(out) < min_chars and tries < 60:
+        tries += 1
+        out += _wrap_p(random.choice(fillers))
+    return out
 
 
 def _clean_title_for_tags(title: str) -> List[str]:
     t = re.sub(r"[^0-9가-힣a-zA-Z\s]", " ", title or "")
     toks = [x.strip() for x in t.split() if x.strip()]
-    # 너무 짧은 토큰 제거 + 중복 제거
     out: List[str] = []
     seen = set()
     for x in toks:
@@ -770,14 +826,21 @@ def _clean_title_for_tags(title: str) -> List[str]:
 
 def build_hashtags(cfg: AppConfig, recipe: Recipe) -> str:
     base = [
-        "한식레시피", "집밥", "오늘뭐먹지", "간단요리", "초간단레시피",
-        "자취요리", "밥도둑", "국물요리", "반찬", "요리기록"
+        "한식레시피",
+        "집밥",
+        "오늘뭐먹지",
+        "간단요리",
+        "초간단레시피",
+        "자취요리",
+        "밥도둑",
+        "국물요리",
+        "반찬",
+        "요리기록",
     ]
     title_tokens = _clean_title_for_tags(recipe.title)
-    # 제목 토큰 일부를 해시태그로(너무 많지 않게)
     for tok in title_tokens[:5]:
         base.append(tok.replace(" ", ""))
-    # 중복 제거 & 길이 제한
+
     uniq: List[str] = []
     seen = set()
     for x in base:
@@ -795,7 +858,7 @@ def build_hashtags(cfg: AppConfig, recipe: Recipe) -> str:
 
 
 def choose_thumb_url(cfg: AppConfig, recipe: Recipe) -> str:
-    # ★ 핵심: 레시피 이미지가 비어도 기본 이미지로 대체
+    # 레시피 이미지가 비어도 기본 이미지로 대체
     return (recipe.image_url or "").strip() or (cfg.img.default_thumb_url or "").strip()
 
 
@@ -820,38 +883,117 @@ def build_schema_block(cfg: AppConfig, recipe: Recipe, image_url: str, now: date
         return ""
     schema_json = build_recipe_schema_json(recipe, image_url, now)
     if mode == "script":
-        # WP에는 좋지만, 네이버 복붙 시 사라지거나 불필요할 수 있음
         return f'<script type="application/ld+json">{_esc(schema_json)}</script>'
-    # comment(default): 네이버 복붙 시 화면에 안 보이게
     return f"<!-- RECIPE_SCHEMA_JSONLD: {_esc(schema_json)} -->"
 
 
-def pick_benefit_phrase(title: str) -> str:
-    # 과장X, 클릭 유도는 하되 담백하게
-    phrases = [
-        "실패 확률 낮게 정리",
-        "재료 간단 버전",
-        "초보도 가능한 레시피",
-        "맛 보장 포인트만 콕",
-        "집밥으로 딱 좋은 메뉴",
-        "10분~20분 완성",
-    ]
-    # 제목에 국/찌개가 있으면 국물 포인트
-    if any(k in title for k in ["국", "찌개", "탕"]):
-        phrases.append("국물맛 깔끔하게")
-    if any(k in title for k in ["볶음", "조림"]):
-        phrases.append("간 딱 맞게")
-    return random.choice(phrases)
+# -----------------------------
+# Title templates
+# -----------------------------
+
+def _title_templates(keyword: str) -> Dict[str, List[str]]:
+    kw = _no_period(keyword).strip()
+    # 따옴표는 네이버에서 클릭을 유도하는 느낌으로 유지
+    return {
+        "benefit": [
+            f"{kw} 이번에 해먹은 사람만 '맛이 확 달라지는 포인트' 듣고 놀랐다",
+            f"{kw} 한 번만 이렇게 했더니 '입맛 당기는 향'이 자동으로 올라왔다",
+            f"{kw} 재료 2개만 바꿨는데 '집밥 퀄리티'가 말이 안 됐다",
+        ],
+        "threat": [
+            f"{kw} 이 순서 틀리면 '맛이 반으로' 줄어든다 저도 처음엔 몰랐다",
+            f"{kw} 간을 중간에 맞추면 '짜게 망할 확률'이 확 올라가요",
+            f"{kw} 불 조절 놓치면 '비린내나 텁텁함'이 남는다 여기 꼭 보세요",
+        ],
+        "curiosity": [
+            f"{kw} 왜 밖에서 먹는 맛이 안 날까 '한 가지 차이'가 있더라고요",
+            f"{kw} 실패하는 이유는 딱 하나였다 오늘은 그 부분만 잡아드릴게요",
+            f"{kw} 만들면서 설레는 이유 알고 보니 '이 타이밍' 때문이었다",
+        ],
+        "compare": [
+            f"{kw} 집에서 만든 맛 vs 밖에서 먹는 맛 '결국 차이는 여기'였어요",
+            f"{kw} 국물파 vs 건더기파 '누가 더 만족할까' 기준을 정리했어요",
+            f"{kw} 냉장재료로 만들기 vs 냉동재료로 만들기 '결과 차이'가 컸어요",
+        ],
+    }
 
 
-def build_naver_hook(title: str) -> str:
-    # 네이버에서 “첫 3줄”이 중요하다고 가정하고, 짧게 후킹
-    hook_lines = [
-        f"{title}는 재료만 맞추면 실패 확률이 확 줄어요.",
-        "오늘은 ‘어렵게 말고, 진짜 해먹을 수 있게’ 정리했습니다.",
-        "바쁜 날에도 그대로 따라 하면 맛이 나오는 포인트만 담았어요.",
+def build_post_title(date_str: str, slot_label: str, keyword: str, title_style: str = "random") -> str:
+    tpls = _title_templates(keyword)
+    style = title_style
+    if style == "random":
+        style = random.choice(["benefit", "threat", "curiosity", "compare"])
+    base = random.choice(tpls.get(style, tpls["curiosity"]))
+    # 날짜는 뒤에 작게
+    return _no_period(f"{base} ({date_str} {slot_label})")
+
+
+# -----------------------------
+# Body templates
+# -----------------------------
+
+def _build_intro_200_300(keyword: str) -> str:
+    kw = _no_period(keyword).strip()
+    # 홈피드형 도입부 200~300자 목표
+    chunks = [
+        f"요즘 {kw} 생각나면 괜히 마음이 좀 바빠지지 않으세요",
+        "뭘 거창하게 하려는 게 아니라 오늘 하루를 편하게 넘기고 싶은 마음이잖아요",
+        "그래서 오늘은 따라만 해도 맛이 나오는 흐름으로 정리해봤어요",
+        "재료는 복잡하게 늘리지 않고 실패 포인트만 조심하는 방식이에요",
+        "읽다가 그대로 장바구니에 담기 좋게 적어둘게요",
     ]
-    return " ".join(hook_lines)
+    txt = " ".join(chunks)
+    # 길이 맞추기
+    if len(txt) < 200:
+        txt += " " + " ".join(
+            [
+                "특히 간 맞추는 타이밍이랑 불 조절만 잡으면 결과가 진짜 안정적이더라고요",
+                "오늘은 그 부분을 제일 쉽게 풀어드릴게요",
+            ]
+        )
+    if len(txt) > 300:
+        txt = txt[:298].rstrip()  # 너무 길면 컷
+    return _no_period(txt)
+
+
+def _section_fillers(keyword: str) -> List[str]:
+    kw = _no_period(keyword).strip()
+    return [
+        f"{kw}는 사실 재료보다 순서가 더 중요해요 그래서 한 번만 흐름을 잡아두면 다음부터는 눈 감고도 할 수 있어요",
+        "중요한 건 한 번에 완벽하게 하려는 마음을 내려놓는 거예요 오늘은 안전하게 성공하는 쪽으로만 가요",
+        "간은 중간에 맞추기보다 마지막에 조절하는 게 훨씬 안정적이에요 중간에 맞추면 졸아들면서 짜지기 쉬워요",
+        "불을 세게 해서 빨리 끝내려고 하면 향이 날아가거나 재료가 굳을 때가 있어요 중불에서 천천히가 결국 이득이에요",
+        "재료가 하나 빠져도 괜찮아요 핵심은 간 불 시간이라서 그 세 가지만 지키면 맛이 크게 무너지지 않아요",
+        "맛이 애매하면 소금이나 간장부터 더 넣기 전에 단맛이나 향을 아주 조금만 더해보는 게 의외로 해결이 빨라요",
+        "처음엔 양을 줄여서 해보는 것도 좋아요 성공 경험을 한 번 만들면 다음부터 마음이 편해져요",
+        "남은 음식은 다음날이 더 맛있을 때가 있어요 대신 재가열할 때 간을 다시 보지 말고 마지막에만 살짝 잡아주세요",
+        "저는 이런 레시피는 저장해두고 장볼 때마다 하나씩 돌려보는 편이에요 그러면 식단 고민이 훨씬 줄어들어요",
+        f"오늘 {kw}는 과하게 꾸미지 않고도 충분히 만족스럽게 나오는 쪽으로 잡았어요",
+    ]
+
+
+def _render_ingredients_lines(ingredients: List[str]) -> List[str]:
+    if not ingredients:
+        return ["재료 정보가 비어있어요"]
+    out = []
+    for x in ingredients:
+        x = _no_period(str(x).strip())
+        if not x:
+            continue
+        out.append(f"- {x}")
+    return out or ["재료 정보가 비어있어요"]
+
+
+def _render_steps_lines(steps: List[str]) -> List[str]:
+    if not steps:
+        return ["과정 정보가 비어있어요"]
+    out = []
+    for i, s in enumerate(steps, start=1):
+        ss = _no_period(str(s).strip())
+        if not ss:
+            continue
+        out.append(f"{i} {ss}")
+    return out or ["과정 정보가 비어있어요"]
 
 
 def build_body_html(
@@ -862,132 +1004,164 @@ def build_body_html(
     display_img_url: str = "",
     recent_links: Optional[List[Tuple[str, str]]] = None,
 ) -> Tuple[str, str]:
-    """
-    returns: (body_html, excerpt)
-    """
-    title = recipe.title.strip()
-    benefit = pick_benefit_phrase(title)
+    """returns (body_html, excerpt)"""
+    keyword = _no_period(recipe.title.strip())
 
-    # excerpt(네이버/워드프레스 미리보기용 짧은 요약)
-    excerpt = f"{title} 레시피. {benefit} 중심으로 재료/순서를 보기 쉽게 정리했습니다."
-    excerpt = excerpt[:140]
+    # excerpt는 도입부에서 뽑고 140자 제한
+    intro_txt = _build_intro_200_300(keyword)
+    excerpt = (intro_txt[:140]).strip()
 
-    # 공통: 스크립트/스타일 최소화(복붙 안정)
     schema_block = build_schema_block(cfg, recipe, display_img_url, now)
 
-    # 이미지(본문 상단 1장 고정)
+    # 상단 이미지
     img_html = ""
     if cfg.img.embed_image_in_body and display_img_url:
-        if cfg.content.naver_style:
-            img_html = f'<p><img src="{_esc(display_img_url)}" alt="{_esc(title)}"/></p>'
-        else:
-            img_html = f"""
-            <p style="margin:14px 0;">
-              <img src="{_esc(display_img_url)}" alt="{_esc(title)}"
-                   style="max-width:100%;height:auto;border-radius:10px;" />
-            </p>
-            """
+        img_html = f'<p><img src="{_esc(display_img_url)}" alt="{_esc(keyword)}"/></p>'
 
-    # 네이버형 구성(후킹 → 본론(정보/재료/순서) → 클릭유도 → 댓글유도)
-    disclosure = f"<p>{_esc(DISCLOSURE)}</p>" if cfg.content.naver_style else f'<p style="padding:10px;border-left:4px solid #111;background:#f7f7f7;">{_esc(DISCLOSURE)}</p>'
-    head = f"<p>기준시각: <b>{_esc(now.astimezone(KST).strftime('%Y-%m-%d %H:%M'))}</b> / 슬롯: <b>{_esc(run_slot_label)}</b></p>"
-    note = f"<p>{_esc(SEO_NOTE)}<br/>{_esc(SOURCE_NOTE)}</p>" if cfg.content.naver_style else f'<p style="font-size:13px;opacity:.85;">{_esc(SEO_NOTE)}<br/>{_esc(SOURCE_NOTE)}</p>'
+    # 공통 안내
+    head_lines = [
+        DISCLOSURE,
+        f"기준시각 {now.astimezone(KST).strftime('%Y-%m-%d %H:%M')}  슬롯 {run_slot_label}",
+        SEO_NOTE,
+        SOURCE_NOTE,
+    ]
+    head_block = _wrap_p_br([_no_period(x) for x in head_lines])
 
-    hook = f"""
-    <h2>{_esc(title)} 레시피</h2>
-    <p><b>오늘의 포인트</b>: {_esc(benefit)}</p>
-    <p>{_esc(build_naver_hook(title))}</p>
-    """
+    # --------
+    # 섹션 3개
+    # --------
+    fillers = _section_fillers(keyword)
 
-    quick = """
-    <h3>한눈에 보기</h3>
-    <ul>
-      <li>✅ 재료: 집에 있는 것 위주로</li>
-      <li>✅ 간 맞추기: 마지막에 한 번만 조절</li>
-      <li>✅ 실패 줄이기: ‘타이밍’만 지키면 끝</li>
-    </ul>
-    """
+    # 섹션 1: 재료/성공 포인트
+    h1 = f"{keyword}  맛이 갈리는 재료 포인트  딱 여기만 보면 돼요"
+    sec1 = f"<h3><strong>{_esc(_no_period(h1))}</strong></h3>"
+    sec1 += _wrap_p(
+        _no_period(
+            f"제가 이 메뉴를 좋아하는 이유가 있어요  바쁜 날에도 마음이 편해지거든요  그런데 {keyword}는 대충 하면 대충한 티가 바로 나요  그래서 오늘은 재료를 과하게 늘리지 않으면서도 맛이 안정적으로 나오게 하는 쪽으로만 잡아볼게요"
+        )
+    )
+    sec1 += _wrap_p(
+        _no_period(
+            "장보실 때 제일 먼저 볼 건 신선함보다도 밸런스예요  짠맛 신맛 단맛 향 이 네 가지가 어느 하나로 치우치지 않게만 잡으면 집밥이 갑자기 업그레이드되거든요  특히 국물류나 볶음류는 간을 빨리 맞추려고 조급해질수록 실패 확률이 올라가요"
+        )
+    )
+    sec1 += _wrap_p_br(
+        [
+            _no_period("오늘 재료는 이렇게만 준비하시면 돼요  체크하면서 보시면 편해요"),
+            *_render_ingredients_lines(recipe.ingredients),
+            _no_period("재료가 하나 빠져도 괜찮아요  대신 핵심 재료 한두 개는 꼭 챙기는 게 좋아요"),
+        ]
+    )
+    sec1 += _wrap_p(
+        _no_period(
+            f"여기서 포인트 하나만 더요  {keyword}는 처음부터 강불로 몰아가면 향이 깨지거나 식감이 애매해질 때가 있어요  중불에서 천천히 시작해서 재료가 익는 속도를 맞춰주면 결과가 훨씬 안정적이에요  그리고 간은 마지막에 한 번만 잡는다고 생각하시면 마음이 편해요"
+        )
+    )
 
-    # 재료
-    ing_li = "".join([f"<li>{_esc(x)}</li>" for x in recipe.ingredients]) or "<li>재료 정보가 비어있어요.</li>"
-    ingredients = f"<h3>재료 준비(체크리스트)</h3><ul>{ing_li}</ul>"
+    sec1 = _ensure_min_chars(sec1, 1500, fillers)
 
-    # 조리순서 (문단 길이/가독성 강화)
-    step_ol = "".join([f"<li>{_esc(s)}</li>" for s in recipe.steps]) or "<li>조리 과정 정보가 비어있어요.</li>"
-    steps = f"<h3>만드는 법(조리 순서)</h3><ol>{step_ol}</ol>"
+    # 섹션 2: 만드는 과정 상세
+    h2 = f"{keyword}  만드는 법  그대로 따라만 해도 맛이 나오는 흐름"
+    sec2 = f"<h3><strong>{_esc(_no_period(h2))}</strong></h3>"
+    sec2 += _wrap_p(
+        _no_period(
+            "조리 과정은요  어려운 기술이 필요한 게 아니라 타이밍을 놓치지 않는 게 전부예요  그래서 오늘은 과정 자체를 길게 말하기보다  어디서 흔들리는지  그 흔들림을 어떻게 잡는지  그걸 중심으로 수다 떨듯이 풀어볼게요"
+        )
+    )
+    sec2 += _wrap_p(
+        _no_period(
+            "제가 제일 자주 보는 실패가 두 가지예요  하나는 양념을 너무 빨리 넣어서 향이 날아가버리는 경우  또 하나는 간을 중간에 맞춰서 마지막에 짜지는 경우예요  이 두 가지만 피하면 웬만하면 성공해요"
+        )
+    )
+    sec2 += _wrap_p_br(
+        [
+            _no_period("조리 순서는 이렇게 가요  중간중간 포인트도 같이 적어둘게요"),
+            *_render_steps_lines(recipe.steps),
+        ]
+    )
+    sec2 += _wrap_p(
+        _no_period(
+            f"그리고 꼭 이 느낌만 기억해두세요  {keyword}는 완성 직전에 맛이 한 번 더 올라가요  그 순간에 간을 확정하면 좋고요  혹시 맛이 애매하면 소금이나 간장을 더하기 전에  향을 살리는 재료를 아주 소량만 더해보는 게 의외로 빠르게 해결돼요"
+        )
+    )
 
-    # 과정 이미지(있으면 1~3장만 추가)
-    step_imgs_html = ""
+    # 과정 이미지 1~3장 (추가 소제목 없이 본문에만)
     if cfg.content.embed_step_images and recipe.step_images:
-        imgs = recipe.step_images[:3]
-        li = "".join([f'<li><img src="{_esc(u)}" alt="{_esc(title)} 과정사진"/></li>' for u in imgs if u.startswith("http")])
-        if li:
-            step_imgs_html = f"<h3>과정 사진</h3><ul>{li}</ul>"
+        imgs = [u for u in recipe.step_images[:3] if u.startswith("http")]
+        if imgs:
+            sec2 += _wrap_p(_no_period("과정 사진은 참고로만 살짝 붙여둘게요  복붙해도 흐트러지지 않게요"))
+            for u in imgs:
+                sec2 += f'<p><img src="{_esc(u)}" alt="{_esc(keyword)} 과정사진"/></p>'
 
-    tips = """
-    <h3>실패 줄이는 꿀팁 3가지</h3>
-    <ul>
-      <li>불 조절은 ‘중불 → 약불’로만 잡아도 결과가 훨씬 안정적이에요.</li>
-      <li>간은 꼭 마지막에! 중간에 맞추면 짜질 확률이 큽니다.</li>
-      <li>향신/양념은 한 번에 많이 넣지 말고 ‘조금씩 추가’가 정답.</li>
-    </ul>
-    """
+    sec2 = _ensure_min_chars(sec2, 1500, fillers)
 
-    variations = """
-    <h3>응용/대체 아이디어</h3>
-    <ul>
-      <li>단맛이 필요하면 설탕 대신 올리고당을 아주 소량만 추가해보세요.</li>
-      <li>더 칼칼하게: 고춧가루는 마지막에 1/2큰술 추가가 깔끔합니다.</li>
-      <li>아이 버전: 매운 양념은 줄이고 간장/육수 비율로 맛을 맞추세요.</li>
-    </ul>
-    """
+    # 섹션 3: 응용 보관 먹는 법 + CTA
+    h3 = f"{keyword}  더 맛있게 먹는 법  그리고 다음에 더 쉬워지는 팁"
+    sec3 = f"<h3><strong>{_esc(_no_period(h3))}</strong></h3>"
+    sec3 += _wrap_p(
+        _no_period(
+            "여기까지 오면 사실 절반은 끝난 거예요  나머지 절반은 내 입맛에 맞게 아주 조금만 조절하는 거예요  그게 진짜 집밥의 매력이잖아요  오늘은 과하게 바꾸지 말고  딱 한 가지 포인트만 내 취향으로 바꿔보는 걸 추천드려요"
+        )
+    )
+    sec3 += _wrap_p(
+        _no_period(
+            "응용은 이렇게 해보셔도 좋아요  칼칼함이 필요하면 매운 양념을 마지막에 아주 조금만 추가  단맛이 필요하면 설탕을 확 늘리기보다 올리고당을 아주 소량  향이 필요하면 대파나 마늘을 한 번 더  이런 식으로요  한 번에 크게 바꾸면 실패 확률이 올라가니까요"
+        )
+    )
+    sec3 += _wrap_p(
+        _no_period(
+            "보관은 밀폐 용기만 잘 써도 편해져요  냉장으로 하루 이틀 정도는 무난하고  다시 데울 때는 꼭 한 번 끓인 뒤에 간을 마지막에만 살짝 보세요  중간에 간을 잡으면 다음날 더 짜게 느껴질 때가 있거든요"
+        )
+    )
 
-    storage = """
-    <h3>보관 & 재가열</h3>
-    <ul>
-      <li>냉장: 밀폐 용기에 담아 1~2일 내 섭취 권장</li>
-      <li>재가열: 한 번 끓인 뒤 간을 마지막에 조절</li>
-    </ul>
-    """
-
-    faq = ""
     if cfg.content.add_faq:
-        faq = f"""
-        <h3>자주 묻는 질문(FAQ)</h3>
-        <ul>
-          <li><b>Q.</b> 간이 심심해요. 언제 보강하나요?<br/><b>A.</b> 끓임/졸임이 끝난 ‘마지막’에 국간장/소금으로 조절하세요.</li>
-          <li><b>Q.</b> 재료가 하나 빠졌는데 대체 가능해요?<br/><b>A.</b> 핵심은 ‘간/불/시간’이라서 1~2개는 대체해도 맛이 크게 무너지지 않아요.</li>
-          <li><b>Q.</b> 다음엔 더 맛있게 하려면?<br/><b>A.</b> 오늘 만든 뒤 “내 입맛 기준”으로 간/매운맛만 메모해두면 다음번이 쉬워집니다.</li>
-        </ul>
-        """
+        faq_lines = [
+            _no_period("자주 묻는 질문도 짧게 정리해볼게요"),
+            _no_period("간이 심심해요  언제 보강하나요  마지막에만 국간장이나 소금으로 조절해요"),
+            _no_period("재료가 하나 빠졌어요  대체 가능해요  핵심은 간 불 시간이라  한두 개 빠져도 괜찮아요"),
+            _no_period("다음엔 더 맛있게 하려면  오늘 만든 뒤 간과 매운맛만 메모해두면 다음번이 훨씬 쉬워져요"),
+        ]
+        sec3 += _wrap_p_br(faq_lines)
 
-    # 내부 링크(지난 글 3개)
-    more = ""
+    # 내부 링크(지난 글 3개) - 별도 소제목 없이
     if cfg.content.add_internal_links and recent_links:
-        items = "".join([f"<li><a href='{_esc(link)}'>{_esc(t)}</a></li>" for link, t in recent_links if link])
+        items = [(link, t) for link, t in recent_links if link]
         if items:
-            more = f"<h3>지난 레시피 더 보기</h3><ul>{items}</ul>"
+            sec3 += _wrap_p(_no_period("지난 레시피도 같이 두고 갈게요  시간 날 때 하나씩 돌려보면 식단 고민이 확 줄어요"))
+            for link, t in items:
+                # 링크 텍스트는 마침표 제거만, URL은 그대로
+                sec3 += f"<p><a href='{_esc(link)}'>{_esc(_no_period(t))}</a></p>"
+
+    # 저장/댓글 유도
+    sec3 += _wrap_p(
+        _no_period(
+            "이 글은 저장해두면 진짜 편해요  다음에 오늘 뭐 먹지 할 때 고민 시간이 확 줄거든요  저는 이런 글은 장보기 전에 한 번씩만 훑어보는 편이에요"
+        )
+    )
+    sec3 += _wrap_p(
+        _no_period(
+            f"댓글로 하나만 알려주세요  {keyword} 만들 때 여러분은 어떤 재료를 추가하는 편이세요  버섯 두부 대파 계란 같은 조합도 좋고  입맛 취향대로 추천해주시면 저도 다음 글에 반영해볼게요"
+        )
+    )
 
     hashtags = build_hashtags(cfg, recipe)
+    sec3 += "<hr/>" + _wrap_p(_no_period(hashtags))
 
-    # 클릭/댓글 유도(너가 원하는 구조 반영)
-    cta = """
-    <h3>저장 포인트</h3>
-    <p>이 글은 <b>저장</b>해두면 다음에 “오늘 뭐 먹지?” 할 때 바로 꺼내 쓰기 좋아요 🙂</p>
-    """
-    comment_prompt = f"""
-    <h3>댓글 질문</h3>
-    <p><b>{_esc(title)}</b> 만들 때 여러분은 어떤 재료를 추가하는 편인가요? (예: 버섯/두부/대파 등) 댓글로 추천해줘요!</p>
-    """
+    sec3 = _ensure_min_chars(sec3, 1500, fillers)
 
-    closing = f"""
-    <hr/>
-    <p>{_esc(hashtags)}</p>
-    """
+    # 본문 합치기
+    body_html = schema_block
+    body_html += head_block
+    body_html += _wrap_p(intro_txt)
+    body_html += img_html
+    body_html += sec1 + sec2 + sec3
 
-    body = schema_block + disclosure + head + img_html + note + hook + quick + ingredients + steps + step_imgs_html + tips + variations + storage + faq + more + cta + comment_prompt + closing
-    return body, excerpt
+    return body_html, excerpt
 
+
+# -----------------------------
+# OpenAI upgrade (optional)
+# -----------------------------
 
 def generate_with_openai(cfg: AppConfig, recipe: Recipe, base_html: str) -> Optional[str]:
     if not (cfg.openai.use_openai and cfg.openai.api_key):
@@ -1001,11 +1175,13 @@ def generate_with_openai(cfg: AppConfig, recipe: Recipe, base_html: str) -> Opti
     try:
         client = OpenAI(api_key=cfg.openai.api_key)
         prompt = f"""
-너는 한국 요리 블로그 전문 에디터야.
-아래 레시피(제목/재료/과정)는 내용이 바뀌면 안 돼. 그대로 유지해.
-대신 도입부/설명/팁/마무리를 더 자연스럽고 조회수 잘 나오는 블로거 말투로 다듬어줘.
-HTML 형태로만 출력해. (코드블럭 금지)
-너무 과장된 광고 문구는 금지. 담백하지만 먹고 싶게.
+너는 한국 요리 블로그 전문 에디터야
+아래 레시피 제목 재료 과정은 내용이 바뀌면 안 돼 그대로 유지해
+대신 말투를 친구에게 수다 떠는 존댓말로 더 자연스럽고 길게 다듬어줘
+마침표는 가능한 쓰지 말고 문장 호흡은 띄어쓰기와 줄바꿈으로 만들어줘
+굵은 소제목은 반드시 3개만 유지하고 각 섹션이 충분히 길게 유지되게 해줘
+HTML 형태로만 출력해 코드블럭 금지
+과장된 광고 문구 금지
 
 [레시피 제목]
 {recipe.title}
@@ -1028,11 +1204,12 @@ HTML 형태로만 출력해. (코드블럭 금지)
     return None
 
 
+# -----------------------------
+# Media helpers
+# -----------------------------
+
 def ensure_media(cfg: AppConfig, image_url: str, stable_name: str) -> Tuple[int, str]:
-    """
-    - 중복 업로드 방지(가능하면): search로 기존 미디어 재사용
-    - 없으면 업로드
-    """
+    """중복 업로드 방지 가능한 경우 search로 재사용, 없으면 업로드"""
     if not image_url:
         return 0, ""
 
@@ -1054,16 +1231,10 @@ def ensure_media(cfg: AppConfig, image_url: str, stable_name: str) -> Tuple[int,
     return mid, murl
 
 
-def build_post_title(date_str: str, slot_label: str, recipe_title: str) -> str:
-    # 네이버에 복붙해도 어색하지 않게 "날짜"는 뒤로 빼고, 앞은 키워드 중심
-    benefit = pick_benefit_phrase(recipe_title)
-    # 예: "돼지고기 김치찌개 레시피 | 실패 확률 낮게 정리 (2026-01-15 오늘)"
-    return f"{recipe_title} 레시피 | {benefit} ({date_str} {slot_label})"
-
-
 # -----------------------------
 # Main
 # -----------------------------
+
 def run(cfg: AppConfig) -> None:
     now = datetime.now(tz=KST)
     date_str = now.strftime("%Y-%m-%d")
@@ -1087,16 +1258,14 @@ def run(cfg: AppConfig) -> None:
 
     assert chosen is not None
 
-    title = build_post_title(date_str, slot_label, chosen.title)
+    title = build_post_title(date_str, slot_label, chosen.title, title_style=cfg.content.title_style)
     slug = f"korean-recipe-{date_str}-{slot}"
 
-    # ★ 핵심: 레시피 이미지가 없으면 기본 이미지로 대체
+    # 레시피 이미지 없으면 기본 이미지로
     thumb_url = choose_thumb_url(cfg, chosen)
-
     if not chosen.image_url and not cfg.img.default_thumb_url:
-        print("[WARN] recipe image empty AND DEFAULT_THUMB_URL empty → featured 이미지 없이 발행될 수 있어요.")
+        print("[WARN] recipe image empty AND DEFAULT_THUMB_URL empty  featured 이미지 없이 발행될 수 있어요")
 
-    # WP 업로드 성공 시 media_url을 쓰고, 실패하면 thumb_url(직접URL)로라도 본문 삽입
     media_id = 0
     media_url = ""
 
@@ -1120,7 +1289,7 @@ def run(cfg: AppConfig) -> None:
         body_html = upgraded
 
     if cfg.run.dry_run:
-        print("[DRY_RUN] 발행 생략. 미리보기 HTML 일부 ↓")
+        print("[DRY_RUN] 발행 생략  미리보기 HTML 일부")
         print(body_html[:2000])
         print("... (truncated)")
         return
@@ -1141,9 +1310,8 @@ def run(cfg: AppConfig) -> None:
                     pass
             print("OK(created):", wp_post_id, wp_link)
     except Exception as e:
-        # 업데이트 실패(삭제됨/권한/ID불일치 등) 시 새로 생성 시도
         if cfg.run.debug:
-            print("[WARN] post create/update failed, fallback to create:", repr(e))
+            print("[WARN] post create update failed, fallback to create:", repr(e))
         wp_post_id, wp_link = wp_create_post(cfg.wp, title, slug, body_html, excerpt=excerpt)
         if featured_id:
             try:
@@ -1168,7 +1336,7 @@ def run(cfg: AppConfig) -> None:
     )
 
 
-def main():
+def main() -> None:
     cfg = load_cfg()
     validate_cfg(cfg)
     print_safe_cfg(cfg)
@@ -1180,5 +1348,6 @@ if __name__ == "__main__":
         main()
     except Exception:
         import traceback
+
         traceback.print_exc()
         sys.exit(1)
