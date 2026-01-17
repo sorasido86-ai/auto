@@ -1,18 +1,25 @@
 name: Daily Recipe (Naverstyle)
 
 on:
+  workflow_dispatch:
+    inputs:
+      run_slot:
+        description: "day / am / pm"
+        required: false
+        default: "day"
+      dry_run:
+        description: "1이면 발행 안 하고 미리보기"
+        required: false
+        default: "0"
   schedule:
     # 매일 09:10 KST = 00:10 UTC
     - cron: "10 0 * * *"
-  workflow_dispatch:
-
-concurrency:
-  group: daily-recipe-naverstyle
-  cancel-in-progress: true
 
 jobs:
-  run:
+  post:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -22,45 +29,43 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install deps
+      - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
-          pip install openai requests
+          pip install -r requirements.txt
 
       - name: Run bot
         env:
           WP_BASE_URL: ${{ secrets.WP_BASE_URL }}
           WP_USER: ${{ secrets.WP_USER }}
           WP_APP_PASS: ${{ secrets.WP_APP_PASS }}
-          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-
           WP_STATUS: ${{ secrets.WP_STATUS }}
+
           WP_CATEGORY_IDS: ${{ secrets.WP_CATEGORY_IDS }}
           WP_TAG_IDS: ${{ secrets.WP_TAG_IDS }}
 
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          OPENAI_MODEL: ${{ secrets.OPENAI_MODEL }}
+
           SQLITE_PATH: "data/daily_recipe.sqlite3"
 
-          OPENAI_MODEL: ${{ secrets.OPENAI_MODEL }}
-          OPENAI_MAX_RETRIES: "3"
-
-          DRY_RUN: "0"
+          RUN_SLOT: ${{ github.event.inputs.run_slot || 'day' }}
+          DRY_RUN: ${{ github.event.inputs.dry_run || '0' }}
           DEBUG: "0"
-          AVOID_REPEAT_DAYS: "90"
-          MAX_TRIES: "30"
 
+          # ✅ 항상 새 글 발행
+          ALWAYS_NEW: "1"
+
+          # 네이버 스타일
           NAVER_RANDOM_LEVEL: "2"
           NAVER_EXPERIENCE_LEVEL: "2"
-          NAVER_MAIN_KEYWORD: ${{ secrets.NAVER_MAIN_KEYWORD }}
-          NAVER_KEYWORDS: ${{ secrets.NAVER_KEYWORDS }}
-
-          NAVER_SECTION_MIN_CHARS: "1500"
-          NAVER_INTRO_MIN: "200"
-          NAVER_INTRO_MAX: "300"
+          NAVER_MAIN_KEYWORD: ""
+          NAVER_RECIPE_KEYWORDS: ${{ secrets.NAVER_RECIPE_KEYWORDS }}
 
           PREFER_AREAS: ${{ secrets.PREFER_AREAS }}
           BLOCK_CATEGORIES: ${{ secrets.BLOCK_CATEGORIES }}
 
+          # 고퀄 썸네일
           PEXELS_API_KEY: ${{ secrets.PEXELS_API_KEY }}
 
         run: |
