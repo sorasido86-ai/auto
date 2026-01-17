@@ -33,8 +33,10 @@ jobs:
 
           # Optional
           MFDS_API_KEY: ${{ secrets.MFDS_API_KEY }}
-          MFDS_TIMEOUT: "35"
-          MFDS_RETRIES: "2"
+          # MFDS 안정화 (느릴 때 오래 끌지 않게)
+          MFDS_TIMEOUT: "8"
+          MFDS_RETRIES: "0"
+          MFDS_BUDGET_SECONDS: "30"
           DEFAULT_THUMB_URL: ${{ secrets.DEFAULT_THUMB_URL }}
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
 
