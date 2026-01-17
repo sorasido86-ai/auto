@@ -63,6 +63,9 @@ jobs:
           ADD_FAQ: "1"
           ADD_INTERNAL_LINKS: "1"
 
+          # Title template style
+          TITLE_STYLE: "random"    # benefit|threat|curiosity|compare|random
+
           # OpenAI (optional)
           USE_OPENAI: "0"
           OPENAI_MODEL: "gpt-4.1-mini"
