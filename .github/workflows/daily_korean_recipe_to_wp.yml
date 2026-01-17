@@ -33,6 +33,8 @@ jobs:
 
           # Optional
           MFDS_API_KEY: ${{ secrets.MFDS_API_KEY }}
+          MFDS_TIMEOUT: "35"
+          MFDS_RETRIES: "2"
           DEFAULT_THUMB_URL: ${{ secrets.DEFAULT_THUMB_URL }}
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
 
