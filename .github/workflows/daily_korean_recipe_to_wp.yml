@@ -1,77 +1,66 @@
 name: Daily Korean Recipe to WordPress
 
 on:
-  schedule:
-    - cron: "15 0 * * *" # UTC 00:15 = KST 09:15
   workflow_dispatch:
-
-permissions:
-  contents: write
+  schedule:
+    # 매일 1회 (KST 09:10) -> UTC 00:10
+    - cron: '10 0 * * *'
 
 jobs:
   post:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Setup Python
+      - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: '3.11'
 
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           pip install requests openai
 
-      - name: Run bot
+      - name: Run
         env:
+          # WordPress
           WP_BASE_URL: ${{ secrets.WP_BASE_URL }}
           WP_USER: ${{ secrets.WP_USER }}
           WP_APP_PASS: ${{ secrets.WP_APP_PASS }}
+          WP_STATUS: publish
+          WP_CATEGORY_IDS: '7'
 
-          # Optional
+          # MFDS (식품안전나라)
           MFDS_API_KEY: ${{ secrets.MFDS_API_KEY }}
-          DEFAULT_THUMB_URL: ${{ secrets.DEFAULT_THUMB_URL }}
+          MFDS_TIMEOUT_SEC: '10'
+          MFDS_BUDGET_SEC: '18'
 
-          # Image - OpenAI fallback
-          USE_OPENAI_IMAGE: "1"
+          # 포스팅 옵션
+          RUN_SLOT: day
+          FORCE_NEW: '0'
+          DRY_RUN: '0'
+          DEBUG: '0'
+          MIN_TOTAL_CHARS: '1200'
+
+          # 이미지
+          DEFAULT_THUMB_URL: ''
+          UPLOAD_THUMB: '1'
+          SET_FEATURED: '1'
+          EMBED_IMAGE_IN_BODY: '1'
+
+          # OpenAI 이미지 생성 (이미지 없을 때만 자동 생성)
+          USE_OPENAI_IMAGE: '1'
+          AUTO_IMAGE: '1'
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-          OPENAI_IMAGE_MODEL: "gpt-image-1-mini"
-          OPENAI_IMAGE_SIZE: "1024x1024"
-          OPENAI_IMAGE_QUALITY: "auto"
-          OPENAI_TIMEOUT_SEC: "60"
+          OPENAI_IMAGE_MODEL: 'gpt-image-1.5'
+          OPENAI_IMAGE_SIZE: '1024x1024'
 
-          # If you prefer Unsplash when no MFDS image
-          AUTO_IMAGE: "0"
-
-          # WP publish settings
-          WP_STATUS: "publish"
-          WP_CATEGORY_IDS: "7"
-          SQLITE_PATH: "data/daily_korean_recipe.sqlite3"
-
-          # Run settings
-          RUN_SLOT: "day"
-          FORCE_NEW: "0"
-          DRY_RUN: "0"
-          DEBUG: "0"
-          AVOID_REPEAT_DAYS: "90"
-
-          # Text rules
-          MIN_TOTAL_CHARS: "1200"
-          INTRO_MIN: "200"
-          INTRO_MAX: "300"
-          HASHTAG_COUNT: "14"
-          DATE_PREFIX: "1"  # 0이면 제목에서 날짜 제거
+          # 태그 자동 생성
+          AUTO_TAGS: '1'
+          TAG_MAX: '10'
 
         run: |
           python daily_korean_recipe_to_wp.py
-
-      - name: Commit sqlite history
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add data/daily_korean_recipe.sqlite3 || true
-          git commit -m "Update recipe history DB" || echo "No changes"
-          git push || echo "No push"
