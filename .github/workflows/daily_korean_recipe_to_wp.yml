@@ -11,7 +11,6 @@ permissions:
 jobs:
   post:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -24,7 +23,7 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install requests
+          pip install requests openai
 
       - name: Run bot
         env:
@@ -32,47 +31,39 @@ jobs:
           WP_USER: ${{ secrets.WP_USER }}
           WP_APP_PASS: ${{ secrets.WP_APP_PASS }}
 
-          # Recipe source (optional)
+          # Optional
           MFDS_API_KEY: ${{ secrets.MFDS_API_KEY }}
-
-          # Image (strongly recommended)
           DEFAULT_THUMB_URL: ${{ secrets.DEFAULT_THUMB_URL }}
 
-          # WordPress settings
+          # Image - OpenAI fallback
+          USE_OPENAI_IMAGE: "1"
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          OPENAI_IMAGE_MODEL: "gpt-image-1-mini"
+          OPENAI_IMAGE_SIZE: "1024x1024"
+          OPENAI_IMAGE_QUALITY: "auto"
+          OPENAI_TIMEOUT_SEC: "60"
+
+          # If you prefer Unsplash when no MFDS image
+          AUTO_IMAGE: "0"
+
+          # WP publish settings
           WP_STATUS: "publish"
           WP_CATEGORY_IDS: "7"
-          WP_TAG_IDS: ""   # If empty, TAG_NAMES will be used to auto-create/find tags
-
-          # History
           SQLITE_PATH: "data/daily_korean_recipe.sqlite3"
 
-          # Behavior
+          # Run settings
           RUN_SLOT: "day"
           FORCE_NEW: "0"
           DRY_RUN: "0"
           DEBUG: "0"
           AVOID_REPEAT_DAYS: "90"
-          MAX_TRIES: "10"
 
-          # MFDS safety timeouts
-          MFDS_TIMEOUT: "10"         # seconds per request
-          MFDS_BUDGET_SEC: "20"      # total seconds budget
-
-          # Image behavior
-          UPLOAD_THUMB: "1"
-          SET_FEATURED: "1"
-          EMBED_IMAGE_IN_BODY: "1"
-          REUSE_MEDIA_BY_SEARCH: "1"
-          AUTO_IMAGE: "1"            # if DEFAULT_THUMB_URL empty and MFDS has no image
-
-          # Content
-          TITLE_STYLE: "random"      # benefit|threat|curiosity|debate|random
-          BODY_MIN: "1200"
+          # Text rules
+          MIN_TOTAL_CHARS: "1200"
           INTRO_MIN: "200"
-          INTRO_MAX: "320"
-
-          # Tags (본문 해시태그 + WP 태그 자동)
-          TAG_NAMES: "한식,집밥,오늘뭐먹지,간단요리,초간단레시피,자취요리,밥도둑,국물요리,반찬,요리기록,저녁메뉴,레시피"
+          INTRO_MAX: "300"
+          HASHTAG_COUNT: "14"
+          DATE_PREFIX: "1"  # 0이면 제목에서 날짜 제거
 
         run: |
           python daily_korean_recipe_to_wp.py
