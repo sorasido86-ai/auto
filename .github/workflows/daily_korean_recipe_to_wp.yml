@@ -35,37 +35,41 @@ jobs:
           MFDS_API_KEY: ${{ secrets.MFDS_API_KEY }}
           DEFAULT_THUMB_URL: ${{ secrets.DEFAULT_THUMB_URL }}
 
-          # Publish
+          # Behavior
           WP_STATUS: "publish"
           WP_CATEGORY_IDS: "7"
-          WP_TAG_IDS: ""
+          WP_TAG_IDS: ""                 # 사용 중이면 유지
+          AUTO_WP_TAGS: "1"              # ✅ 태그 여러개 자동 생성/연결
+          WP_TAG_NAMES: "한식레시피,집밥,간단요리,오늘뭐먹지,자취요리,요리팁,국물요리,반찬"
           SQLITE_PATH: "data/daily_korean_recipe.sqlite3"
 
-          # Run mode
           RUN_SLOT: "day"
           FORCE_NEW: "0"
           DRY_RUN: "0"
           DEBUG: "0"
           AVOID_REPEAT_DAYS: "90"
-          MAX_TRIES: "12"
+          MAX_TRIES: "25"
 
-          # MFDS timeout safety (prevents 6+ minutes hanging)
-          MFDS_TIMEOUT: "10"
+          # MFDS stability
+          MFDS_TIMEOUT: "12"
           MFDS_BUDGET_SECONDS: "20"
-          STRICT_KOREAN: "1"
-          MFDS_ONLY: "0"  # 1이면 MFDS 실패 시 발행하지 않고 종료
+          MFDS_MAX_FAILS: "2"
 
           # Image
           UPLOAD_THUMB: "1"
           SET_FEATURED: "1"
           EMBED_IMAGE_IN_BODY: "1"
           REUSE_MEDIA_BY_SEARCH: "1"
+          AUTO_IMAGE: "1"
+          EXTRA_IMAGE_COUNT: "0"
 
-          # Content rules (your request)
+          # Content length & style
+          TITLE_STYLE: "random"
+          HASHTAG_COUNT: "18"
           INTRO_MIN_CHARS: "200"
           INTRO_MAX_CHARS: "300"
           SECTION_MIN_CHARS: "1200"
-          HASHTAG_COUNT: "0"
+          ADD_INTERNAL_LINKS: "0"
 
         run: |
           python daily_korean_recipe_to_wp.py
