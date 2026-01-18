@@ -24,6 +24,7 @@ import random
 import re
 import sqlite3
 import sys
+import signal
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -33,6 +34,46 @@ from urllib.parse import quote
 import requests
 
 KST = timezone(timedelta(hours=9))
+
+# -----------------------------
+# hard-timeout (DNS/SSL hang 방지)
+# -----------------------------
+
+class _HardTimeout(Exception):
+    pass
+
+
+def _raise_hard_timeout(signum, frame):
+    raise _HardTimeout("hard-timeout")
+
+
+def _call_with_hard_timeout(seconds: int, fn, *args, **kwargs):
+    """POSIX 환경에서 signal alarm으로 전체 호출 시간을 강제로 제한
+    requests timeout으로 잡히지 않는 DNS/SSL hang도 끊기도록
+    """
+    if seconds <= 0:
+        return fn(*args, **kwargs)
+    if os.name != 'posix':
+        return fn(*args, **kwargs)
+    old = signal.signal(signal.SIGALRM, _raise_hard_timeout)
+    try:
+        signal.setitimer(signal.ITIMER_REAL, seconds)
+        return fn(*args, **kwargs)
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, old)
+
+
+def _http_hard_timeout() -> int:
+    return _env_int('HTTP_HARD_TIMEOUT', 25)
+
+
+def http_get(url: str, **kwargs):
+    return _call_with_hard_timeout(_http_hard_timeout(), requests.get, url, **kwargs)
+
+
+def http_post(url: str, **kwargs):
+    return _call_with_hard_timeout(_http_hard_timeout(), requests.post, url, **kwargs)
 
 # -----------------------------
 # 내장 한식 레시피(폴백)
@@ -407,7 +448,7 @@ def wp_create_post(cfg: WordPressConfig, title: str, slug: str, html_body: str, 
     tag_ids = tags if tags is not None else cfg.tag_ids
     if tag_ids:
         payload["tags"] = tag_ids
-    r = requests.post(url, headers=headers, json=payload, timeout=35)
+    r = http_post(url, headers=headers, json=payload, timeout=35)
     if r.status_code not in (200, 201):
         raise RuntimeError(f"WP create failed: {r.status_code} body={r.text[:500]}")
     data = r.json()
@@ -426,7 +467,7 @@ def wp_update_post(cfg: WordPressConfig, post_id: int, title: str, html_body: st
     tag_ids = tags if tags is not None else cfg.tag_ids
     if tag_ids:
         payload["tags"] = tag_ids
-    r = requests.post(url, headers=headers, json=payload, timeout=35)
+    r = http_post(url, headers=headers, json=payload, timeout=35)
     if r.status_code not in (200, 201):
         raise RuntimeError(f"WP update failed: {r.status_code} body={r.text[:500]}")
     data = r.json()
@@ -436,7 +477,7 @@ def wp_find_media_by_search(cfg: WordPressConfig, search: str) -> Optional[Tuple
     url = cfg.base_url.rstrip("/") + "/wp-json/wp/v2/media"
     headers = wp_auth_header(cfg.user, cfg.app_pass)
     params = {"search": search, "per_page": 10}
-    r = requests.get(url, headers=headers, params=params, timeout=25)
+    r = http_get(url, headers=headers, params=params, timeout=25)
     if r.status_code != 200:
         return None
     try:
@@ -453,7 +494,7 @@ def wp_find_media_by_search(cfg: WordPressConfig, search: str) -> Optional[Tuple
     return None
 
 def wp_upload_media_from_url(cfg: WordPressConfig, image_url: str, filename: str) -> Tuple[int, str]:
-    r = requests.get(image_url, timeout=35)
+    r = http_get(image_url, timeout=35)
     if r.status_code != 200 or not r.content:
         raise RuntimeError(f"Image download failed: {r.status_code}")
     content = r.content
@@ -469,7 +510,7 @@ def wp_upload_media_from_url(cfg: WordPressConfig, image_url: str, filename: str
         "Content-Disposition": f'attachment; filename="{filename}"',
         "Content-Type": ctype,
     }
-    rr = requests.post(url, headers=headers, data=content, timeout=60)
+    rr = http_post(url, headers=headers, data=content, timeout=60)
     if rr.status_code not in (200, 201):
         raise RuntimeError(f"WP media upload failed: {rr.status_code} body={rr.text[:500]}")
     data = rr.json()
@@ -480,7 +521,7 @@ def wp_find_tag_id(cfg: WordPressConfig, name: str) -> int:
     url = cfg.base_url.rstrip("/") + "/wp-json/wp/v2/tags"
     headers = wp_auth_header(cfg.user, cfg.app_pass)
     params = {"search": name, "per_page": 100}
-    r = requests.get(url, headers=headers, params=params, timeout=25)
+    r = http_get(url, headers=headers, params=params, timeout=25)
     if r.status_code != 200:
         return 0
     try:
@@ -502,7 +543,7 @@ def wp_create_tag(cfg: WordPressConfig, name: str) -> int:
     url = cfg.base_url.rstrip("/") + "/wp-json/wp/v2/tags"
     headers = {**wp_auth_header(cfg.user, cfg.app_pass), "Content-Type": "application/json"}
     payload = {"name": name}
-    r = requests.post(url, headers=headers, json=payload, timeout=25)
+    r = http_post(url, headers=headers, json=payload, timeout=25)
     if r.status_code not in (200, 201):
         return 0
     try:
@@ -555,7 +596,7 @@ def mfds_fetch_by_param(api_key: str, param: str, value: str, start: int, end: i
     base = f"https://openapi.foodsafetykorea.go.kr/api/{api_key}/COOKRCP01/json/{start}/{end}"
     url = f"{base}/{param}={quote(value)}"
     try:
-        r = requests.get(url, timeout=timeout)
+        r = http_get(url, timeout=timeout)
         if r.status_code != 200:
             return []
         data = r.json()
