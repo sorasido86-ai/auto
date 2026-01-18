@@ -11,7 +11,6 @@ permissions:
 jobs:
   post:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -24,7 +23,7 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install requests
+          pip install requests openai
 
       - name: Run bot
         env:
@@ -32,50 +31,51 @@ jobs:
           WP_USER: ${{ secrets.WP_USER }}
           WP_APP_PASS: ${{ secrets.WP_APP_PASS }}
 
-          # Optional data sources
           MFDS_API_KEY: ${{ secrets.MFDS_API_KEY }}
           DEFAULT_THUMB_URL: ${{ secrets.DEFAULT_THUMB_URL }}
-
-          # Optional OpenAI image
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-          USE_OPENAI_IMAGE: "0"         # 1 to enable
-          OPENAI_IMAGE_MODEL: "gpt-image-1"
-          AUTO_IMAGE: "1"              # 1 to allow OpenAI image generation when no image
 
-          # Publish behavior
           WP_STATUS: "publish"
           WP_CATEGORY_IDS: "7"
-          WP_TAG_IDS: ""               # ex) "1,2,3" if you want fixed tag IDs
+          WP_TAG_IDS: ""
+          WP_AUTO_TAGS: "1"
+          WP_AUTO_TAGS_MAX: "10"
+
           SQLITE_PATH: "data/daily_korean_recipe.sqlite3"
 
           RUN_SLOT: "day"
+          ALLOW_DUPLICATE_POSTS: "1"
           FORCE_NEW: "0"
-          ALLOW_DUPLICATE_POSTS: "0"   # 1 = rerun creates NEW posts (unique slug)
           DRY_RUN: "0"
           DEBUG: "0"
+
           AVOID_REPEAT_DAYS: "90"
-          MAX_TRIES: "18"
 
-          # Speed / stability
-          MFDS_TIMEOUT_SEC: "8"
-          MFDS_BUDGET_SEC: "14"
+          MFDS_TIMEOUT_SEC: "10"
+          MFDS_BUDGET_SEC: "18"
 
-          # Image
-          UPLOAD_THUMB: "1"
+          UPLOAD_MEDIA: "1"
           SET_FEATURED: "1"
           EMBED_IMAGE_IN_BODY: "1"
-          REUSE_MEDIA_BY_SEARCH: "1"
-          FORCE_HTTPS_MEDIA: "1"
 
-          # Content
-          MIN_TOTAL_CHARS: "1200"      # user request
-          INTRO_MIN_CHARS: "200"
-          INTRO_MAX_CHARS: "300"
-          HASHTAG_COUNT: "14"
-          TITLE_STYLE: "random"        # benefit|threat|curiosity|compare|random
+          # OpenAI 이미지 생성은 "레시피 이미지 다운로드"가 실패할 때만 쓰도록 0으로 두는 걸 추천
+          USE_OPENAI_IMAGE: "0"
+          OPENAI_IMAGE_MODEL: "gpt-image-1"
+          OPENAI_IMAGE_SIZE: "1024x1024"
+
+          # 스톡 이미지 폴백(깨진 이미지 방지용)
+          AUTO_STOCK_IMAGE: "1"
+          STOCK_W: "1200"
+          STOCK_H: "800"
+
+          MIN_TOTAL_CHARS: "1200"
+          MAX_TOTAL_CHARS: "1800"
+
+          HASHTAG_MIN: "12"
+          HASHTAG_MAX: "20"
 
         run: |
-          python daily_korean_recipe_to_wp.py
+          python daily_korean_recipe_to_wp_fixed.py
 
       - name: Commit sqlite history
         run: |
