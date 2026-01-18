@@ -1,48 +1,50 @@
 # -*- coding: utf-8 -*-
-"""daily_korean_recipe_to_wp.py (Homefeed v3 + OpenAI Image fallback)
+"""daily_korean_recipe_to_wp.py
 
-요구사항(핵심)
-- 홈피드형: 도입부 200~300자 + 굵은 소제목 3개 + 레시피 목록(재료/순서) + 해시태그
-- 친구에게 수다 떠는 존댓말 톤
-- 마침표( . ) 없이 줄바꿈/여백으로 호흡
-- 레시피 목록 앞에 불릿/체크/점 같은 특수문자 없이 출력
-- '자동 생성' '기준시각/슬롯' '출처' '지난 레시피 링크' 같은 문구 기본 미노출
-- 전체 글 최소 글자수: MIN_TOTAL_CHARS(기본 1200)
+한식 레시피 자동 포스팅 (WordPress)
 
-이미지 우선순위
-1) MFDS(식품안전나라) 이미지
-2) DEFAULT_THUMB_URL
-3) USE_OPENAI_IMAGE=1 이면 OpenAI 이미지 생성해서 WP에 업로드
-4) AUTO_IMAGE=1 이면 Unsplash Source 자동 이미지
+문제 해결 포인트
+- MFDS(식품안전나라) API가 느리거나 타임아웃이어도 1시간씩 안 붙고 빠르게 폴백
+- 이미지가 없는 레시피도 사진이 반드시 1장 나오도록 처리
+  1) MFDS 메인/스텝 이미지 다운로드 후 WP Media 업로드
+  2) DEFAULT_THUMB_URL 다운로드 후 WP Media 업로드
+  3) (선택) OpenAI 이미지 생성 -> WP Media 업로드
+- 본문은 홈피드형 + 굵은 소제목 3개 + 레시피(재료/순서) 목록 포함
+- 마침표 없이 줄바꿈으로 호흡
+- 자동생성 고지 / 슬롯 문구 / 지난 레시피 링크 기본 미노출
 
 필수 환경변수
 - WP_BASE_URL
 - WP_USER
 - WP_APP_PASS
 
-권장 환경변수
-- WP_STATUS=publish
-- WP_CATEGORY_IDS=7
-- SQLITE_PATH=data/daily_korean_recipe.sqlite3
-
 선택 환경변수
+- WP_STATUS (기본 publish)
+- WP_CATEGORY_IDS (예: 7 또는 7,19)
+- SQLITE_PATH (기본 data/daily_korean_recipe.sqlite3)
+- RUN_SLOT (기본 day)
+- FORCE_NEW (1이면 같은 슬롯이어도 새 글)
+- MIN_TOTAL_CHARS (기본 1200)
+
+MFDS
 - MFDS_API_KEY
-- RUN_SLOT=day|am|pm
-- FORCE_NEW=0|1
-- DRY_RUN=0|1
-- DEBUG=0|1
+- MFDS_TIMEOUT_SEC (기본 10)
+- MFDS_BUDGET_SEC (기본 18)
+- MFDS_ONLY (1이면 MFDS 실패 시 발행 안 함)
 
-이미지 관련
-- DEFAULT_THUMB_URL=https://...
-- USE_OPENAI_IMAGE=0|1
-- OPENAI_API_KEY=...
-- OPENAI_IMAGE_MODEL=gpt-image-1-mini
-- OPENAI_IMAGE_SIZE=1024x1024
-- OPENAI_IMAGE_QUALITY=auto
-- AUTO_IMAGE=1
+이미지
+- DEFAULT_THUMB_URL
+- UPLOAD_THUMB (기본 1)
+- SET_FEATURED (기본 1)
+- EMBED_IMAGE_IN_BODY (기본 1)
 
-주의
-- MFDS 서버가 느릴 수 있어 타임아웃/예산 시간을 짧게 잡고 실패 시 로컬 레시피로 폴백합니다
+OpenAI 이미지 (선택)
+- USE_OPENAI_IMAGE (1이면 활성)
+- OPENAI_API_KEY
+- OPENAI_IMAGE_MODEL (기본 gpt-image-1.5)
+- OPENAI_IMAGE_SIZE (기본 1024x1024)
+- AUTO_IMAGE (기본 1)  # 이미지가 없을 때 OpenAI로 생성
+
 """
 
 from __future__ import annotations
@@ -57,8 +59,9 @@ import re
 import sqlite3
 import sys
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import quote
 
@@ -67,48 +70,49 @@ import requests
 KST = timezone(timedelta(hours=9))
 
 # -----------------------------
-# 로컬 폴백 레시피
+# Local fallback recipes
 # -----------------------------
 LOCAL_KOREAN_RECIPES: List[Dict[str, Any]] = [
+    {
+        "id": "doenjang-jjigae",
+        "title": "구수한 된장찌개",
+        "ingredients": [
+            ("된장", "1.5큰술"),
+            ("고추장 선택", "1/2큰술"),
+            ("애호박", "1/3개"),
+            ("양파", "1/3개"),
+            ("두부", "1/2모"),
+            ("대파", "1/2대"),
+            ("다진마늘", "1작은술"),
+            ("멸치다시마 육수 또는 물", "700ml"),
+        ],
+        "steps": [
+            "끓는 육수에 된장을 풀고 5분 끓여요",
+            "양파 애호박 두부를 넣고 5에서 6분 더 끓입니다",
+            "대파를 넣고 한 번만 더 끓인 뒤 간을 보고 마무리해요",
+        ],
+        "image_url": "",
+    },
     {
         "id": "kimchi-jjigae",
         "title": "돼지고기 김치찌개",
         "ingredients": [
             ("신김치", "2컵"),
             ("돼지고기", "200g"),
-            ("양파", "반 개"),
-            ("대파", "한 대"),
-            ("두부", "반 모"),
+            ("양파", "1/2개"),
+            ("대파", "1대"),
+            ("두부", "1/2모"),
             ("고춧가루", "1큰술"),
             ("다진마늘", "1큰술"),
             ("국간장", "1큰술"),
-            ("멸치다시마 육수", "700ml"),
+            ("육수 또는 물", "700ml"),
         ],
         "steps": [
-            "냄비에 돼지고기를 먼저 볶아 기름을 살짝 내주세요",
-            "신김치를 넣고 같이 볶아서 신맛을 눌러주세요",
-            "고춧가루 다진마늘 국간장을 넣고 향만 올려주세요",
-            "육수를 붓고 끓인 뒤 약불로 줄여서 더 끓여주세요",
-            "양파를 넣고 두부를 넣고 마지막에 대파로 마무리해요",
-        ],
-        "image_url": "",
-    },
-    {
-        "id": "doenjang-jjigae",
-        "title": "구수한 된장찌개",
-        "ingredients": [
-            ("된장", "1큰술 반"),
-            ("애호박", "1/3개"),
-            ("양파", "1/3개"),
-            ("두부", "반 모"),
-            ("대파", "반 대"),
-            ("다진마늘", "1작은술"),
-            ("멸치다시마 육수", "700ml"),
-        ],
-        "steps": [
-            "끓는 육수에 된장을 풀고 한 번 끓여주세요",
-            "양파 애호박을 넣고 부드럽게 익혀주세요",
-            "두부를 넣고 한 번 더 끓인 뒤 대파로 향만 더해요",
+            "냄비에 돼지고기를 넣고 중불에서 기름이 살짝 돌 때까지 볶아주세요",
+            "신김치를 넣고 2에서 3분 더 볶아 김치의 신맛을 한 번 눌러줍니다",
+            "고춧가루 다진마늘 국간장을 넣고 30초만 볶아 향을 내요",
+            "육수를 붓고 10에서 12분 끓입니다",
+            "양파를 넣고 3분 두부를 넣고 2분 더 끓인 뒤 대파로 마무리해요",
         ],
         "image_url": "",
     },
@@ -117,8 +121,8 @@ LOCAL_KOREAN_RECIPES: List[Dict[str, Any]] = [
         "title": "간장 불고기",
         "ingredients": [
             ("소고기 불고기용", "300g"),
-            ("양파", "반 개"),
-            ("대파", "한 대"),
+            ("양파", "1/2개"),
+            ("대파", "1대"),
             ("간장", "4큰술"),
             ("설탕", "1큰술"),
             ("다진마늘", "1큰술"),
@@ -127,1003 +131,891 @@ LOCAL_KOREAN_RECIPES: List[Dict[str, Any]] = [
             ("물 또는 배즙", "3큰술"),
         ],
         "steps": [
-            "간장 설탕 다진마늘 참기름 물 후추를 섞어 양념을 만들어주세요",
-            "고기에 양념을 넣고 잠깐 재워두면 맛이 안정적으로 들어가요",
-            "팬에 고기를 볶다가 양파 대파를 넣고 숨이 죽을 때까지 볶아주세요",
+            "간장 설탕 다진마늘 참기름 물 후추로 양념장을 섞어요",
+            "고기를 양념에 15분 정도 재워요",
+            "팬을 달군 뒤 고기를 볶다가 양파 대파를 넣고 윤기나게 마무리해요",
         ],
         "image_url": "",
     },
 ]
 
-# -----------------------------
-# Env helpers
-# -----------------------------
-
-def _env(name: str, default: str = "") -> str:
-    return str(os.getenv(name, default) or "").strip()
-
-
-def _env_int(name: str, default: int) -> int:
-    try:
-        return int(_env(name, str(default)))
-    except Exception:
-        return default
-
-
-def _env_bool(name: str, default: bool = False) -> bool:
-    v = _env(name, "1" if default else "0").lower()
-    return v in ("1", "true", "yes", "y", "on")
-
-
-def _parse_int_list(csv: str) -> List[int]:
-    out: List[int] = []
-    for x in (csv or "").split(","):
-        x = x.strip()
-        if not x:
-            continue
-        try:
-            out.append(int(x))
-        except Exception:
-            pass
-    return out
-
-
-def _parse_str_list(csv: str) -> List[str]:
-    out: List[str] = []
-    for x in (csv or "").split(","):
-        x = x.strip()
-        if not x:
-            continue
-        out.append(x)
-    return out
-
+MFDS_KEYWORDS = [
+    "찌개",
+    "볶음",
+    "국",
+    "무침",
+    "덮밥",
+    "김밥",
+    "잡채",
+    "전",
+    "비빔",
+    "나물",
+]
 
 # -----------------------------
 # Config
 # -----------------------------
 
+def _env(name: str, default: str = "") -> str:
+    v = os.getenv(name)
+    return v.strip() if v is not None else default
+
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    v = os.getenv(name)
+    if v is None:
+        return default
+    return v.strip().lower() in ("1", "true", "yes", "y", "on")
+
+
+def _env_int(name: str, default: int) -> int:
+    v = os.getenv(name)
+    if v is None:
+        return default
+    try:
+        return int(v.strip())
+    except Exception:
+        return default
+
+
+def _parse_int_list(s: str) -> List[int]:
+    s = (s or "").strip()
+    if not s:
+        return []
+    out: List[int] = []
+    for p in re.split(r"[\s,]+", s):
+        p = p.strip()
+        if not p:
+            continue
+        try:
+            out.append(int(p))
+        except Exception:
+            pass
+    return out
+
 
 @dataclass
-class WordPressConfig:
+class WPConfig:
     base_url: str
     user: str
     app_pass: str
     status: str = "publish"
-    category_ids: List[int] = field(default_factory=list)
-    tag_ids: List[int] = field(default_factory=list)
+    category_ids: List[int] = None
+    tag_ids: List[int] = None
 
 
 @dataclass
-class RunConfig:
-    run_slot: str = "day"  # day/am/pm
-    force_new: bool = False
-    dry_run: bool = False
-    debug: bool = False
-    avoid_repeat_days: int = 90
-
-
-@dataclass
-class RecipeSourceConfig:
-    mfds_api_key: str = ""
-    strict_korean: bool = True
-    mfds_timeout_sec: int = 10
-    mfds_budget_sec: int = 18
-    mfds_max_fails: int = 2
+class MFDSConfig:
+    api_key: str = ""
+    timeout_sec: int = 10
+    budget_sec: int = 18
+    only: bool = False
 
 
 @dataclass
 class ImageConfig:
+    default_thumb_url: str = ""
     upload_thumb: bool = True
     set_featured: bool = True
-    embed_image_in_body: bool = True
-    reuse_media_by_search: bool = True
-
-    default_thumb_url: str = ""
-    auto_image: bool = True
+    embed_in_body: bool = True
 
     use_openai_image: bool = False
     openai_api_key: str = ""
-    openai_model: str = "gpt-image-1-mini"
-    openai_size: str = "1024x1024"
-    openai_quality: str = "auto"
-    openai_timeout_sec: int = 60
+    openai_image_model: str = "gpt-image-1.5"
+    openai_image_size: str = "1024x1024"
+    auto_image: bool = True
 
 
 @dataclass
-class ContentConfig:
-    intro_min: int = 200
-    intro_max: int = 300
+class RunConfig:
+    sqlite_path: str = "data/daily_korean_recipe.sqlite3"
+    run_slot: str = "day"
+    force_new: bool = False
+    dry_run: bool = False
+    debug: bool = False
     min_total_chars: int = 1200
-    hashtag_count: int = 18
 
 
 @dataclass
-class AppConfig:
-    wp: WordPressConfig
-    run: RunConfig
-    recipe: RecipeSourceConfig
+class Config:
+    wp: WPConfig
+    mfds: MFDSConfig
     img: ImageConfig
-    content: ContentConfig
-    sqlite_path: str
+    run: RunConfig
 
 
-def load_cfg() -> AppConfig:
-    wp_base = _env("WP_BASE_URL").rstrip("/")
-    wp_user = _env("WP_USER")
-    wp_pass = _env("WP_APP_PASS")
-    wp_status = _env("WP_STATUS", "publish") or "publish"
-
-    cat_ids = _parse_int_list(_env("WP_CATEGORY_IDS", "7"))
-    tag_ids = _parse_int_list(_env("WP_TAG_IDS", ""))
-
-    run_slot = (_env("RUN_SLOT", "day") or "day").lower()
-    if run_slot not in ("day", "am", "pm"):
-        run_slot = "day"
-
-    sqlite_path = _env("SQLITE_PATH", "data/daily_korean_recipe.sqlite3")
-
-    use_openai_image = _env_bool("USE_OPENAI_IMAGE", False)
-    openai_key = _env("OPENAI_API_KEY", "")
-
-    return AppConfig(
-        wp=WordPressConfig(
-            base_url=wp_base,
-            user=wp_user,
-            app_pass=wp_pass,
-            status=wp_status,
-            category_ids=cat_ids,
-            tag_ids=tag_ids,
-        ),
-        run=RunConfig(
-            run_slot=run_slot,
-            force_new=_env_bool("FORCE_NEW", False),
-            dry_run=_env_bool("DRY_RUN", False),
-            debug=_env_bool("DEBUG", False),
-            avoid_repeat_days=_env_int("AVOID_REPEAT_DAYS", 90),
-        ),
-        recipe=RecipeSourceConfig(
-            mfds_api_key=_env("MFDS_API_KEY", ""),
-            strict_korean=_env_bool("STRICT_KOREAN", True),
-            mfds_timeout_sec=_env_int("MFDS_TIMEOUT_SEC", 10),
-            mfds_budget_sec=_env_int("MFDS_BUDGET_SEC", 18),
-            mfds_max_fails=_env_int("MFDS_MAX_FAILS", 2),
-        ),
-        img=ImageConfig(
-            upload_thumb=_env_bool("UPLOAD_THUMB", True),
-            set_featured=_env_bool("SET_FEATURED", True),
-            embed_image_in_body=_env_bool("EMBED_IMAGE_IN_BODY", True),
-            reuse_media_by_search=_env_bool("REUSE_MEDIA_BY_SEARCH", True),
-            default_thumb_url=_env("DEFAULT_THUMB_URL", ""),
-            auto_image=_env_bool("AUTO_IMAGE", True),
-            use_openai_image=use_openai_image,
-            openai_api_key=openai_key,
-            openai_model=_env("OPENAI_IMAGE_MODEL", "gpt-image-1-mini"),
-            openai_size=_env("OPENAI_IMAGE_SIZE", "1024x1024"),
-            openai_quality=_env("OPENAI_IMAGE_QUALITY", "auto"),
-            openai_timeout_sec=_env_int("OPENAI_TIMEOUT_SEC", 60),
-        ),
-        content=ContentConfig(
-            intro_min=_env_int("INTRO_MIN", 200),
-            intro_max=_env_int("INTRO_MAX", 300),
-            min_total_chars=_env_int("MIN_TOTAL_CHARS", 1200),
-            hashtag_count=_env_int("HASHTAG_COUNT", 18),
-        ),
-        sqlite_path=sqlite_path,
+def load_config() -> Config:
+    wp = WPConfig(
+        base_url=_env("WP_BASE_URL", "").rstrip("/"),
+        user=_env("WP_USER", ""),
+        app_pass=_env("WP_APP_PASS", ""),
+        status=_env("WP_STATUS", "publish"),
+        category_ids=_parse_int_list(_env("WP_CATEGORY_IDS", "")),
+        tag_ids=_parse_int_list(_env("WP_TAG_IDS", "")),
     )
 
+    mfds = MFDSConfig(
+        api_key=_env("MFDS_API_KEY", ""),
+        timeout_sec=_env_int("MFDS_TIMEOUT_SEC", 10),
+        budget_sec=_env_int("MFDS_BUDGET_SEC", 18),
+        only=_env_bool("MFDS_ONLY", False),
+    )
 
-def print_cfg(cfg: AppConfig) -> None:
-    def ok(v: str) -> str:
-        return "OK" if v else "EMPTY"
+    img = ImageConfig(
+        default_thumb_url=_env("DEFAULT_THUMB_URL", ""),
+        upload_thumb=_env_bool("UPLOAD_THUMB", True),
+        set_featured=_env_bool("SET_FEATURED", True),
+        embed_in_body=_env_bool("EMBED_IMAGE_IN_BODY", True),
+        use_openai_image=_env_bool("USE_OPENAI_IMAGE", False),
+        openai_api_key=_env("OPENAI_API_KEY", ""),
+        openai_image_model=_env("OPENAI_IMAGE_MODEL", "gpt-image-1.5"),
+        openai_image_size=_env("OPENAI_IMAGE_SIZE", "1024x1024"),
+        auto_image=_env_bool("AUTO_IMAGE", True),
+    )
 
-    print("[CFG] WP_BASE_URL:", ok(cfg.wp.base_url))
-    print("[CFG] WP_USER:", ok(cfg.wp.user), f"(len={len(cfg.wp.user)})")
-    print("[CFG] WP_APP_PASS:", ok(cfg.wp.app_pass), f"(len={len(cfg.wp.app_pass)})")
+    run = RunConfig(
+        sqlite_path=_env("SQLITE_PATH", "data/daily_korean_recipe.sqlite3"),
+        run_slot=_env("RUN_SLOT", "day"),
+        force_new=_env_bool("FORCE_NEW", False),
+        dry_run=_env_bool("DRY_RUN", False),
+        debug=_env_bool("DEBUG", False),
+        min_total_chars=_env_int("MIN_TOTAL_CHARS", 1200),
+    )
+
+    return Config(wp=wp, mfds=mfds, img=img, run=run)
+
+
+def _ok(s: str) -> str:
+    return "OK" if s else "EMPTY"
+
+
+def print_cfg(cfg: Config) -> None:
+    print("[CFG] WP_BASE_URL:", _ok(cfg.wp.base_url))
+    print("[CFG] WP_USER:", _ok(cfg.wp.user), f"(len={len(cfg.wp.user)})")
+    print("[CFG] WP_APP_PASS:", _ok(cfg.wp.app_pass), f"(len={len(cfg.wp.app_pass)})")
     print("[CFG] WP_STATUS:", cfg.wp.status)
-    print("[CFG] WP_CATEGORY_IDS:", cfg.wp.category_ids)
-    print("[CFG] WP_TAG_IDS:", cfg.wp.tag_ids)
-    print("[CFG] SQLITE_PATH:", cfg.sqlite_path)
+    print("[CFG] WP_CATEGORY_IDS:", cfg.wp.category_ids or [])
+    print("[CFG] WP_TAG_IDS:", cfg.wp.tag_ids or [])
+    print("[CFG] SQLITE_PATH:", cfg.run.sqlite_path)
     print("[CFG] RUN_SLOT:", cfg.run.run_slot, "| FORCE_NEW:", int(cfg.run.force_new))
     print("[CFG] DRY_RUN:", cfg.run.dry_run, "| DEBUG:", cfg.run.debug)
-    print("[CFG] MFDS_API_KEY:", ok(cfg.recipe.mfds_api_key), "| STRICT_KOREAN:", cfg.recipe.strict_korean)
-    print("[CFG] MFDS_TIMEOUT_SEC:", cfg.recipe.mfds_timeout_sec, "| MFDS_BUDGET_SEC:", cfg.recipe.mfds_budget_sec)
-    print("[CFG] DEFAULT_THUMB_URL:", ok(cfg.img.default_thumb_url))
-    print("[CFG] USE_OPENAI_IMAGE:", cfg.img.use_openai_image, "| OPENAI_API_KEY:", ok(cfg.img.openai_api_key))
-    print("[CFG] AUTO_IMAGE:", cfg.img.auto_image)
-    print("[CFG] MIN_TOTAL_CHARS:", cfg.content.min_total_chars)
+    print("[CFG] MFDS_API_KEY:", _ok(cfg.mfds.api_key), "| MFDS_TIMEOUT_SEC:", cfg.mfds.timeout_sec, "| MFDS_BUDGET_SEC:", cfg.mfds.budget_sec)
+    print("[CFG] DEFAULT_THUMB_URL:", _ok(cfg.img.default_thumb_url))
+    print("[CFG] USE_OPENAI_IMAGE:", cfg.img.use_openai_image, "| AUTO_IMAGE:", cfg.img.auto_image, "| OPENAI_API_KEY:", _ok(cfg.img.openai_api_key))
+    print("[CFG] MIN_TOTAL_CHARS:", cfg.run.min_total_chars)
 
 
 # -----------------------------
-# SQLite history
+# DB
 # -----------------------------
 
 
 def init_db(sqlite_path: str) -> None:
     Path(os.path.dirname(sqlite_path) or ".").mkdir(parents=True, exist_ok=True)
-    con = sqlite3.connect(sqlite_path)
-    cur = con.cursor()
-    cur.execute(
-        """
-        CREATE TABLE IF NOT EXISTS daily_posts (
-            date_slot TEXT PRIMARY KEY,
-            recipe_source TEXT,
-            recipe_id TEXT,
-            recipe_title TEXT,
-            wp_post_id INTEGER,
-            wp_link TEXT,
-            created_at TEXT
+    with sqlite3.connect(sqlite_path) as conn:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS posts (
+                date_slot TEXT PRIMARY KEY,
+                recipe_id TEXT,
+                recipe_title TEXT,
+                slug TEXT,
+                post_id INTEGER,
+                media_id INTEGER,
+                created_at TEXT
+            )
+            """
         )
-        """
-    )
-    con.commit()
-    con.close()
+        conn.commit()
 
 
-def get_today_post(sqlite_path: str, date_slot: str) -> Optional[Dict[str, Any]]:
-    con = sqlite3.connect(sqlite_path)
-    cur = con.cursor()
-    cur.execute(
-        """
-        SELECT date_slot, recipe_source, recipe_id, recipe_title, wp_post_id, wp_link
-        FROM daily_posts
-        WHERE date_slot=?
-        """,
-        (date_slot,),
-    )
+def db_get(conn: sqlite3.Connection, date_slot: str) -> Optional[Dict[str, Any]]:
+    cur = conn.execute("SELECT date_slot, recipe_id, recipe_title, slug, post_id, media_id, created_at FROM posts WHERE date_slot=?", (date_slot,))
     row = cur.fetchone()
-    con.close()
     if not row:
         return None
     return {
         "date_slot": row[0],
-        "recipe_source": row[1] or "",
-        "recipe_id": row[2] or "",
-        "recipe_title": row[3] or "",
-        "wp_post_id": row[4] or 0,
-        "wp_link": row[5] or "",
+        "recipe_id": row[1],
+        "recipe_title": row[2],
+        "slug": row[3],
+        "post_id": row[4],
+        "media_id": row[5],
+        "created_at": row[6],
     }
 
 
-def upsert_today_post(sqlite_path: str, date_slot: str, recipe_source: str, recipe_id: str, recipe_title: str, wp_post_id: int, wp_link: str) -> None:
-    con = sqlite3.connect(sqlite_path)
-    cur = con.cursor()
-    cur.execute(
+def db_recent_recipe_ids(conn: sqlite3.Connection, days: int = 14) -> List[str]:
+    cur = conn.execute(
+        "SELECT recipe_id FROM posts WHERE created_at >= datetime('now', ?) AND recipe_id IS NOT NULL",
+        (f"-{days} day",),
+    )
+    return [r[0] for r in cur.fetchall() if r and r[0]]
+
+
+def db_upsert(conn: sqlite3.Connection, data: Dict[str, Any]) -> None:
+    conn.execute(
         """
-        INSERT INTO daily_posts(date_slot, recipe_source, recipe_id, recipe_title, wp_post_id, wp_link, created_at)
+        INSERT INTO posts(date_slot, recipe_id, recipe_title, slug, post_id, media_id, created_at)
         VALUES(?,?,?,?,?,?,?)
         ON CONFLICT(date_slot) DO UPDATE SET
-          recipe_source=excluded.recipe_source,
-          recipe_id=excluded.recipe_id,
-          recipe_title=excluded.recipe_title,
-          wp_post_id=excluded.wp_post_id,
-          wp_link=excluded.wp_link
+            recipe_id=excluded.recipe_id,
+            recipe_title=excluded.recipe_title,
+            slug=excluded.slug,
+            post_id=excluded.post_id,
+            media_id=excluded.media_id,
+            created_at=excluded.created_at
         """,
-        (date_slot, recipe_source, recipe_id, recipe_title, int(wp_post_id), wp_link, datetime.now(tz=KST).isoformat()),
+        (
+            data.get("date_slot"),
+            data.get("recipe_id"),
+            data.get("recipe_title"),
+            data.get("slug"),
+            data.get("post_id"),
+            data.get("media_id"),
+            data.get("created_at"),
+        ),
     )
-    con.commit()
-    con.close()
-
-
-def get_recent_recipe_ids(sqlite_path: str, avoid_days: int) -> List[Tuple[str, str]]:
-    cutoff = datetime.now(tz=KST) - timedelta(days=max(1, avoid_days))
-    con = sqlite3.connect(sqlite_path)
-    cur = con.cursor()
-    cur.execute(
-        """
-        SELECT recipe_source, recipe_id
-        FROM daily_posts
-        WHERE created_at >= ?
-        ORDER BY created_at DESC
-        LIMIT 500
-        """,
-        (cutoff.isoformat(),),
-    )
-    rows = cur.fetchall()
-    con.close()
-    out: List[Tuple[str, str]] = []
-    for s, rid in rows:
-        if s and rid:
-            out.append((str(s), str(rid)))
-    return out
+    conn.commit()
 
 
 # -----------------------------
-# WordPress REST
+# WP helpers
 # -----------------------------
 
 
-def wp_auth_header(user: str, app_pass: str) -> Dict[str, str]:
-    token = base64.b64encode(f"{user}:{app_pass}".encode("utf-8")).decode("utf-8")
-    return {"Authorization": f"Basic {token}", "User-Agent": "daily-korean-recipe-bot/3.0"}
+def _wp_auth_header(cfg: WPConfig) -> Dict[str, str]:
+    token = base64.b64encode(f"{cfg.user}:{cfg.app_pass}".encode("utf-8")).decode("ascii")
+    return {"Authorization": f"Basic {token}"}
 
 
-def wp_create_post(cfg: WordPressConfig, title: str, slug: str, html_body: str, excerpt: str = "") -> Tuple[int, str]:
-    url = cfg.base_url.rstrip("/") + "/wp-json/wp/v2/posts"
-    headers = {**wp_auth_header(cfg.user, cfg.app_pass), "Content-Type": "application/json"}
-    payload: Dict[str, Any] = {"title": title, "slug": slug, "content": html_body, "status": cfg.status}
-    if excerpt:
-        payload["excerpt"] = excerpt
-    if cfg.category_ids:
-        payload["categories"] = cfg.category_ids
-    if cfg.tag_ids:
-        payload["tags"] = cfg.tag_ids
+def wp_request(cfg: WPConfig, method: str, path: str, *, json_body: Optional[dict] = None, headers: Optional[dict] = None, data: Optional[bytes] = None, timeout: int = 25) -> requests.Response:
+    url = cfg.base_url.rstrip("/") + path
+    h = {}
+    h.update(_wp_auth_header(cfg))
+    if headers:
+        h.update(headers)
+    return requests.request(method, url, headers=h, json=json_body, data=data, timeout=timeout)
 
-    r = requests.post(url, headers=headers, json=payload, timeout=35)
+
+def wp_upload_media_bytes(cfg: WPConfig, image_bytes: bytes, filename: str, mime: str) -> Tuple[Optional[int], Optional[str]]:
+    headers = {
+        "Content-Disposition": f'attachment; filename="{filename}"',
+        "Content-Type": mime,
+    }
+    r = wp_request(cfg, "POST", "/wp-json/wp/v2/media", headers=headers, data=image_bytes, timeout=60)
     if r.status_code not in (200, 201):
-        raise RuntimeError(f"WP create failed: {r.status_code} body={r.text[:500]}")
-    data = r.json()
-    return int(data.get("id") or 0), str(data.get("link") or "")
+        return None, None
+    j = r.json()
+    return j.get("id"), j.get("source_url")
 
 
-def wp_update_post(cfg: WordPressConfig, post_id: int, title: str, html_body: str, featured_media: int = 0, excerpt: str = "") -> Tuple[int, str]:
-    url = cfg.base_url.rstrip("/") + f"/wp-json/wp/v2/posts/{post_id}"
-    headers = {**wp_auth_header(cfg.user, cfg.app_pass), "Content-Type": "application/json"}
-    payload: Dict[str, Any] = {"title": title, "content": html_body, "status": cfg.status}
-    if excerpt:
-        payload["excerpt"] = excerpt
-    if featured_media:
-        payload["featured_media"] = featured_media
-    if cfg.category_ids:
-        payload["categories"] = cfg.category_ids
-    if cfg.tag_ids:
-        payload["tags"] = cfg.tag_ids
-
-    r = requests.post(url, headers=headers, json=payload, timeout=35)
-    if r.status_code not in (200, 201):
-        raise RuntimeError(f"WP update failed: {r.status_code} body={r.text[:500]}")
-    data = r.json()
-    return int(data.get("id") or 0), str(data.get("link") or "")
-
-
-def wp_find_media_by_search(cfg: WordPressConfig, search: str) -> Optional[Tuple[int, str]]:
-    url = cfg.base_url.rstrip("/") + "/wp-json/wp/v2/media"
-    headers = wp_auth_header(cfg.user, cfg.app_pass)
-    params = {"search": search, "per_page": 10}
-    r = requests.get(url, headers=headers, params=params, timeout=25)
-    if r.status_code != 200:
-        return None
+def wp_get_or_create_tag(cfg: WPConfig, name: str) -> Optional[int]:
+    # search
     try:
-        items = r.json()
+        r = wp_request(cfg, "GET", f"/wp-json/wp/v2/tags?search={quote(name)}&per_page=100", timeout=25)
+        if r.status_code == 200:
+            arr = r.json()
+            for t in arr:
+                if (t.get("name") or "").strip() == name:
+                    return t.get("id")
+        # create
+        r2 = wp_request(cfg, "POST", "/wp-json/wp/v2/tags", json_body={"name": name}, timeout=25)
+        if r2.status_code in (200, 201):
+            return r2.json().get("id")
     except Exception:
         return None
-    if not isinstance(items, list) or not items:
-        return None
-    it = items[0]
-    mid = int(it.get("id") or 0)
-    src = str(it.get("source_url") or "")
-    if mid and src:
-        return mid, src
     return None
 
 
-def wp_upload_media_bytes(cfg: WordPressConfig, content: bytes, filename: str, content_type: str) -> Tuple[int, str]:
-    url = cfg.base_url.rstrip("/") + "/wp-json/wp/v2/media"
-    headers = {
-        **wp_auth_header(cfg.user, cfg.app_pass),
-        "Content-Disposition": f'attachment; filename="{filename}"',
-        "Content-Type": content_type,
+def wp_create_or_update_post(
+    cfg: WPConfig,
+    *,
+    title: str,
+    slug: str,
+    content_html: str,
+    status: str,
+    category_ids: List[int],
+    tag_ids: List[int],
+    featured_media_id: Optional[int],
+    existing_post_id: Optional[int] = None,
+) -> Tuple[Optional[int], Optional[str]]:
+    payload: Dict[str, Any] = {
+        "title": title,
+        "content": content_html,
+        "status": status,
+        "slug": slug,
     }
-    rr = requests.post(url, headers=headers, data=content, timeout=90)
-    if rr.status_code not in (200, 201):
-        raise RuntimeError(f"WP media upload failed: {rr.status_code} body={rr.text[:500]}")
-    data = rr.json()
-    return int(data.get("id") or 0), str(data.get("source_url") or "")
+    if category_ids:
+        payload["categories"] = category_ids
+    if tag_ids:
+        payload["tags"] = tag_ids
+    if featured_media_id:
+        payload["featured_media"] = featured_media_id
 
+    if existing_post_id:
+        r = wp_request(cfg, "POST", f"/wp-json/wp/v2/posts/{existing_post_id}", json_body=payload, timeout=60)
+        if r.status_code not in (200, 201):
+            return None, None
+        j = r.json()
+        return j.get("id"), j.get("link")
 
-def wp_upload_media_from_url(cfg: WordPressConfig, image_url: str, filename: str) -> Tuple[int, str]:
-    r = requests.get(image_url, timeout=35)
-    if r.status_code != 200 or not r.content:
-        raise RuntimeError(f"Image download failed: {r.status_code}")
-
-    ctype = (r.headers.get("Content-Type", "") or "").split(";")[0].strip().lower()
-    if not ctype:
-        if filename.lower().endswith(".png"):
-            ctype = "image/png"
-        elif filename.lower().endswith(".jpg") or filename.lower().endswith(".jpeg"):
-            ctype = "image/jpeg"
-        else:
-            ctype = "application/octet-stream"
-
-    return wp_upload_media_bytes(cfg, r.content, filename, ctype)
+    r = wp_request(cfg, "POST", "/wp-json/wp/v2/posts", json_body=payload, timeout=60)
+    if r.status_code not in (200, 201):
+        return None, None
+    j = r.json()
+    return j.get("id"), j.get("link")
 
 
 # -----------------------------
-# Recipe model / MFDS
+# MFDS
 # -----------------------------
 
 
-@dataclass
-class Recipe:
-    source: str  # mfds|local
-    recipe_id: str
-    title: str
-    ingredients: List[str]
-    steps: List[str]
-    image_url: str = ""
-
-
-def _has_hangul(s: str) -> bool:
-    return bool(re.search(r"[가-힣]", s or ""))
-
-
-def _is_korean_recipe_name(name: str, strict: bool = True) -> bool:
-    name = (name or "").strip()
-    if not name:
-        return False
-    if strict and not _has_hangul(name):
-        return False
-    bad = ["pasta", "pizza", "taco", "sushi", "curry", "sandwich", "burger", "salad"]
-    low = name.lower()
-    if any(x in low for x in bad):
-        return False
-    return True
-
-
-def mfds_fetch_by_param(api_key: str, param: str, value: str, start: int = 1, end: int = 60, timeout_sec: int = 10) -> List[Dict[str, Any]]:
-    if not api_key:
-        return []
-    base = f"https://openapi.foodsafetykorea.go.kr/api/{api_key}/COOKRCP01/json/{start}/{end}"
-    url = f"{base}/{param}={quote(str(value))}"
+def mfds_fetch_by_param(api_key: str, param: str, value: str, *, start: int, end: int, timeout: int) -> List[Dict[str, Any]]:
+    value_enc = quote(value)
+    url = f"https://openapi.foodsafetykorea.go.kr/api/{api_key}/COOKRCP01/json/{start}/{end}/{param}/{value_enc}"
     try:
-        r = requests.get(url, timeout=(5, max(5, int(timeout_sec))))
+        r = requests.get(url, timeout=timeout)
+        if r.status_code != 200:
+            return []
+        j = r.json()
+        block = j.get("COOKRCP01") or {}
+        rows = block.get("row") or []
+        if isinstance(rows, list):
+            return rows
+        return []
     except Exception:
         return []
-    if r.status_code != 200:
-        return []
-    try:
-        data = r.json()
-    except Exception:
-        return []
-    co = data.get("COOKRCP01") or {}
-    rows = co.get("row") or []
-    return rows if isinstance(rows, list) else []
 
 
-def mfds_row_to_recipe(row: Dict[str, Any]) -> Recipe:
-    rid = str(row.get("RCP_SEQ") or "").strip() or ""
-    title = str(row.get("RCP_NM") or "").strip()
-    parts = str(row.get("RCP_PARTS_DTLS") or "").strip()
+def _clean_text(s: str) -> str:
+    s = (s or "").strip()
+    s = re.sub(r"\s+", " ", s)
+    return s
 
-    # 재료는 MFDS가 긴 문장으로 오는 경우가 많아서 ',' 기준으로만 가볍게 나눔
+
+def _strip_bullets(s: str) -> str:
+    # 텍스트 앞의 특수 기호 제거
+    s = (s or "").strip()
+    s = re.sub(r"^[\-\*\u2022\u00B7\u25AA\u25AB\u25CF\u25CB\u2713\u2705\u2611\u2733\u2734\u2757\u27A1\u2192\u25B6\u25C0\u2665\u2661\u25AA\u25A0]+\s*", "", s)
+    return s
+
+
+def parse_mfds_row(row: Dict[str, Any]) -> Dict[str, Any]:
+    rid = str(row.get("RCP_SEQ") or "").strip() or hashlib.md5((row.get("RCP_NM") or "").encode("utf-8", "ignore")).hexdigest()[:10]
+    title = _clean_text(str(row.get("RCP_NM") or ""))
+
+    # ingredients
+    parts_raw = str(row.get("RCP_PARTS_DTLS") or "")
+    parts_lines = [p.strip() for p in re.split(r"[\r\n]+", parts_raw) if p and p.strip()]
+    if not parts_lines:
+        parts_lines = [p.strip() for p in re.split(r"[,\u3001]", parts_raw) if p and p.strip()]
     ingredients: List[str] = []
-    for p in re.split(r"\s*,\s*", parts):
-        p = p.strip()
+    for p in parts_lines:
+        p = _strip_bullets(_clean_text(p))
         if p:
             ingredients.append(p)
 
+    # steps + step images
     steps: List[str] = []
+    step_imgs: List[str] = []
     for i in range(1, 21):
-        s = str(row.get(f"MANUAL{str(i).zfill(2)}") or "").strip()
-        if not s:
-            continue
-        s = re.sub(r"\s+", " ", s).strip()
-        s = s.replace(".", "")
-        steps.append(s)
+        key = f"MANUAL{i:02d}"
+        txt = _clean_text(str(row.get(key) or ""))
+        txt = _strip_bullets(txt)
+        if txt:
+            steps.append(txt)
+        ikey = f"MANUAL_IMG{i:02d}"
+        img = _clean_text(str(row.get(ikey) or ""))
+        if img:
+            step_imgs.append(img)
 
-    img_main = str(row.get("ATT_FILE_NO_MAIN") or "").strip()
-    if not img_main:
-        img_main = str(row.get("ATT_FILE_NO_MK") or "").strip()
+    main_img = _clean_text(str(row.get("ATT_FILE_NO_MAIN") or ""))
+    if not main_img and step_imgs:
+        main_img = step_imgs[0]
 
-    return Recipe(
-        source="mfds",
-        recipe_id=rid or hashlib.sha1(title.encode("utf-8")).hexdigest()[:10],
-        title=title,
-        ingredients=ingredients,
-        steps=steps,
-        image_url=img_main if img_main.startswith("http") else "",
-    )
+    # http -> https 시도(혼합콘텐츠 방지)
+    if main_img.startswith("http://"):
+        main_img = "https://" + main_img[len("http://") :]
+
+    step_imgs2: List[str] = []
+    for u in step_imgs[:4]:
+        if u.startswith("http://"):
+            u = "https://" + u[len("http://") :]
+        step_imgs2.append(u)
+
+    return {
+        "id": rid,
+        "title": title,
+        "ingredients": ingredients,
+        "steps": steps,
+        "image_url": main_img,
+        "step_images": step_imgs2,
+    }
 
 
-def pick_recipe_mfds(cfg: AppConfig, recent_pairs: List[Tuple[str, str]]) -> Optional[Recipe]:
-    if not cfg.recipe.mfds_api_key:
+def pick_recipe_mfds(cfg: Config, recent_ids: List[str]) -> Optional[Dict[str, Any]]:
+    if not cfg.mfds.api_key:
         return None
 
-    used = set(recent_pairs)
-    keywords = ["김치", "된장", "고추장", "국", "찌개", "볶음", "전", "조림", "비빔", "나물", "탕", "죽", "김밥", "떡", "불고기", "잡채", "비빔밥"]
+    deadline = time.monotonic() + max(5, cfg.mfds.budget_sec)
+    keywords = MFDS_KEYWORDS[:]
+    random.shuffle(keywords)
 
-    t0 = time.time()
-    fails = 0
-
-    for _ in range(30):
-        if time.time() - t0 > max(8, cfg.recipe.mfds_budget_sec):
+    for kw in keywords:
+        if time.monotonic() > deadline:
             break
-
-        kw = random.choice(keywords)
-        rows = mfds_fetch_by_param(cfg.recipe.mfds_api_key, "RCP_NM", kw, start=1, end=60, timeout_sec=cfg.recipe.mfds_timeout_sec)
+        rows = mfds_fetch_by_param(cfg.mfds.api_key, "RCP_NM", kw, start=1, end=60, timeout=cfg.mfds.timeout_sec)
         if not rows:
-            fails += 1
-            if fails >= max(1, cfg.recipe.mfds_max_fails):
-                break
             continue
-
         random.shuffle(rows)
-        for row in rows:
-            try:
-                rcp = mfds_row_to_recipe(row)
-            except Exception:
+        for row in rows[:20]:
+            rec = parse_mfds_row(row)
+            if not rec.get("title"):
                 continue
-            if cfg.recipe.strict_korean and not _is_korean_recipe_name(rcp.title, strict=True):
+            if rec.get("id") in recent_ids:
                 continue
-            if (rcp.source, rcp.recipe_id) in used:
+            # 최소한의 구조
+            if len(rec.get("steps") or []) < 2:
                 continue
-            if not rcp.title or not rcp.steps:
-                continue
-            return rcp
+            return rec
 
     return None
 
 
-def pick_recipe_local(recent_pairs: List[Tuple[str, str]]) -> Recipe:
-    used = set(recent_pairs)
-    pool = [x for x in LOCAL_KOREAN_RECIPES if ("local", str(x.get("id"))) not in used]
+def pick_recipe_local(recent_ids: List[str]) -> Dict[str, Any]:
+    pool = [r for r in LOCAL_KOREAN_RECIPES if r.get("id") not in recent_ids]
     if not pool:
         pool = LOCAL_KOREAN_RECIPES[:]
-    pick = random.choice(pool)
-    ing = [f"{a} {b}".strip() for a, b in pick.get("ingredients", [])]
-    steps = [str(s).strip().replace(".", "") for s in pick.get("steps", []) if str(s).strip()]
-    return Recipe(
-        source="local",
-        recipe_id=str(pick.get("id")),
-        title=str(pick.get("title")),
-        ingredients=ing,
-        steps=steps,
-        image_url=str(pick.get("image_url") or "").strip(),
-    )
-
-
-def get_recipe_by_id(cfg: AppConfig, source: str, recipe_id: str) -> Optional[Recipe]:
-    if source == "local":
-        for x in LOCAL_KOREAN_RECIPES:
-            if str(x.get("id")) == recipe_id:
-                ing = [f"{a} {b}".strip() for a, b in x.get("ingredients", [])]
-                steps = [str(s).strip().replace(".", "") for s in x.get("steps", []) if str(s).strip()]
-                return Recipe(source="local", recipe_id=recipe_id, title=str(x.get("title") or ""), ingredients=ing, steps=steps, image_url=str(x.get("image_url") or "").strip())
-        return None
-
-    if source == "mfds" and cfg.recipe.mfds_api_key:
-        rows = mfds_fetch_by_param(cfg.recipe.mfds_api_key, "RCP_SEQ", recipe_id, start=1, end=5, timeout_sec=cfg.recipe.mfds_timeout_sec)
-        for row in rows:
-            try:
-                rcp = mfds_row_to_recipe(row)
-            except Exception:
-                continue
-            if rcp.recipe_id == recipe_id:
-                return rcp
-    return None
+    r = random.choice(pool)
+    return {
+        "id": r["id"],
+        "title": r["title"],
+        "ingredients": [f"{a} {b}".strip() for a, b in (r.get("ingredients") or [])],
+        "steps": [s for s in (r.get("steps") or [])],
+        "image_url": r.get("image_url") or "",
+        "step_images": [],
+    }
 
 
 # -----------------------------
-# OpenAI Image generator
+# Image
 # -----------------------------
 
 
-def openai_generate_recipe_image_bytes(cfg: AppConfig, recipe: Recipe) -> Optional[bytes]:
-    if not cfg.img.use_openai_image:
+def _guess_mime_from_url(url: str) -> Tuple[str, str]:
+    u = url.lower()
+    if u.endswith(".png"):
+        return "image/png", "png"
+    if u.endswith(".webp"):
+        return "image/webp", "webp"
+    return "image/jpeg", "jpg"
+
+
+def download_bytes(url: str, *, timeout: int = 20) -> Optional[bytes]:
+    try:
+        r = requests.get(url, timeout=timeout)
+        if r.status_code != 200:
+            return None
+        return r.content
+    except Exception:
         return None
-    if not cfg.img.openai_api_key:
+
+
+def openai_generate_image_bytes(cfg: Config, prompt: str) -> Optional[bytes]:
+    if not (cfg.img.use_openai_image and cfg.img.openai_api_key):
         return None
-
-    # 너무 많은 정보를 넣으면 음식이 흐려져서 핵심만
-    key_ing = []
-    for x in recipe.ingredients[:8]:
-        x = re.sub(r"\(.*?\)", " ", x)
-        x = re.sub(r"[^0-9가-힣a-zA-Z\s]", " ", x)
-        w = [t for t in x.split() if t]
-        if w:
-            key_ing.append(w[0])
-    key_ing = list(dict.fromkeys(key_ing))[:5]
-
-    prompt = (
-        f"A high-quality appetizing food photo of Korean dish '{recipe.title.strip()}', "
-        f"served nicely on a simple Korean table setting, natural light, realistic, "
-        f"ingredients hint: {', '.join(key_ing) if key_ing else 'Korean home-cooking'}, "
-        f"no text, no watermark, no logo, no people"
-    )
-
     try:
         from openai import OpenAI
 
-        client = OpenAI(api_key=cfg.img.openai_api_key, timeout=cfg.img.openai_timeout_sec)
-        res = client.images.generate(
-            model=cfg.img.openai_model,
+        client = OpenAI(api_key=cfg.img.openai_api_key)
+        result = client.images.generate(
+            model=cfg.img.openai_image_model,
             prompt=prompt,
-            size=cfg.img.openai_size,
-            quality=cfg.img.openai_quality,
             n=1,
+            size=cfg.img.openai_image_size,
         )
-        b64 = res.data[0].b64_json
-        if not b64:
-            return None
+        b64 = result.data[0].b64_json
         return base64.b64decode(b64)
     except Exception:
         return None
 
 
-# -----------------------------
-# Image selection / upload
-# -----------------------------
+def make_image_prompt(recipe_title: str) -> str:
+    # 텍스트 렌더링(글자) 지시를 피해서 실패율을 낮춤
+    return (
+        "Korean home cooking food photography, warm natural light, shallow depth of field, "
+        "a bowl of {t}, steam rising, realistic, high detail, clean background, "
+        "no text, no watermark"
+    ).format(t=recipe_title)
 
 
-def choose_thumb_url(cfg: AppConfig, recipe: Recipe) -> str:
-    if (recipe.image_url or "").strip():
-        return recipe.image_url.strip()
-    if (cfg.img.default_thumb_url or "").strip():
-        return cfg.img.default_thumb_url.strip()
-    if cfg.img.auto_image:
-        q = recipe.title.strip()
-        return f"https://source.unsplash.com/1200x800/?{quote(q)},korean,food"
-    return ""
+def ensure_post_image(cfg: Config, recipe: Dict[str, Any], slug: str) -> Tuple[Optional[int], Optional[str]]:
+    # returns (media_id, media_url)
+    if not cfg.img.upload_thumb:
+        return None, None
 
+    # 1) MFDS image
+    candidates: List[str] = []
+    if recipe.get("image_url"):
+        candidates.append(str(recipe["image_url"]))
+    for u in (recipe.get("step_images") or [])[:2]:
+        if u:
+            candidates.append(str(u))
+    if cfg.img.default_thumb_url:
+        candidates.append(cfg.img.default_thumb_url)
 
-def ensure_media_from_url(cfg: AppConfig, image_url: str, stable_name: str) -> Tuple[int, str]:
-    h = hashlib.sha1(image_url.encode("utf-8")).hexdigest()[:12]
-    ext = ".jpg"
-    u = image_url.lower()
-    if u.endswith(".png"):
-        ext = ".png"
-    elif u.endswith(".jpeg"):
-        ext = ".jpg"
-    filename = f"{stable_name}_{h}{ext}"
-
-    if cfg.img.reuse_media_by_search:
-        found = wp_find_media_by_search(cfg.wp, search=f"{stable_name}_{h}")
-        if found:
-            return found
-
-    return wp_upload_media_from_url(cfg.wp, image_url, filename)
-
-
-def ensure_media_from_bytes(cfg: AppConfig, content: bytes, stable_name: str) -> Tuple[int, str]:
-    h = hashlib.sha1(content).hexdigest()[:12]
-    filename = f"{stable_name}_{h}.png"
-
-    if cfg.img.reuse_media_by_search:
-        found = wp_find_media_by_search(cfg.wp, search=f"{stable_name}_{h}")
-        if found:
-            return found
-
-    return wp_upload_media_bytes(cfg.wp, content, filename, "image/png")
-
-
-# -----------------------------
-# Content (homefeed)
-# -----------------------------
-
-
-def _esc(s: str) -> str:
-    return html.escape(s or "", quote=True)
-
-
-def _strip_period(s: str) -> str:
-    return (s or "").replace(".", "").replace("·", " ")
-
-
-def _plain_text_from_html(s: str) -> str:
-    s = re.sub(r"<[^>]+>", " ", s or "")
-    s = re.sub(r"\s+", " ", s).strip()
-    return s
-
-
-def _fit_intro(text: str, min_len: int, max_len: int) -> str:
-    t = _strip_period(re.sub(r"\s+", " ", text or "")).strip()
-    if len(t) > max_len:
-        t = t[:max_len]
-        t = re.sub(r"\s+\S*$", "", t).strip()
-    if len(t) < min_len:
-        # 짧으면 자연스럽게 한 줄 덧붙이기
-        extra = "  괜히 어렵게 생각하지 말고 오늘은 가볍게 한 번만 해보셔요"
-        t = (t + extra).strip()
-        if len(t) > max_len:
-            t = t[:max_len]
-            t = re.sub(r"\s+\S*$", "", t).strip()
-    return t
-
-
-INTRO_TEMPLATES = [
-    "오늘은 {t} 얘기 좀 해볼게요  이상하게 바쁜 날일수록 이런 메뉴가 더 당기더라고요  손이 많이 갈 것 같아 보여도 흐름만 잡으면 금방 끝나요",
-    "{t} 는 한 번만 성공하면 그 다음부터는 마음이 엄청 편해져요  실패가 줄어드는 포인트를 제가 겪은 그대로 풀어볼게요",
-    "요즘 같은 날씨에는 {t} 가 진짜 든든하잖아요  집에서 해먹으면 재료도 조절되고 간도 내 입맛대로 잡히니까 더 좋더라고요",
-]
-
-
-def _pick_key_ingredients(recipe: Recipe, n: int = 4) -> List[str]:
-    out: List[str] = []
-    for x in recipe.ingredients[:12]:
-        x = re.sub(r"\(.*?\)", " ", x)
-        x = re.sub(r"[^0-9가-힣a-zA-Z\s]", " ", x)
-        w = [t for t in x.split() if t]
-        if w:
-            out.append(w[0])
-    # de-dup
-    uniq: List[str] = []
-    seen = set()
-    for x in out:
-        k = x.lower()
-        if k in seen:
+    for url in candidates:
+        url = url.strip()
+        if not url:
             continue
-        seen.add(k)
-        uniq.append(x)
-    return uniq[:n]
+        b = download_bytes(url, timeout=20)
+        if not b:
+            continue
+        mime, ext = _guess_mime_from_url(url)
+        mid, murl = wp_upload_media_bytes(cfg.wp, b, f"{slug}.{ext}", mime)
+        if mid and murl:
+            return mid, murl
+
+    # 2) OpenAI image
+    if cfg.img.use_openai_image and cfg.img.auto_image:
+        prompt = make_image_prompt(str(recipe.get("title") or "Korean food"))
+        b = openai_generate_image_bytes(cfg, prompt)
+        if b:
+            mid, murl = wp_upload_media_bytes(cfg.wp, b, f"{slug}.png", "image/png")
+            if mid and murl:
+                return mid, murl
+
+    return None, None
 
 
-def _summarize_steps(recipe: Recipe) -> Tuple[str, str]:
-    # 첫 2개는 흐름, 마지막 1개는 마무리
-    steps = [re.sub(r"\s+", " ", s).strip() for s in recipe.steps if s.strip()]
-    if not steps:
-        return "재료를 준비하고 불을 너무 세게만 안 쓰면 대부분 편하게 끝나요", "마지막에 간만 살짝 보고 바로 드시면 제일 좋아요"
-    a = steps[0]
-    b = steps[1] if len(steps) > 1 else steps[0]
-    c = steps[-1]
-    return _strip_period(a), _strip_period(c if c else b)
+# -----------------------------
+# Content
+# -----------------------------
 
 
-def _make_paragraph(lines: List[str]) -> str:
-    lines = [re.sub(r"\s+", " ", _strip_period(x)).strip() for x in lines if str(x).strip()]
-    if not lines:
-        return ""
-    # 홈피드 호흡
-    return "<p>" + "<br/><br/>".join(_esc(x) for x in lines) + "</p>"
+def _now_kst() -> datetime:
+    return datetime.now(tz=KST)
 
 
-def build_hashtags(cfg: AppConfig, recipe: Recipe) -> str:
-    base = []
-    title = re.sub(r"[^0-9가-힣a-zA-Z\s]", " ", recipe.title)
-    for w in title.split():
-        w = re.sub(r"\s+", "", w)
-        if w:
-            base.append(w)
+def build_slug(date_slot: str) -> str:
+    # 예: korean-recipe-2026-01-17-day
+    return f"korean-recipe-{date_slot}"
 
-    for w in _pick_key_ingredients(recipe, n=6):
-        base.append(w)
 
-    base += [
-        "한식레시피",
-        "집밥",
-        "오늘뭐먹지",
-        "간단요리",
-        "자취요리",
-        "요리팁",
-        "집밥메뉴",
-        "한식",
-        "맛있게",
-        "저녁메뉴",
-        "점심메뉴",
+def no_period(s: str) -> str:
+    # 마침표/느낌표/물음표를 제거
+    return s.replace(".", " ").replace("!", " ").replace("?", " ")
+
+
+def html_p(lines: List[str]) -> str:
+    safe = [html.escape(no_period(x)).strip() for x in lines if x and x.strip()]
+    safe = [re.sub(r"\s+", " ", x) for x in safe]
+    return "<p>" + "<br/>".join(safe) + "</p>"
+
+
+def bold_title(s: str) -> str:
+    return f"<p><b>{html.escape(no_period(s))}</b></p>"
+
+
+def make_intro(recipe_title: str) -> str:
+    # 200~300자 정도
+    chunks = [
+        f"요즘 집에서 밥 챙겨 드시기 더 힘드실 때 있지요",
+        f"오늘은 {recipe_title}로 마음을 조금 덜 바쁘게 만들어 보려고 해요",
+        "재료는 익숙한데 맛은 확 좋아지는 포인트가 있어서요",
+        "처음부터 거창하게 하실 필요 없고요",
+        "냄비 하나로 천천히 끓이듯이 하루도 그렇게 풀어가면 괜찮더라고요",
     ]
-
-    uniq: List[str] = []
-    seen = set()
-    for x in base:
-        x = re.sub(r"\s+", "", x)
-        if not x:
-            continue
-        k = x.lower()
-        if k in seen:
-            continue
-        seen.add(k)
-        uniq.append(x)
-
-    n = max(10, min(30, cfg.content.hashtag_count))
-    return " ".join([f"#{x}" for x in uniq[:n]])
+    txt = " ".join(chunks)
+    # 길이 맞추기
+    if len(txt) < 200:
+        txt += "  " + "따뜻한 한 그릇이 생각보다 큰 위로가 되니까요"
+    return txt[:320]
 
 
-def render_recipe_list(recipe: Recipe) -> str:
-    ing_lines = [re.sub(r"\s+", " ", _strip_period(x)).strip() for x in recipe.ingredients if str(x).strip()]
-    step_lines = [re.sub(r"\s+", " ", _strip_period(x)).strip() for x in recipe.steps if str(x).strip()]
-
-    ing_html = "<br/>".join(_esc(x) for x in ing_lines) if ing_lines else _esc("재료는 집에 있는 걸로 유연하게 맞추셔도 돼요")
-
-    # 번호는 특수문자 불릿이 아니라 숫자라서 허용
-    steps_out: List[str] = []
-    for i, s in enumerate(step_lines[:20]):
-        steps_out.append(f"{i+1}  {s}")
-    step_html = "<br/>".join(_esc(x) for x in steps_out) if steps_out else _esc("순서는 어렵지 않게 한 번에 이어가시면 돼요")
-
-    out = ""
-    out += "<p><strong>재료 목록</strong><br/>" + ing_html + "</p>"
-    out += "<p><strong>만드는 순서</strong><br/>" + step_html + "</p>"
-    return out
-
-
-def build_body_html(cfg: AppConfig, recipe: Recipe, display_img_url: str) -> Tuple[str, str]:
-    intro = random.choice(INTRO_TEMPLATES).format(t=recipe.title.strip())
-    intro = _fit_intro(intro, cfg.content.intro_min, cfg.content.intro_max)
-
-    key_ing = _pick_key_ingredients(recipe, n=4)
-    step_first, step_last = _summarize_steps(recipe)
-
-    h1 = f"{recipe.title.strip()}  오늘 이 메뉴를 추천하는 이유"
-    h2 = "실패가 줄어드는 흐름  제가 해보면서 편했던 순서"
-    h3 = "맛이 흔들릴 때 잡는 방법  다음번이 더 쉬워져요"
-
+def make_sections(recipe_title: str) -> List[Tuple[str, List[str]]]:
+    s1_title = "오늘 이 레시피가 딱인 이유"
     s1 = [
-        intro,
-        f"저는 {recipe.title.strip()} 가 딱 그 느낌이에요  힘이 빠질 때도 한 숟갈 뜨면 마음이 좀 풀리는 메뉴요",
-        f"재료도 {', '.join(key_ing) if key_ing else '집에 있는 기본 재료'} 정도만 잡아두면 생각보다 간단해져요",
-        "처음부터 완벽하게 하려는 마음만 내려두면 맛이 훨씬 안정적으로 나오더라고요",
+        f"{recipe_title}는 조리 과정이 복잡하지 않아서 시작이 편해요",
+        "불 앞에서 오래 서 있어야 하는 요리만 떠올리면 부담이 확 올라가는데요",
+        "이건 순서를 크게 세 덩어리로만 생각하시면 됩니다",
+        "재료 손질  간 맞추기  마지막에 향 올리기",
+        "이렇게만 잡아두면 중간에 마음이 덜 흔들려요",
+        "그리고 한 번 끓여두면 다음 끼니에 더 맛있어지는 타입이라서요",
+        "오늘 한 번만 해두면 내일은 덜 애쓰게 되지요",
     ]
 
+    s2_title = "재료 준비와 맛이 살아나는 포인트"
     s2 = [
-        f"흐름은 이렇게만 기억해두셔도 돼요  {step_first}",
-        "불 조절은 센 불로 끝까지 밀지 말고 중불로 천천히 가는 쪽이 실패가 훨씬 적어요",
-        "간은 중간에 한 번만 보고 마지막에 아주 살짝만 조정하면 과해질 일이 거의 없어요",
-        "혹시 오늘 시간이 없으면 재료 손질만 먼저 해두고 조리만 이어가셔도 편해요",
+        "재료는 다 꺼내놓고 시작하시면 속도가 진짜 빨라져요",
+        "대파  양파  두부 같은 것들은 손질만 해두면 절반은 끝난 느낌이 들고요",
+        "양념은 한 번에 넣기보다 두 번에 나눠서 조절해 보세요",
+        "처음에는 기본 간을 잡고",
+        "마지막에는 향이 살아나는 재료를 넣어서 마무리해요",
+        "이때 간을 세게 하는 것보다 향을 올리는 쪽으로 가면 실패가 훨씬 줄어요",
+        "혹시 싱거우면 국간장이나 소금으로 아주 조금씩만",
+        "반대로 짜면 물을 더하기보다 두부나 채소를 조금 더 넣는 방식이 편하더라고요",
     ]
 
+    s3_title = "순서대로 만들기  실패 줄이는 작은 팁"
     s3 = [
-        f"먹어보면 한 번에 확 오는 포인트가 있어요  마지막에 {step_last} 이 부분이 저는 제일 중요하더라고요",
-        "그리고 남았을 때도 너무 걱정하지 마세요  다음날 데울 때는 물 조금만 보태고 천천히 데우면 괜찮아요",
-        "혹시 입맛이 심심하면 대파나 고춧가루 같은 걸 마지막에 아주 조금만 더해보시면 느낌이 살아나요",
-        "다음번에는 오늘 한 번 해본 흐름이 몸에 남아서 훨씬 빠르게 끝나실 거예요",
+        "순서는 아주 단순하게만 적어둘게요",
+        "끓이기 전에 팬이나 냄비를 미리 데워두면 재료에서 물이 덜 생겨요",
+        "중불에서 시작해서 끓기 시작하면 약불로 내려서 시간을 주면 맛이 더 깊어지고요",
+        "중간에 뚜껑을 덮었다가 살짝 열어두면 향이 답답하지 않게 올라와요",
+        "마지막 1분이 중요하니까요",
+        "대파나 참기름 같은 향 재료는 진짜 끝에서 넣으시면 좋아요",
+        "그리고 한 숟갈 떠서 식혀서 맛을 보면 간이 더 정확하게 느껴져요",
+        "뜨거울 때는 짠맛이 덜 느껴져서 과하게 넣기 쉽거든요",
     ]
 
-    # 글자수 최소 보정
-    def text_len(body_html: str) -> int:
-        return len(_plain_text_from_html(body_html))
-
-    def pack() -> str:
-        img_html = f'<p><img src="{_esc(display_img_url)}" alt="{_esc(recipe.title.strip())}"/></p>' if (cfg.img.embed_image_in_body and display_img_url) else ""
-        body = ""
-        body += img_html
-        body += f"<h3><strong>{_esc(_strip_period(h1))}</strong></h3>" + _make_paragraph(s1)
-        body += f"<h3><strong>{_esc(_strip_period(h2))}</strong></h3>" + _make_paragraph(s2)
-        body += render_recipe_list(recipe)
-        body += f"<h3><strong>{_esc(_strip_period(h3))}</strong></h3>" + _make_paragraph(s3)
-        body += "<p><br/><br/>" + _esc(build_hashtags(cfg, recipe)) + "</p>"
-        return body
-
-    body_html = pack()
-
-    fillers = [
-        "혹시 오늘 기분이 축 처져 있으면요  이런 따뜻한 메뉴 하나만 있어도 하루가 좀 덜 날카로워지더라고요",
-        "저는 요리할 때 음악 한 곡 틀어두고 천천히 움직이면 괜히 마음이 정리되는 느낌이 있어요",
-        "처음엔 양을 작게 해보셔도 좋아요  작은 성공 한 번이 다음번을 엄청 편하게 만들어줘요",
-        "간이 애매하면 소금보다 간장이나 된장처럼 익숙한 쪽으로 아주 조금만 움직이는 게 안전해요",
-        "오늘은 완벽이 아니라 편안함이 목표라고 생각하면 훨씬 잘 되실 거예요",
+    return [
+        (s1_title, s1),
+        (s2_title, s2),
+        (s3_title, s3),
     ]
 
-    tries = 0
-    while text_len(body_html) < max(600, cfg.content.min_total_chars) and tries < 6:
-        s3.append(random.choice(fillers))
-        body_html = pack()
-        tries += 1
 
-    excerpt = _strip_period(f"{recipe.title.strip()} 레시피  집에서 편하게 해먹는 흐름으로 정리했어요")
-    excerpt = re.sub(r"\s+", " ", excerpt).strip()[:140]
+def make_recipe_block(recipe: Dict[str, Any]) -> str:
+    title = str(recipe.get("title") or "")
+    ingredients = [
+        _strip_bullets(_clean_text(x)) for x in (recipe.get("ingredients") or []) if x and str(x).strip()
+    ]
+    steps = [_strip_bullets(_clean_text(x)) for x in (recipe.get("steps") or []) if x and str(x).strip()]
 
-    return body_html, excerpt
+    html_parts: List[str] = []
+    html_parts.append(bold_title("레시피 목록"))
+    html_parts.append(html_p([f"오늘 메뉴  {title}"]))
+
+    if ingredients:
+        html_parts.append(bold_title("재료"))
+        # 불릿 대신 줄바꿈
+        ing_lines = [f"{x}" for x in ingredients[:35]]
+        html_parts.append(html_p(ing_lines))
+
+    if steps:
+        html_parts.append(bold_title("만드는 법"))
+        step_lines = [f"{i+1}  {steps[i]}" for i in range(min(len(steps), 20))]
+        html_parts.append(html_p(step_lines))
+
+    return "\n".join(html_parts)
+
+
+def make_hashtags(recipe_title: str, n: int = 12) -> str:
+    base = [
+        "한식",
+        "집밥",
+        "오늘의요리",
+        "레시피",
+        "간단요리",
+        "저녁메뉴",
+        "혼밥",
+        "따뜻한한끼",
+        "주방루틴",
+    ]
+    # 제목에서 추출
+    words = re.findall(r"[가-힣]{2,}", recipe_title)
+    for w in words[:5]:
+        base.append(w)
+    # 중복 제거
+    seen = set()
+    tags: List[str] = []
+    for t in base:
+        t = re.sub(r"\s+", "", t)
+        if not t:
+            continue
+        if t in seen:
+            continue
+        seen.add(t)
+        tags.append(t)
+    random.shuffle(tags)
+    tags = tags[: max(6, min(n, len(tags)))]
+    return " ".join([f"#{t}" for t in tags])
+
+
+def build_post_html(cfg: Config, recipe: Dict[str, Any], *, image_url: Optional[str]) -> str:
+    title = str(recipe.get("title") or "오늘의 집밥")
+
+    parts: List[str] = []
+
+    if cfg.img.embed_in_body and image_url:
+        parts.append(
+            f"<p><img src=\"{html.escape(image_url)}\" alt=\"{html.escape(title)}\" style=\"max-width:100%;height:auto;\" loading=\"lazy\"/></p>"
+        )
+
+    # intro
+    intro = make_intro(title)
+    parts.append(html_p([intro]))
+
+    # sections
+    for sec_title, sec_lines in make_sections(title):
+        parts.append(bold_title(sec_title))
+        parts.append(html_p(sec_lines))
+
+    # recipe list block
+    parts.append(make_recipe_block(recipe))
+
+    # hashtags
+    parts.append(html_p([make_hashtags(title, n=12)]))
+
+    body = "\n".join(parts)
+
+    # 최소 글자수 확보(HTML 태그 제외 대략값)
+    plain_len = len(re.sub(r"<[^>]+>", "", body))
+    if plain_len < cfg.run.min_total_chars:
+        # 부족하면 마지막에 부드러운 수다 문단을 추가
+        extra_lines = [
+            "혹시 오늘 컨디션이 애매하시면요",
+            "레시피를 완벽하게 따라야 한다는 마음을 먼저 내려놓으셔도 괜찮아요",
+            "한 숟갈씩 맛 보면서 조절하는 게 집밥의 매력이라서요",
+            "저는 이런 요리가 사람을 조금 덜 외롭게 만든다고 생각하거든요",
+            "따뜻하게 드시고 물 한 잔까지 챙기시면 오늘은 그걸로 충분해요",
+        ]
+        parts.insert(-2, html_p(extra_lines))
+        body = "\n".join(parts)
+
+    return body
+
+
+def build_title(recipe_title: str) -> str:
+    # 제목도 과한 특수문자 없이
+    hooks = [
+        "오늘 저녁은 이거로 가요",
+        "재료 적고 맛은 확 좋아져요",
+        "한 그릇으로 마음이 풀려요",
+        "실패 확률 낮추는 순서로 정리했어요",
+    ]
+    h = random.choice(hooks)
+    return no_period(f"{recipe_title} {h}").strip()
+
+
+def build_tag_names(recipe_title: str) -> List[str]:
+    tags = []
+    for w in re.findall(r"[가-힣]{2,}", recipe_title):
+        if w not in tags:
+            tags.append(w)
+    tags += ["한식", "집밥", "레시피", "오늘의요리", "저녁메뉴", "간단요리"]
+    # 정리
+    out: List[str] = []
+    for t in tags:
+        t = re.sub(r"\s+", "", t)
+        if not t:
+            continue
+        if t in out:
+            continue
+        out.append(t)
+    return out[:10]
 
 
 # -----------------------------
-# Title
-# -----------------------------
-
-TITLE_BENEFIT = [
-    "{t} 집에서 해먹으니까 마음이 편해지더라고요",
-    "{t} 이렇게 하면 실패가 확 줄어요",
-    "{t} 오늘 저녁 메뉴로 딱이에요",
-]
-TITLE_CURIOSITY = [
-    "{t} 왜 자꾸 생각나는지 오늘 알았어요",
-    "{t} 딱 한 가지 포인트가 있어요",
-    "{t} 한 번만 해보시면 감이 와요",
-]
-TITLE_COMPARE = [
-    "{t} 사먹는 맛이랑 비교해보니 결론이 났어요",
-    "{t} 배달 대신 해먹어보면 차이가 커요",
-    "{t} 집밥으로 돌리면 진짜 이득이에요",
-]
-
-
-def build_post_title(date_str: str, slot: str, recipe_title: str) -> str:
-    style = (_env("TITLE_STYLE", "random") or "random").lower()
-    if style not in ("benefit", "curiosity", "compare", "random"):
-        style = "random"
-
-    if style == "random":
-        style = random.choice(["benefit", "curiosity", "compare"])
-
-    if style == "benefit":
-        fmt = random.choice(TITLE_BENEFIT)
-    elif style == "curiosity":
-        fmt = random.choice(TITLE_CURIOSITY)
-    else:
-        fmt = random.choice(TITLE_COMPARE)
-
-    core = _strip_period(fmt.format(t=recipe_title.strip())).strip()
-
-    # 제목에 기준시각/슬롯 노출 싫으면 DATE_PREFIX=0
-    if _env_bool("DATE_PREFIX", True):
-        return f"{date_str} {core}"
-    return core
-
-
-# -----------------------------
-# Main
+# Run
 # -----------------------------
 
 
-def run(cfg: AppConfig) -> None:
-    now = datetime.now(tz=KST)
-    date_str = now.strftime("%Y-%m-%d")
-    slot = cfg.run.run_slot
-    date_slot = f"{date_str}_{slot}"
+def run(cfg: Config) -> None:
+    if not (cfg.wp.base_url and cfg.wp.user and cfg.wp.app_pass):
+        raise RuntimeError("WP_BASE_URL / WP_USER / WP_APP_PASS 는 필수입니다")
 
-    init_db(cfg.sqlite_path)
-    today_meta = get_today_post(cfg.sqlite_path, date_slot)
-    recent_pairs = get_recent_recipe_ids(cfg.sqlite_path, cfg.run.avoid_repeat_days)
+    init_db(cfg.run.sqlite_path)
 
-    chosen: Optional[Recipe] = None
-    if today_meta and (not cfg.run.force_new) and today_meta.get("recipe_source") and today_meta.get("recipe_id"):
-        chosen = get_recipe_by_id(cfg, today_meta["recipe_source"], today_meta["recipe_id"])
+    now = _now_kst()
+    # 기존 퍼머링크 스타일과 맞추기 위해 구분자는 하이픈 사용
+    # 예: 2026-01-17-day
+    date_slot = f"{now:%Y-%m-%d}-{cfg.run.run_slot}"
+    slug = build_slug(date_slot)
 
-    if not chosen:
-        chosen = pick_recipe_mfds(cfg, recent_pairs) or pick_recipe_local(recent_pairs)
+    print("[RUN] date_slot=", date_slot)
 
-    assert chosen is not None
+    with sqlite3.connect(cfg.run.sqlite_path) as conn:
+        existing = None if cfg.run.force_new else db_get(conn, date_slot)
+        recent_ids = db_recent_recipe_ids(conn, days=14)
 
-    title = build_post_title(date_str, slot, chosen.title)
-    slug = f"korean-recipe-{date_str}-{slot}"
+        recipe = pick_recipe_mfds(cfg, recent_ids)
+        if not recipe:
+            if cfg.mfds.only:
+                print("[MFDS] MFDS_ONLY=1 이라서 MFDS 실패 시 발행을 건너뜁니다")
+                return
+            recipe = pick_recipe_local(recent_ids)
 
-    # 1) 기본 이미지 URL
-    thumb_url = choose_thumb_url(cfg, chosen)
+        recipe_title = str(recipe.get("title") or "오늘의 집밥")
+        title = build_title(recipe_title)
 
-    media_id = 0
-    media_url = ""
+        # tags
+        tag_ids: List[int] = []
+        if cfg.wp.tag_ids:
+            tag_ids.extend(cfg.wp.tag_ids)
+        # auto create tags (best-effort)
+        for name in build_tag_names(recipe_title):
+            tid = wp_get_or_create_tag(cfg.wp, name)
+            if tid and tid not in tag_ids:
+                tag_ids.append(tid)
 
-    # 2) URL 이미지 업로드 시도
-    if cfg.img.upload_thumb and thumb_url:
-        try:
-            media_id, media_url = ensure_media_from_url(cfg, thumb_url, stable_name="korean_recipe")
-        except Exception:
-            media_id, media_url = 0, ""
+        # image
+        media_id = None
+        media_url = None
+        if cfg.img.upload_thumb:
+            media_id, media_url = ensure_post_image(cfg, recipe, slug)
 
-    # 3) 이미지가 여전히 없으면 OpenAI 생성 폴백
-    if cfg.img.upload_thumb and not media_url and cfg.img.use_openai_image:
-        try:
-            img_bytes = openai_generate_recipe_image_bytes(cfg, chosen)
-            if img_bytes:
-                media_id, media_url = ensure_media_from_bytes(cfg, img_bytes, stable_name="korean_recipe_ai")
-        except Exception:
-            media_id, media_url = 0, ""
+        # content
+        content_html = build_post_html(cfg, recipe, image_url=media_url)
 
-    display_img_url = (media_url or thumb_url or "").strip()
+        # wp create/update
+        if cfg.run.dry_run:
+            print("[DRY_RUN] title:", title)
+            print("[DRY_RUN] slug:", slug)
+            print("[DRY_RUN] featured_media_id:", media_id)
+            print("[DRY_RUN] tags:", tag_ids)
+            print("[DRY_RUN] content chars:", len(re.sub(r"<[^>]+>", "", content_html)))
+            return
 
-    body_html, excerpt = build_body_html(cfg, chosen, display_img_url)
+        post_id, link = wp_create_or_update_post(
+            cfg.wp,
+            title=title,
+            slug=slug,
+            content_html=content_html,
+            status=cfg.wp.status,
+            category_ids=cfg.wp.category_ids or [],
+            tag_ids=tag_ids,
+            featured_media_id=media_id if cfg.img.set_featured else None,
+            existing_post_id=existing.get("post_id") if existing else None,
+        )
 
-    if cfg.run.dry_run:
-        print("[DRY_RUN] 발행 생략")
-        print(body_html[:2000])
-        return
+        if not post_id:
+            raise RuntimeError("WordPress 포스팅 실패")
 
-    featured_id = media_id if (cfg.img.set_featured and media_id) else 0
+        print("[OK] post_id=", post_id)
+        if link:
+            print("[OK] link=", link)
 
-    if today_meta and int(today_meta.get("wp_post_id") or 0):
-        post_id = int(today_meta["wp_post_id"])
-        wp_post_id, wp_link = wp_update_post(cfg.wp, post_id, title, body_html, featured_media=featured_id, excerpt=excerpt)
-        print("OK(updated):", wp_post_id, wp_link, "| source=", chosen.source)
-    else:
-        wp_post_id, wp_link = wp_create_post(cfg.wp, title, slug, body_html, excerpt=excerpt)
-        # featured는 생성 후 업데이트하는 테마가 있어서 한 번 더
-        if featured_id:
-            try:
-                wp_post_id, wp_link = wp_update_post(cfg.wp, wp_post_id, title, body_html, featured_media=featured_id, excerpt=excerpt)
-            except Exception:
-                pass
-        print("OK(created):", wp_post_id, wp_link, "| source=", chosen.source)
-
-    upsert_today_post(cfg.sqlite_path, date_slot, chosen.source, chosen.recipe_id, chosen.title, wp_post_id, wp_link)
+        db_upsert(
+            conn,
+            {
+                "date_slot": date_slot,
+                "recipe_id": recipe.get("id"),
+                "recipe_title": recipe_title,
+                "slug": slug,
+                "post_id": post_id,
+                "media_id": media_id,
+                "created_at": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
+            },
+        )
 
 
 def main() -> None:
-    cfg = load_cfg()
+    cfg = load_config()
     print_cfg(cfg)
-
-    if not cfg.wp.base_url or not cfg.wp.user or not cfg.wp.app_pass:
-        raise SystemExit("WP_BASE_URL / WP_USER / WP_APP_PASS 가 필요합니다")
-
-    print(f"[RUN] slot={cfg.run.run_slot} force_new={int(cfg.run.force_new)}")
     run(cfg)
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as e:
+        print("\n[ERROR]", str(e))
+        if _env_bool("DEBUG", False):
+            import traceback
+
+            traceback.print_exc()
+        sys.exit(1)
