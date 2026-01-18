@@ -1,8 +1,8 @@
-name: Daily Korean Recipe to WordPress
+name: Daily Korean Recipe to WordPress (No Image)
 
 on:
   schedule:
-    - cron: "15 0 * * *" # UTC 00:15 = KST 09:15
+    - cron: "15 0 * * *"
   workflow_dispatch:
 
 permissions:
@@ -11,6 +11,7 @@ permissions:
 jobs:
   post:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -23,59 +24,34 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install requests openai
+          pip install requests
 
       - name: Run bot
         env:
           WP_BASE_URL: ${{ secrets.WP_BASE_URL }}
           WP_USER: ${{ secrets.WP_USER }}
           WP_APP_PASS: ${{ secrets.WP_APP_PASS }}
-
           MFDS_API_KEY: ${{ secrets.MFDS_API_KEY }}
-          DEFAULT_THUMB_URL: ${{ secrets.DEFAULT_THUMB_URL }}
-          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
 
           WP_STATUS: "publish"
           WP_CATEGORY_IDS: "7"
           WP_TAG_IDS: ""
-          WP_AUTO_TAGS: "1"
-          WP_AUTO_TAGS_MAX: "10"
-
           SQLITE_PATH: "data/daily_korean_recipe.sqlite3"
 
           RUN_SLOT: "day"
           ALLOW_DUPLICATE_POSTS: "1"
-          FORCE_NEW: "0"
-          DRY_RUN: "0"
-          DEBUG: "0"
-
-          AVOID_REPEAT_DAYS: "90"
-
-          MFDS_TIMEOUT_SEC: "10"
-          MFDS_BUDGET_SEC: "18"
-
-          UPLOAD_MEDIA: "1"
-          SET_FEATURED: "1"
-          EMBED_IMAGE_IN_BODY: "1"
-
-          # OpenAI 이미지 생성은 "레시피 이미지 다운로드"가 실패할 때만 쓰도록 0으로 두는 걸 추천
-          USE_OPENAI_IMAGE: "0"
-          OPENAI_IMAGE_MODEL: "gpt-image-1"
-          OPENAI_IMAGE_SIZE: "1024x1024"
-
-          # 스톡 이미지 폴백(깨진 이미지 방지용)
-          AUTO_STOCK_IMAGE: "1"
-          STOCK_W: "1200"
-          STOCK_H: "800"
-
           MIN_TOTAL_CHARS: "1200"
           MAX_TOTAL_CHARS: "1800"
-
           HASHTAG_MIN: "12"
           HASHTAG_MAX: "20"
-
+          STRICT_KOREAN: "1"
+          MFDS_TIMEOUT_SEC: "8"
+          MFDS_BUDGET_SEC: "15"
+          MAX_TRIES: "18"
+          DRY_RUN: "0"
+          DEBUG: "0"
         run: |
-          python daily_korean_recipe_to_wp_fixed.py
+          python daily_korean_recipe_to_wp_no_image.py
 
       - name: Commit sqlite history
         run: |
