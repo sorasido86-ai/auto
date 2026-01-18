@@ -10,6 +10,7 @@ permissions:
 
 jobs:
   post:
+    timeout-minutes: 12
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -27,6 +28,7 @@ jobs:
 
       - name: Run bot
         env:
+          HTTP_HARD_TIMEOUT: "25"
           WP_BASE_URL: ${{ secrets.WP_BASE_URL }}
           WP_USER: ${{ secrets.WP_USER }}
           WP_APP_PASS: ${{ secrets.WP_APP_PASS }}
@@ -39,7 +41,7 @@ jobs:
           WP_STATUS: "publish"
           WP_CATEGORY_IDS: "7"
           WP_TAG_IDS: ""                 # 사용 중이면 유지
-          AUTO_WP_TAGS: "1"              # ✅ 태그 여러개 자동 생성/연결
+          AUTO_WP_TAGS: "0"              # (선택) 1로 바꾸면 WP 태그 자동 생성/연결
           WP_TAG_NAMES: "한식레시피,집밥,간단요리,오늘뭐먹지,자취요리,요리팁,국물요리,반찬"
           SQLITE_PATH: "data/daily_korean_recipe.sqlite3"
 
