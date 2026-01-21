@@ -50,7 +50,7 @@ jobs:
           MIN_TOTAL_CHARS: "1200"
           MAX_TOTAL_CHARS: "1900"
         run: |
-          python daily_korean_recipe_to_wp_no_image_v3.py
+          python daily_korean_recipe_to_wp_no_image.py
 
       - name: Commit sqlite history
         run: |
