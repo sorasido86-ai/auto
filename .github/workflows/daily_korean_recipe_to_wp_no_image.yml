@@ -2,7 +2,7 @@ name: Daily Korean Recipe to WordPress (No Image)
 
 on:
   schedule:
-    - cron: "15 0 * * *"
+    - cron: "15 0 * * *" # UTC 00:15 = KST 09:15
   workflow_dispatch:
 
 permissions:
@@ -11,7 +11,6 @@ permissions:
 jobs:
   post:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -39,19 +38,19 @@ jobs:
           SQLITE_PATH: "data/daily_korean_recipe.sqlite3"
 
           RUN_SLOT: "day"
+          FORCE_NEW: "0"
           ALLOW_DUPLICATE_POSTS: "1"
-          MIN_TOTAL_CHARS: "1200"
-          MAX_TOTAL_CHARS: "1800"
-          HASHTAG_MIN: "12"
-          HASHTAG_MAX: "20"
-          STRICT_KOREAN: "1"
-          MFDS_TIMEOUT_SEC: "8"
-          MFDS_BUDGET_SEC: "15"
-          MAX_TRIES: "18"
+
           DRY_RUN: "0"
           DEBUG: "0"
+          AVOID_REPEAT_DAYS: "90"
+          MAX_TRIES: "20"
+          MFDS_TIMEOUT_SEC: "10"
+          MFDS_BUDGET_SEC: "18"
+          MIN_TOTAL_CHARS: "1200"
+          MAX_TOTAL_CHARS: "1900"
         run: |
-          python daily_korean_recipe_to_wp_no_image.py
+          python daily_korean_recipe_to_wp_no_image_v3.py
 
       - name: Commit sqlite history
         run: |
