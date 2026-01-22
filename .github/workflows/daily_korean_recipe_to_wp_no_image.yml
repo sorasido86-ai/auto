@@ -1,8 +1,8 @@
-name: Daily Korean Recipe to WordPress (No Image)
+name: Daily Korean Recipe (No Image) to WordPress (v4)
 
 on:
   schedule:
-    - cron: "15 0 * * *"
+    - cron: "15 0 * * *" # UTC 00:15 = KST 09:15
   workflow_dispatch:
 
 permissions:
@@ -11,7 +11,6 @@ permissions:
 jobs:
   post:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -26,30 +25,34 @@ jobs:
           python -m pip install --upgrade pip
           pip install requests
 
-      - name: Run bot
+      - name: Run bot (no image)
         env:
           WP_BASE_URL: ${{ secrets.WP_BASE_URL }}
           WP_USER: ${{ secrets.WP_USER }}
           WP_APP_PASS: ${{ secrets.WP_APP_PASS }}
+
+          # Optional
           MFDS_API_KEY: ${{ secrets.MFDS_API_KEY }}
 
+          # Behavior
           WP_STATUS: "publish"
           WP_CATEGORY_IDS: "7"
           WP_TAG_IDS: ""
           SQLITE_PATH: "data/daily_korean_recipe.sqlite3"
 
           RUN_SLOT: "day"
-          ALLOW_DUPLICATE_POSTS: "1"
-          MIN_TOTAL_CHARS: "1200"
-          MAX_TOTAL_CHARS: "1800"
-          HASHTAG_MIN: "12"
-          HASHTAG_MAX: "20"
-          STRICT_KOREAN: "1"
-          MFDS_TIMEOUT_SEC: "8"
-          MFDS_BUDGET_SEC: "15"
-          MAX_TRIES: "18"
+          FORCE_NEW: "0"
           DRY_RUN: "0"
           DEBUG: "0"
+          AVOID_REPEAT_DAYS: "90"
+          MAX_TRIES: "25"
+
+          # Content controls (v4)
+          TITLE_STYLE: "random"
+          MIN_TOTAL_CHARS: "1200"
+          HASHTAG_COUNT: "16"
+          ALLOW_DUPLICATE_POSTS: "1"
+
         run: |
           python daily_korean_recipe_to_wp_no_image.py
 
