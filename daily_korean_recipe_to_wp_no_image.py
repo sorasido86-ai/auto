@@ -427,13 +427,39 @@ def mfds_fetch_by_param(api_key: str, param: str, value: str, start: int, end: i
     return rows if isinstance(rows, list) else []
 
 def _sanitize_text(s: str) -> str:
+    """본문에서 '불릿/체크/점찍힌 특수문자'를 제거하고, 과도한 공백을 정리한다.
+
+    ⚠️ 중요: 빈 문자열(""")을 replace 대상으로 쓰면 글자 사이에 공백이 삽입되므로 절대 사용하지 않는다.
+    """
     s = (s or "").strip()
-    # 출력 특수문자 제거(본문에 불릿 느낌이 나지 않게)
-    s = s.replace("", " ").replace("", " ").replace("", " ").replace("", " ")
-    s = s.replace("", " ").replace("", " ").replace("", " ").replace("", " ")
-    s = s.replace("*", " ").replace("■", " ").replace("□", " ").replace("", " ")
-    # 마침표/느낌표/물음표 제거(요청사항)
+    if not s:
+        return ""
+
+    # 보이지 않는 문자/nbsp 정리
+    s = (
+        s.replace("\u200b", "")
+        .replace("\ufeff", "")
+        .replace("\u2060", "")
+        .replace("\xa0", " ")
+    )
+
+    # 불릿/체크/박스/점찍힌 문자 제거(요청사항)
+    bad_chars = [
+        "•", "·", "∙", "‧", "ㆍ",
+        "●", "○", "◆", "◇",
+        "■", "□",
+        "▶", "▷", "►", "▸",
+        "✔", "✓", "✅", "☑",
+        "※",
+        "*",
+    ]
+    for ch in bad_chars:
+        s = s.replace(ch, " ")
+
+    # 마침표/느낌표/물음표 제거(요청사항: 마침표 없이)
     s = re.sub(r"[\.!\?]+", " ", s)
+
+    # 여백 정리
     s = re.sub(r"\s+", " ", s).strip()
     return s
 
