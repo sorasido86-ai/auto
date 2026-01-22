@@ -54,7 +54,7 @@ jobs:
           ALLOW_DUPLICATE_POSTS: "1"
 
         run: |
-          python daily_korean_recipe_to_wp_no_image.py
+          python daily_korean_recipe_to_wp.py
 
       - name: Commit sqlite history
         run: |
