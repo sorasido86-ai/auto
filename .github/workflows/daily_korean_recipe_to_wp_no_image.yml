@@ -1,4 +1,4 @@
-name: Daily Korean Recipe (No Image) to WordPress (v4)
+name: Daily Korean Recipe to WordPress
 
 on:
   schedule:
@@ -25,7 +25,7 @@ jobs:
           python -m pip install --upgrade pip
           pip install requests
 
-      - name: Run bot (no image)
+      - name: Run bot
         env:
           WP_BASE_URL: ${{ secrets.WP_BASE_URL }}
           WP_USER: ${{ secrets.WP_USER }}
@@ -33,25 +33,39 @@ jobs:
 
           # Optional
           MFDS_API_KEY: ${{ secrets.MFDS_API_KEY }}
+          DEFAULT_THUMB_URL: ${{ secrets.DEFAULT_THUMB_URL }}
 
-          # Behavior
+          # Publish
           WP_STATUS: "publish"
           WP_CATEGORY_IDS: "7"
           WP_TAG_IDS: ""
           SQLITE_PATH: "data/daily_korean_recipe.sqlite3"
 
+          # Run mode
           RUN_SLOT: "day"
           FORCE_NEW: "0"
           DRY_RUN: "0"
           DEBUG: "0"
           AVOID_REPEAT_DAYS: "90"
-          MAX_TRIES: "25"
+          MAX_TRIES: "12"
 
-          # Content controls (v4)
-          TITLE_STYLE: "random"
-          MIN_TOTAL_CHARS: "1200"
-          HASHTAG_COUNT: "16"
-          ALLOW_DUPLICATE_POSTS: "1"
+          # MFDS timeout safety (prevents 6+ minutes hanging)
+          MFDS_TIMEOUT: "10"
+          MFDS_BUDGET_SECONDS: "20"
+          STRICT_KOREAN: "1"
+          MFDS_ONLY: "0"  # 1이면 MFDS 실패 시 발행하지 않고 종료
+
+          # Image
+          UPLOAD_THUMB: "1"
+          SET_FEATURED: "1"
+          EMBED_IMAGE_IN_BODY: "1"
+          REUSE_MEDIA_BY_SEARCH: "1"
+
+          # Content rules (your request)
+          INTRO_MIN_CHARS: "200"
+          INTRO_MAX_CHARS: "300"
+          SECTION_MIN_CHARS: "1200"
+          HASHTAG_COUNT: "0"
 
         run: |
           python daily_korean_recipe_to_wp.py
