@@ -280,20 +280,48 @@ def init_db(sqlite_path: str) -> None:
           recipe_title TEXT,
           wp_post_id INTEGER,
           wp_link TEXT,
-          created_at TEXT
+          created_at TEXT,
+          style_sig TEXT
         )
         """
     )
     con.commit()
+
+    cur.execute("PRAGMA table_info(daily_posts)")
+    cols = {row[1] for row in cur.fetchall()}
+    if "style_sig" not in cols:
+        cur.execute("ALTER TABLE daily_posts ADD COLUMN style_sig TEXT")
+        con.commit()
+
     con.close()
+
+def get_recent_style_sigs(sqlite_path: str, limit: int = 20) -> List[str]:
+    try:
+        con = sqlite3.connect(sqlite_path)
+        cur = con.cursor()
+        cur.execute(
+            """
+            SELECT style_sig
+            FROM daily_posts
+            WHERE style_sig IS NOT NULL AND style_sig != ''
+            ORDER BY created_at DESC
+            LIMIT ?
+            """,
+            (int(limit),),
+        )
+        rows = cur.fetchall()
+        con.close()
+        return [str(r[0]) for r in rows if r and r[0]]
+    except Exception:
+        return []
 
 def save_post_meta(sqlite_path: str, meta: Dict[str, Any]) -> None:
     con = sqlite3.connect(sqlite_path)
     cur = con.cursor()
     cur.execute(
         """
-        INSERT OR REPLACE INTO daily_posts(date_slot, recipe_source, recipe_id, recipe_title, wp_post_id, wp_link, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
+        INSERT OR REPLACE INTO daily_posts(date_slot, recipe_source, recipe_id, recipe_title, wp_post_id, wp_link, created_at, style_sig)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             meta.get("date_slot", ""),
@@ -303,6 +331,7 @@ def save_post_meta(sqlite_path: str, meta: Dict[str, Any]) -> None:
             int(meta.get("wp_post_id", 0) or 0),
             meta.get("wp_link", ""),
             meta.get("created_at", datetime.utcnow().isoformat()),
+            meta.get("style_sig", ""),
         ),
     )
     con.commit()
@@ -400,9 +429,9 @@ def mfds_fetch_by_param(api_key: str, param: str, value: str, start: int, end: i
 def _sanitize_text(s: str) -> str:
     s = (s or "").strip()
     # 출력 특수문자 제거(본문에 불릿 느낌이 나지 않게)
-    s = s.replace("•", " ").replace("·", " ").replace("●", " ").replace("○", " ")
-    s = s.replace("✅", " ").replace("✔", " ").replace("▶", " ").replace("※", " ")
-    s = s.replace("*", " ").replace("■", " ").replace("□", " ").replace("▪", " ")
+    s = s.replace("", " ").replace("", " ").replace("", " ").replace("", " ")
+    s = s.replace("", " ").replace("", " ").replace("", " ").replace("", " ")
+    s = s.replace("*", " ").replace("■", " ").replace("□", " ").replace("", " ")
     # 마침표/느낌표/물음표 제거(요청사항)
     s = re.sub(r"[\.!\?]+", " ", s)
     s = re.sub(r"\s+", " ", s).strip()
@@ -452,7 +481,7 @@ def pick_recipe_mfds(cfg: AppConfig, recent_pairs: List[Tuple[str, str]]) -> Opt
         kw = random.choice(keywords)
         rows = mfds_fetch_by_param(
             cfg.recipe.mfds_api_key,
-            "RCP_NM",  # ✅ 오타 방지
+            "RCP_NM",  #  오타 방지
             kw,
             start=1,
             end=60,
@@ -523,33 +552,44 @@ def _no_period_text(s: str) -> str:
     s = re.sub(r"\s+", " ", s).strip()
     return s
 
-def _intro_200_300(title: str, dish: str, rng: random.Random) -> str:
-    # 문단 템플릿 5종 중 택 1 (연결어 포함)
-    t = title
+def _intro_200_300(title: str, rng: random.Random) -> str:
+    """
+    홈피드형 도입부 200~300자
+    - 마침표 없이
+    - 연결어로 자연스럽게 이어지게
+    """
+    t = _no_period_text(title)
+
     templates = [
-        lambda: f"{t}는 이상하게 생각날 때가 있어요\n\n바쁜 날에도 입안이 먼저 떠오르는 느낌이라서요\n\n그래서 오늘은 복잡하게 말하지 않고 딱 따라가실 수 있게 정리해봤어요",
-        lambda: f"요즘은 밥 한 끼가 마음을 세워주는 순간 같더라고요\n\n그중에서도 {t}는 괜히 든든해지는 쪽이라서 자꾸 손이 가요\n\n처음 하실 때도 흐름만 잡으면 충분히 맛이 나와요",
-        lambda: f"{t}는 한 번만 제대로 해두면 다음부터는 정말 편해져요\n\n저도 예전에 간이 흔들려서 아쉬웠던 날이 있었거든요\n\n그 뒤로는 포인트를 두세 개만 잡고 하니까 마음이 훨씬 가벼워졌어요",
-        lambda: f"오늘 같은 날엔 {t}처럼 믿고 가는 메뉴가 있으면 좋더라고요\n\n재료가 완벽하지 않아도 괜찮아요\n\n중요한 건 순서와 타이밍이라서요 그걸 중심으로 써볼게요",
-        lambda: f"{t}는 조용히 잘 되는 메뉴라서 좋아요\n\n손이 바쁘지 않은데도 결과가 꽤 근사하게 나오는 편이거든요\n\n제가 자주 하는 방식으로 정리했으니 편하게 읽어주세요",
+        lambda: f"요즘은 한 끼가 그냥 밥이 아니라 하루 리듬을 다시 잡아주는 느낌이더라고요\n\n그래서 저는 {t}처럼 손이 많이 가지 않는데도 만족도가 높은 메뉴가 자꾸 생각나요\n\n오늘은 어렵게 말하지 않고 흐름만 잡으실 수 있게 정리해봤어요",
+        lambda: f"{t}는 괜히 떠올라서 한 번 만들기 시작하면 끝까지 가게 되는 메뉴예요\n\n재료가 완벽하지 않아도 방향만 맞추면 맛이 크게 흔들리지 않더라고요\n\n제가 자주 하는 순서대로 차분히 풀어볼게요",
+        lambda: f"바쁜 날엔 뭘 해먹을지 고민하는 시간도 아깝잖아요\n\n그럴 때 {t}처럼 기준이 되는 메뉴가 하나 있으면 선택이 훨씬 쉬워져요\n\n오늘은 그 기준을 딱 잡아드리는 쪽으로 적어볼게요",
+        lambda: f"{t}는 ‘지금 먹으면 딱이다’ 싶은 순간이 있어요\n\n처음 해보실 때는 간과 타이밍만 잡으면 되고 나머지는 유연하게 가셔도 돼요\n\n저는 그런 방식이 제일 현실적이더라고요",
+        lambda: f"저도 예전에 {t}를 대충 했다가 간이 흔들려서 아쉬웠던 적이 있었어요\n\n그 뒤로는 순서 하나와 간 타이밍 하나만 지키니까 결과가 훨씬 안정적이더라고요\n\n그 포인트를 중심으로 오늘 버전으로 정리해드릴게요",
+        lambda: f"{t}는 복잡한 기술보다 기본이 더 크게 먹히는 메뉴예요\n\n중간에 욕심만 안 내면 맛이 자연스럽게 따라오더라고요\n\n그래서 지금부터 딱 필요한 부분만 깔끔하게 적어볼게요",
+        lambda: f"{t}는 만들고 나서 ‘아 이 맛이었지’ 하고 고개가 끄덕여지는 편이더라고요\n\n그래서 저는 기분이 들쭉날쭉할 때 이런 메뉴로 중심을 잡는 편이에요\n\n오늘도 그 느낌 그대로 따라가기 쉬운 형태로 정리해봤어요",
+        lambda: f"저는 요리할 때 거창한 목표를 세우기보다 오늘의 컨디션에 맞추는 편이에요\n\n그래서 {t}처럼 부담이 덜한 메뉴가 자연스럽게 손에 잡히더라고요\n\n재료는 있는 만큼만 쓰시고 흐름만 따라오시면 돼요",
     ]
+
     out = templates[rng.randrange(len(templates))]()
-    out = _no_period_text(out).replace(" \n ", "\n\n")
-    # 길이 200~320 사이로 맞추기(너무 빡세게 자르지 않음)
+    out = _no_period_text(out)
+
     if len(out) < 200:
-        out += "\n\n처음 하시는 분도 부담 없이 가실 수 있어요"
-        out = _no_period_text(out).replace(" \n ", "\n\n")
-    if len(out) > 320:
-        # 마지막 문장 하나 제거
+        out += "\n\n처음 하시는 분도 흐름만 따라가시면 충분히 괜찮게 나와요"
+        out = _no_period_text(out)
+    if len(out) > 360:
         parts = out.split("\n\n")
-        if len(parts) >= 3:
-            out = "\n\n".join(parts[:3])
+        out = "\n\n".join(parts[:3])
+
     return out
 
 def _fmt_lines(lines: List[str]) -> str:
-    # 불릿 없이 라인 나열
     safe = [html.escape(_no_period_text(x)) for x in lines if _no_period_text(x)]
     return "<br/>".join(safe)
+
+def _fmt_paras(paras: List[str]) -> str:
+    safe = [html.escape(_no_period_text(x)) for x in paras if _no_period_text(x)]
+    return "<br/><br/>".join(safe)
 
 def _clean_title_tokens(title: str) -> List[str]:
     t = re.sub(r"[^0-9가-힣a-zA-Z\s]", " ", title or "")
@@ -628,7 +668,7 @@ def ensure_min_chars(body_html: str, min_chars: int, max_chars: int, rng: random
         "오늘 한 번 해보고 내 입맛 기준으로 매운맛이나 단맛만 살짝 메모해두면 다음엔 훨씬 빨리 끝나요",
     ]
     extra_pool_soup = [
-        "국물 쪽은 센 불로 오래 끓이기보다 중불로 일정하게 가져가면 맛이 편해져요 끓는 동안은 건드리지 말고 마지막에만 간을 보셔도 좋아요",
+        "국물 쪽은 센 불로 오래 끓이기보다 중불로 일정하게 가져가면 맛이 더 정돈돼요 끓는 동안은 건드리지 말고 마지막에만 간을 보셔도 좋아요",
         "찌개나 국은 한 번 끓인 뒤 3분만 쉬게 두면 맛이 더 붙을 때가 있어요 그때 간을 보면 과하게 넣을 일이 줄어들어요",
     ]
     extra_pool_pan = [
@@ -656,146 +696,202 @@ def ensure_min_chars(body_html: str, min_chars: int, max_chars: int, rng: random
         cur = len(_strip_html_tags(base))
     return base
 
-def build_body_html(cfg: AppConfig, recipe: Recipe, seed_key: str) -> Tuple[str, str]:
+def build_body_html(cfg: AppConfig, recipe: Recipe, seed_key: str, recent_style_sigs: Optional[set] = None) -> Tuple[str, str, str]:
+    """
+    홈피드형 글 생성
+    - 도입부 200~300자
+    - 굵은 소제목 3개
+    - 레시피(재료/순서) 항상 포함
+    - 불릿/체크/점찍힌 특수문자 제거
+    - 총 글자수 MIN_TOTAL_CHARS 이상 보장(과도한 장문 방지)
+    - 레퍼토리 반복을 줄이기 위해 style_sig를 만들고 최근과 겹치면 재시도
+    """
     title = _no_period_text(recipe.title)
     dish = _dish_type(title)
-    rng = _seeded_rng(seed_key + "|" + recipe.uid())
 
-    intro = _intro_200_300(title, dish, rng)
+    used_style = set(recent_style_sigs or set())
 
-    # 재료/순서 정리
-    ing_lines = [_no_period_text(x) for x in (recipe.ingredients or []) if _no_period_text(x)]
-    if not ing_lines:
-        ing_lines = ["집에 있는 재료 기준으로 편하게 맞춰주세요"]
+    def compose(rng: random.Random) -> Tuple[str, str, str]:
+        intro = _intro_200_300(title, rng)
 
-    step_src = [x for x in (recipe.steps or []) if _no_period_text(x)]
-    if not step_src:
-        step_src = ["재료를 먼저 준비해요", "중불로 익히고 마지막에 간을 맞춰요"]
-    step_src = step_src[:10]
+        # 재료/순서 정리
+        ing_lines = [_no_period_text(x) for x in (recipe.ingredients or []) if _no_period_text(x)]
+        if not ing_lines:
+            ing_lines = ["집에 있는 재료 기준으로 편하게 맞춰주세요"]
 
-    step_lines: List[str] = []
-    for i, s in enumerate(step_src, start=1):
-        ord_k = _ORD[i - 1] if i - 1 < len(_ORD) else f"{i}번째"
-        step_lines.append(f"순서 {ord_k}  {s}")
+        step_src = [x for x in (recipe.steps or []) if _no_period_text(x)]
+        if not step_src:
+            step_src = ["재료를 먼저 준비해요", "중불로 익히고 마지막에 간을 맞춰요"]
+        step_src = step_src[:10]
 
-    # 섹션 1  감정 + 경험(반복 줄이기)
-    sec1_templates = [
-        lambda: [
-            f"{title}는 괜히 마음이 내려앉을 때 떠오르는 메뉴예요",
-            "한 번 해먹고 나면 다음 날에도 생각나는 그런 쪽이 있더라고요",
-            "그래서 오늘은 제가 자주 하는 방식으로 편하게 정리해볼게요",
-        ],
-        lambda: [
-            f"요즘 같은 날엔 {title}처럼 실패 확률 낮은 메뉴가 고마워요",
-            "재료가 조금 부족해도 흐름만 잡으면 웬만하면 맛이 따라와주거든요",
-            "저도 몇 번 시행착오를 겪고 나서야 편한 루틴이 생겼어요",
-        ],
-        lambda: [
-            f"{title}는 대단한 기술보다 타이밍이 중요하더라고요",
-            "처음엔 욕심내서 이것저것 넣다가 오히려 맛이 흐려진 적이 있었어요",
-            "지금은 핵심만 남겨서 훨씬 가볍게 하고 있어요",
-        ],
-        lambda: [
-            f"{title}는 한입 먹으면 그날 기분이 조금 정돈되는 느낌이 있어요",
-            "그 덕분에 저녁 시간이 덜 급해지고요",
-            "그래서 오늘은 짧게 읽어도 바로 따라가실 수 있게 썼어요",
-        ],
-    ]
-    sec1_lines = sec1_templates[rng.randrange(len(sec1_templates))]()
-    sec1 = "<br/><br/>".join([html.escape(_no_period_text(x)) for x in sec1_lines if _no_period_text(x)])
+        step_lines: List[str] = []
+        for i, s in enumerate(step_src, start=1):
+            ord_k = _ORD[i - 1] if i - 1 < len(_ORD) else f"{i}번째"
+            step_lines.append(f"순서 {ord_k}  {s}")
 
-    # 섹션 2  재료 목록
-    sec2_open_pool = [
-        "재료는 완벽하게 맞추지 않으셔도 괜찮아요",
-        "여기서 중요한 건 비율보다 순서예요",
-        "저는 이 정도만 준비되면 마음이 편해지더라고요",
-        "냉장고 상황에 맞춰 바꿔도 흐름만 지키면 충분해요",
-    ]
-    sec2_open = html.escape(_no_period_text(rng.choice(sec2_open_pool)))
-    sec2_body = (
-        f"{sec2_open}"
-        f"<br/><br/><strong>재료 목록</strong><br/>{_fmt_lines(ing_lines)}"
-    )
+        # 섹션 1  왜 이 메뉴가 떠오르는지(문장이 이어지게)
+        sec1_templates: List[List[str]] = [
+            [
+                f"{title}는 이상하게도 컨디션이 애매한 날에 먼저 떠오르더라고요 그래서 저는 이런 날엔 메뉴를 새로 고민하기보다 익숙한 쪽으로 마음을 돌려요",
+                "예전에 한 번은 재료를 대충 맞췄다가 맛이 흐릿해서 아쉬웠던 적이 있었는데요 그때 느낀 게 방향만 잡아도 반은 성공이라는 거였어요 그래서 오늘은 그 방향을 먼저 잡아드릴게요",
+            ],
+            [
+                f"저는 {title}를 생각하면 그날의 분위기까지 같이 따라오는 편이에요 그래서 한 번 만들기 시작하면 괜히 정리를 끝까지 하고 싶어지더라고요",
+                "처음 하실 때는 욕심내지 않고 흐름만 따라가도 충분해요 특히 간과 시간은 뒤로 갈수록 달라질 수 있으니까 초반엔 가볍게 시작하시는 게 좋아요",
+            ],
+            [
+                f"{title}는 그냥 해도 괜찮을 것 같은데 싶으면서도 막상 해보면 포인트가 있는 메뉴예요 그래서 저는 포인트를 두세 개만 정해두고 그 외는 유연하게 가요",
+                "그 방식이 좋은 게 재료가 조금 달라도 결과가 크게 흔들리지 않더라고요 오늘도 같은 흐름으로 정리해드릴게요",
+            ],
+            [
+                f"요즘처럼 정신 없는 날엔 메뉴를 결정하는 것부터가 에너지잖아요 그래서 저는 {title}처럼 기준이 되는 메뉴를 하나 정해두는 편이에요",
+                "오늘은 그 기준을 그대로 따라가실 수 있게 재료와 순서를 한 번에 보이도록 적어볼게요",
+            ],
+        ]
+        sec1_idx = rng.randrange(len(sec1_templates))
+        sec1 = _fmt_paras(sec1_templates[sec1_idx])
 
-    # 섹션 3  순서 + 맛 포인트(매번 똑같지 않게)
-    tip_pool_soup = [
-        "국물은 센 불로만 밀지 말고 중불을 유지하면 맛이 편해져요",
-        "간은 마지막에 한 번만 보시면 짜질 확률이 확 줄어요",
-        "향이 약하면 대파나 마늘을 마지막에 아주 조금만 더해보세요",
-    ]
-    tip_pool_pan = [
-        "팬 요리는 물이 생기지 않게 한 번에 너무 많이 넣지 않는 게 좋아요",
-        "불은 올렸다 내렸다 하기보다 중불을 유지하는 쪽이 안정적이에요",
-        "마지막에 참기름이나 후추를 아주 조금만 더하면 향이 살아나요",
-    ]
-    tip_pool_common = [
-        "단맛이 필요하면 한 번에 넣지 말고 아주 소량씩만 조절해보세요",
-        "오늘 만든 뒤에 내 입맛 기준으로 매운맛만 메모해두면 다음이 훨씬 쉬워요",
-        "재료가 하나 빠져도 괜찮아요 간과 시간만 무너지지 않게 잡아주면 돼요",
-    ]
-    tip_pool = tip_pool_common[:]
-    if dish == "국물":
-        tip_pool += tip_pool_soup
-    else:
-        tip_pool += tip_pool_pan
+        # 섹션 2  재료와 준비(도입 문단 다양화)
+        sec2_open_pool = [
+            "재료는 완벽할 필요 없어요 다만 순서가 꼬이지 않게 미리 손질만 해두면 훨씬 수월해요",
+            "요리할 때 제일 피곤한 건 중간에 재료를 찾는 순간이더라고요 그래서 저는 시작 전에 재료부터 한 번 쫙 꺼내두는 편이에요",
+            "맛을 좌우하는 건 재료 종류보다 준비 순서인 경우가 많아요 오늘은 그 부분을 기준으로 정리해볼게요",
+            "재료가 조금 달라도 괜찮아요 핵심은 간을 언제 잡느냐와 불을 어떻게 유지하느냐 쪽이에요",
+            "처음 하실수록 준비가 반이에요 손질만 끝내두면 조리는 생각보다 금방 따라와요",
+            "냉장고 상황 따라 바꾸실 부분은 바꾸셔도 돼요 대신 기본 흐름만 지키면 맛은 따라오더라고요",
+            "재료를 다 갖추지 못해도 괜찮아요 대신 양념 비율은 조금씩만 조절해보시면 좋아요",
+        ]
+        sec2_open_idx = rng.randrange(len(sec2_open_pool))
+        sec2_open = html.escape(_no_period_text(sec2_open_pool[sec2_open_idx]))
 
-    tips = rng.sample(tip_pool, k=min(3, len(tip_pool)))
-    tips_html = "<br/>".join([html.escape(_no_period_text(t)) for t in tips])
+        sec2_body = (
+            f"{sec2_open}"
+            f"<br/><br/><strong>레시피 재료 목록</strong><br/>{_fmt_lines(ing_lines)}"
+        )
 
-    ask_pool = [
-        f"{title} 만들 때 혹시 꼭 넣는 재료가 있으세요",
-        f"{title}는 어떤 버전이 제일 취향이세요",
-        f"오늘 {title} 드시면 다음엔 어떤 재료를 더해보고 싶으세요",
-        "집에 있는 재료 중에 어떤 게 제일 잘 어울렸나요",
-    ]
-    ask = html.escape(_no_period_text(rng.choice(ask_pool)))
+        # 섹션 3  순서 + 맛 포인트
+        tip_pool_soup = [
+            "국물은 센 불로 밀기보다 중불을 유지하면 맛이 더 안정적으로 나와요",
+            "간은 중간에 확 잡지 말고 마지막에 한 번만 정리하는 쪽이 안전해요",
+            "향이 아쉬우면 대파나 마늘을 마지막에 조금만 더해도 충분히 살아나요",
+            "육수가 없다면 물로 시작해도 괜찮고 대신 끓이는 시간을 조금만 더 주세요",
+            "재료가 익는 속도가 다르니 단단한 것부터 넣는 순서만 챙겨주시면 돼요",
+            "국물은 마지막에 농도가 잡히니까 초반엔 조금 심심해도 괜찮아요",
+        ]
+        tip_pool_pan = [
+            "팬 요리는 한 번에 너무 많이 넣지 않으면 물이 덜 생기고 결과가 깔끔해요",
+            "불을 올렸다 내렸다 하기보다 한 단계로 유지하면 맛이 흔들리지 않아요",
+            "마지막에 후추나 참기름을 아주 소량만 더해도 향이 또렷해져요",
+            "양념은 먼저 섞어두고 들어가면 중간에 헤매지 않아서 좋아요",
+            "수분이 많아 보이면 잠깐 뚜껑을 열고 정리해주면 식감이 좋아져요",
+            "겉면만 먼저 잡아두면 안이 더 촉촉하게 남더라고요",
+        ]
+        tip_pool_common = [
+            "단맛이나 매운맛은 한 번에 넣지 말고 아주 소량씩만 조절해보세요",
+            "오늘 만든 뒤에 내 입맛 기준으로 간만 메모해두면 다음이 훨씬 쉬워요",
+            "재료가 하나 빠져도 괜찮아요 흐름만 무너지지 않게 잡아주면 돼요",
+            "조리는 길게 끌기보다 필요한 구간만 정확히 잡는 게 오히려 맛이 좋아요",
+            "중간에 간을 보더라도 확정은 마지막에 하시는 게 안전하더라고요",
+        ]
+        tip_pool = tip_pool_common[:]
+        tip_pool += (tip_pool_soup if dish == "국물" else tip_pool_pan)
 
-    closing_pool = [
-        "편하게 한 줄만 남겨주시면 다음에 더 잘 맞춰서 써볼게요",
-        "댓글로 살짝만 얘기해주시면 저도 다음 메뉴 고를 때 참고할게요",
-        "한 줄만 남겨주셔도 충분해요 저는 그게 제일 도움이 되더라고요",
-        "오늘 드신 느낌이 어땠는지 짧게만 남겨주시면 저도 같이 기뻐요",
-    ]
-    closing = html.escape(_no_period_text(rng.choice(closing_pool)))
+        rng.shuffle(tip_pool)
+        tips: List[str] = []
+        for t in tip_pool:
+            if len(tips) >= 3:
+                break
+            key = t[:10]
+            if any(key == x[:10] for x in tips):
+                continue
+            tips.append(t)
+        tips_html = "<br/>".join([html.escape(_no_period_text(t)) for t in tips])
 
-    sec3_intro_pool = [
-        "이제 흐름만 따라가시면 돼요",
-        "순서는 길어 보여도 실제로는 금방 끝나요",
-        "여기서부터는 타이밍만 잡아주시면 돼요",
-        "저는 아래 순서대로 하면 마음이 제일 편하더라고요",
-    ]
-    sec3_intro = html.escape(_no_period_text(rng.choice(sec3_intro_pool)))
+        ask_pool = [
+            f"{title} 만들 때 자주 쓰는 재료 조합이 있으세요",
+            f"{title}는 어떤 버전이 제일 취향이세요",
+            f"오늘 {title} 드신다면 다음엔 어떤 재료를 더해보고 싶으세요",
+            "집에 있는 재료 중에 가장 잘 어울렸던 조합이 뭐였나요",
+            "이 메뉴는 간을 어떤 스타일로 잡으시는 편이세요",
+        ]
+        closing_pool = [
+            "말씀 한 번만 들려주시면 다음 글에 더 자연스럽게 녹여볼게요",
+            "짧게라도 남겨주시면 제가 다음 메뉴 고를 때도 큰 도움이 돼요",
+            "편하게 얘기해주시면 그 방향으로 다음 버전도 만들어볼게요",
+            "읽으시면서 떠오른 팁이 하나라도 있으면 살짝만 공유해주셔도 좋아요",
+            "오늘 드신 느낌이 어땠는지 가볍게만 알려주셔도 충분해요",
+            "취향이 어디로 가는지 알면 다음 글이 훨씬 정확해지더라고요",
+            "재료 한 가지만 추천해주셔도 저한텐 진짜 힌트가 돼요",
+            "다음엔 더 짧게 갈지 더 디테일하게 갈지 방향도 같이 맞춰보고 싶어요",
+            "혹시 다른 분들이 자주 하는 팁이 있으면 같이 나눠주셔도 좋아요",
+        ]
+        ask_idx = rng.randrange(len(ask_pool))
+        closing_idx = rng.randrange(len(closing_pool))
+        ask = html.escape(_no_period_text(ask_pool[ask_idx]))
+        closing = html.escape(_no_period_text(closing_pool[closing_idx]))
 
-    sec3_body = (
-        f"{sec3_intro}"
-        f"<br/><br/><strong>만드는 순서</strong><br/>{_fmt_lines(step_lines)}"
-        f"<br/><br/><strong>맛 포인트</strong><br/>{tips_html}"
-        f"<br/><br/>{ask}  {closing}"
-    )
+        sec3_intro_pool = [
+            "이제는 흐름만 따라가시면 돼요",
+            "순서는 길어 보여도 실제로는 금방 끝나요",
+            "여기서부터는 타이밍만 잡아주시면 돼요",
+            "아래 순서대로 가시면 중간에 덜 헤매요",
+            "한 단계씩만 넘기면 생각보다 단순해요",
+            "처음부터 끝까지 한 번에 보이면 더 쉬워지더라고요",
+            "지금부터는 단계만 따라가시면 맛이 자연스럽게 따라와요",
+        ]
+        sec3_intro_idx = rng.randrange(len(sec3_intro_pool))
+        sec3_intro = html.escape(_no_period_text(sec3_intro_pool[sec3_intro_idx]))
 
-    hashtags = build_hashtags(cfg, title, dish)
-    tags_block = f"<strong>해시태그</strong><br/>{html.escape(hashtags)}"
+        sec3_body = (
+            f"{sec3_intro}"
+            f"<br/><br/><strong>만드는 순서</strong><br/>{_fmt_lines(step_lines)}"
+            f"<br/><br/><strong>맛 포인트</strong><br/>{tips_html}"
+            f"<br/><br/>{ask}  {closing}"
+        )
 
-    intro_html = html.escape(_no_period_text(intro)).replace("\n\n", "<br/><br/>")
+        hashtags = build_hashtags(cfg, title, dish)
+        tags_block = f"<strong>해시태그</strong><br/>{html.escape(hashtags)}"
 
-    body = (
-        f"{intro_html}"
-        f"<br/><br/><strong>왜 이 메뉴가 떠오르는지</strong><br/>{sec1}"
-        f"<br/><br/><strong>재료와 준비</strong><br/>{sec2_body}"
-        f"<br/><br/><strong>순서와 맛 포인트</strong><br/>{sec3_body}"
-        f"<br/><br/>{tags_block}"
-    )
+        intro_html = html.escape(_no_period_text(intro)).replace("\n\n", "<br/><br/>")
 
-    body = ensure_min_chars(
-        body_html=body,
-        min_chars=max(600, cfg.run.min_total_chars),
-        max_chars=max(cfg.run.min_total_chars, cfg.run.max_total_chars),
-        rng=rng,
-        dish=dish,
-    )
+        body = (
+            f"{intro_html}"
+            f"<br/><br/><strong>왜 이 메뉴가 떠오르는지</strong><br/>{sec1}"
+            f"<br/><br/><strong>재료와 준비</strong><br/>{sec2_body}"
+            f"<br/><br/><strong>순서와 맛 포인트</strong><br/>{sec3_body}"
+            f"<br/><br/>{tags_block}"
+        )
 
-    excerpt = _no_period_text(f"{title} 레시피  재료와 순서를 보기 좋게 정리했어요")[:140]
-    return body, excerpt
+        style_meta = {
+            "sec1": sec1_idx,
+            "sec2": sec2_open_idx,
+            "sec3i": sec3_intro_idx,
+            "ask": ask_idx,
+            "close": closing_idx,
+            "tips": "|".join([t[:12] for t in tips]),
+        }
+        style_sig = hashlib.sha1(json.dumps(style_meta, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()[:10]
+
+        excerpt = f"{title} 레시피  재료와 순서  맛 포인트까지 한 번에 정리했어요"
+        excerpt = excerpt[:140]
+
+        body = ensure_min_chars(
+            body_html=body,
+            min_chars=cfg.run.min_total_chars,
+            max_chars=cfg.run.max_total_chars,
+            rng=rng,
+            dish=dish,
+        )
+
+        return body, excerpt, style_sig
+
+    for k in range(6):
+        rng = _seeded_rng(f"{seed_key}|{recipe.uid()}|{k}")
+        body, excerpt, style_sig = compose(rng)
+        if style_sig not in used_style:
+            return body, excerpt, style_sig
+
+    return compose(_seeded_rng(f"{seed_key}|{recipe.uid()}|fallback"))
 
 def build_post_title(recipe_title: str, date_str: str, slot_label: str) -> str:
     rng = _seeded_rng(recipe_title + "|" + date_str + "|" + slot_label)
@@ -836,7 +932,8 @@ def run(cfg: AppConfig) -> None:
     title = build_post_title(chosen.title, date_str, slot_label)
     slug = slugify(f"korean-recipe-{date_str}-{slot}-{run_id}" if cfg.run.allow_duplicate_posts else f"korean-recipe-{date_str}-{slot}")
 
-    body_html, excerpt = build_body_html(cfg, chosen, seed_key=date_slot)
+    recent_style_sigs = set(get_recent_style_sigs(cfg.sqlite_path, limit=20))
+    body_html, excerpt, style_sig = build_body_html(cfg, chosen, seed_key=date_slot, recent_style_sigs=recent_style_sigs)
 
     if cfg.run.dry_run:
         print("[DRY_RUN] 발행 생략  HTML 미리보기 일부")
@@ -856,6 +953,7 @@ def run(cfg: AppConfig) -> None:
             "wp_post_id": wp_post_id,
             "wp_link": wp_link,
             "created_at": datetime.utcnow().isoformat(),
+            "style_sig": style_sig,
         },
     )
 
