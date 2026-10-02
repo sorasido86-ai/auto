@@ -792,7 +792,7 @@ def get_recipe_by_id(cfg: AppConfig, source: str, recipe_id: str) -> Optional[Re
 
 
 # -----------------------------
-# Text helpers (no bullets, no periods)
+# Stable selection seed
 # -----------------------------
 
 
@@ -813,46 +813,18 @@ def build_post_title(date_str: str, slot_label: str, recipe_title: str, rng: ran
 # Images
 # -----------------------------
 
-def _korean_title_to_image_query(title: str) -> str:
-    t = title or ""
-    mapping = [
-        (["김치찌개"], "kimchi jjigae korean stew"),
-        (["된장찌개"], "doenjang jjigae korean stew"),
-        (["불고기"], "bulgogi korean beef"),
-        (["비빔"], "bibimbap korean"),
-        (["김밥"], "kimbap"),
-        (["떡"], "tteokbokki"),
-        (["국"], "korean soup"),
-        (["찌개"], "korean stew"),
-        (["전"], "korean pancake jeon"),
-    ]
-    for keys, q in mapping:
-        if any(k in t for k in keys):
-            return q
-    # fallback
-    t2 = re.sub(r"\s+", " ", t).strip()
-    if t2:
-        return f"{t2} korean food"
-    return "korean food"
 
 
-def _unsplash_source_url(query: str) -> str:
-    # Unsplash Source는 API키 없이도 랜덤 이미지를 줌 (리다이렉트)
-    q = quote(query)
-    return f"https://source.unsplash.com/1600x900/?{q}"
+
+
+
+
 
 
 def choose_thumb_url(cfg: AppConfig, recipe: Recipe) -> str:
-    # 1) MFDS 제공 이미지
-    if (recipe.image_url or "").strip().startswith("http"):
-        return recipe.image_url.strip()
-    # 2) 기본 썸네일
-    if (cfg.img.default_thumb_url or "").strip():
-        return cfg.img.default_thumb_url.strip()
-    # 3) 자동 이미지
-    if cfg.img.auto_image:
-        return _unsplash_source_url(_korean_title_to_image_query(recipe.title))
-    return ""
+    # A generic stock-photo search must not pretend to show the chosen dish.
+    return (recipe.image_url or cfg.img.default_thumb_url or "").strip()
+
 
 
 def ensure_media(cfg: AppConfig, image_url: str, stable_name: str) -> Tuple[int, str]:

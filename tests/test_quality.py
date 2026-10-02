@@ -100,6 +100,14 @@ class RecipeQualityTests(unittest.TestCase):
         self.assertNotIn("중불", body)
         self.assertIn("<ol>", body)
 
+    def test_missing_recipe_image_does_not_get_generic_stock_photo(self):
+        bot = importlib.import_module("daily_korean_recipe_to_wp")
+        cfg = bot.load_cfg()
+        cfg.img.default_thumb_url = ""
+        cfg.img.auto_image = True
+        recipe = bot.Recipe("local", "test", "두부 조림", ["두부 150g"], ["두부를 썬다."])
+        self.assertEqual(bot.choose_thumb_url(cfg, recipe), "")
+
 
 class PublishingTests(unittest.TestCase):
     endpoint = "https://example.com/wp-json/wp/v2/posts"
