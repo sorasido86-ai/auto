@@ -37,7 +37,6 @@ from __future__ import annotations
 
 import base64
 import html
-import json
 import os
 import random
 import re
@@ -50,6 +49,8 @@ from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import quote
 
 import requests
+from wp_common import write_post
+from content_quality import require_items, save_preview
 
 
 KST = timezone(timedelta(hours=9))
@@ -311,10 +312,7 @@ def wp_create_post(cfg: WordPressConfig, title: str, slug: str, html_body: str, 
     if featured_media:
         payload["featured_media"] = featured_media
 
-    r = requests.post(url, headers=headers, json=payload, timeout=30)
-    if r.status_code not in (200, 201):
-        raise RuntimeError(f"WP create failed: {r.status_code} body={r.text[:500]}")
-    data = r.json()
+    data = write_post(url, headers, payload)
     return int(data["id"]), str(data.get("link") or "")
 
 
@@ -329,10 +327,7 @@ def wp_update_post(cfg: WordPressConfig, post_id: int, title: str, html_body: st
     if featured_media:
         payload["featured_media"] = featured_media
 
-    r = requests.post(url, headers=headers, json=payload, timeout=30)
-    if r.status_code not in (200, 201):
-        raise RuntimeError(f"WP update failed: {r.status_code} body={r.text[:500]}")
-    data = r.json()
+    data = write_post(url, headers, payload)
     return int(data["id"]), str(data.get("link") or "")
 
 
@@ -694,19 +689,22 @@ def run(cfg: AppConfig) -> None:
     combined = gif_cards + photo_cards
     combined = combined[:total_target]
 
-    gifs_out = [x for x in combined if x.get("embed_url","").lower().endswith(".gif") or x.get("uid","").startswith("commons:File") and x.get("source")=="Wikimedia Commons"][: cfg.run.gif_count]
+    gif_uids = {x["uid"] for x in gif_cards}
+    gifs_out = [x for x in combined if x["uid"] in gif_uids][: cfg.run.gif_count]
     photos_out = [x for x in combined if x not in gifs_out]
 
-    title = f"{date_str} 멍냥짤/사진 TOP{len(gifs_out)+len(photos_out)} ({slot_label})"
+    title = f"{date_str} 멍냥짤·사진 모음 {len(gifs_out)+len(photos_out)} ({slot_label})"
     slug = f"animal-media-{date_str}-{slot}"
+    require_items(combined, "동물 사진·움짤")
     body_html = build_html(now, slot_label, gifs_out, photos_out)
+    save_preview(slug, title, body_html)
 
     # 대표이미지: 사진 1번(우선) → gif → 없음
     featured_id = 0
     featured_url = ""
     pick = (photos_out[0] if photos_out else (gifs_out[0] if gifs_out else None))
 
-    if cfg.run.upload_thumb and cfg.run.set_featured and pick:
+    if not cfg.run.dry_run and cfg.run.upload_thumb and cfg.run.set_featured and pick:
         b, mime = download_bytes(pick.get("download_url",""))
         if b:
             mime = mime or "image/jpeg"
@@ -757,3 +755,4 @@ if __name__ == "__main__":
         import traceback
         traceback.print_exc()
         sys.exit(1)
+

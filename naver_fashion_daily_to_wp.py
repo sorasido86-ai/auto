@@ -29,6 +29,9 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import requests
+from wp_common import write_post
+from content_quality import require_items, save_preview
+from datetime import timezone, timedelta
 
 
 # -----------------------------
@@ -58,8 +61,8 @@ class WordPressConfig:
 
 @dataclass
 class PostConfig:
-    title_template: str = "{date} 네이버 쇼핑 남성/여성 의류 TOP20 (데일리)"
-    disclosure: str = "※ 이 포스팅은 데이터 순위를 기록하기 위한 자료입니다."
+    title_template: str = "{date} 남성·여성 의류 검색 결과 비교"
+    disclosure: str = "※ 이 포스팅은 쇼핑 검색 결과를 비교하기 위한 자료입니다. 검색 순서는 판매량·품질 순위를 의미하지 않습니다."
     note: str = "데이터 출처: 네이버 쇼핑 검색 API(정렬 기준: {sort})."
 
 
@@ -381,21 +384,18 @@ def wp_auth_header(username: str, app_password: str) -> Dict[str, str]:
     return {"Authorization": f"Basic {token}", "User-Agent": "naver-fashion-bot/1.0"}
 
 
-def wp_create_post(cfg: WordPressConfig, title: str, html: str) -> Tuple[int, str]:
+def wp_create_post(cfg: WordPressConfig, title: str, html: str, slug: str) -> Tuple[int, str]:
     endpoint = cfg.site_url.rstrip("/") + "/wp-json/wp/v2/posts"
     headers = {**wp_auth_header(cfg.username, cfg.app_password), "Content-Type": "application/json"}
 
-    payload: Dict[str, Any] = {"title": title, "content": html, "status": cfg.status}
+    payload: Dict[str, Any] = {"title": title, "slug": slug, "content": html, "status": cfg.status}
     # ✅ 카테고리/태그 적용
     if cfg.category_ids:
         payload["categories"] = cfg.category_ids
     if cfg.tag_ids:
         payload["tags"] = cfg.tag_ids
 
-    r = requests.post(endpoint, headers=headers, json=payload, timeout=30)
-    if r.status_code not in (200, 201):
-        raise RuntimeError(f"WP create failed: {r.status_code} body={r.text[:300]}")
-    data = r.json()
+    data = write_post(endpoint, headers, payload)
     return int(data["id"]), str(data.get("link") or "")
 
 
@@ -410,10 +410,7 @@ def wp_update_post(cfg: WordPressConfig, post_id: int, title: str, html: str) ->
     if cfg.tag_ids:
         payload["tags"] = cfg.tag_ids
 
-    r = requests.post(endpoint, headers=headers, json=payload, timeout=30)
-    if r.status_code not in (200, 201):
-        raise RuntimeError(f"WP update failed: {r.status_code} body={r.text[:300]}")
-    data = r.json()
+    data = write_post(endpoint, headers, payload)
     return int(data["id"]), str(data.get("link") or "")
 
 
@@ -462,10 +459,10 @@ def build_table(title: str, items: List[Dict[str, Any]]) -> str:
     <table style="border-collapse:collapse;width:100%;font-size:14px;">
       <thead>
         <tr>
-          <th style="padding:8px;border:1px solid #e5e5e5;">순위</th>
+          <th style="padding:8px;border:1px solid #e5e5e5;">검색 순서</th>
           <th style="padding:8px;border:1px solid #e5e5e5;">이미지</th>
           <th style="padding:8px;border:1px solid #e5e5e5;">상품</th>
-          <th style="padding:8px;border:1px solid #e5e5e5;">최저가</th>
+          <th style="padding:8px;border:1px solid #e5e5e5;">검색 최저가</th>
         </tr>
       </thead>
       <tbody>
@@ -480,8 +477,8 @@ def build_post_html(date_str: str, post_cfg: PostConfig, women_items: List[Dict[
     head = f"<p>기준일: <b>{date_str}</b></p>"
     note = f'<p style="font-size:13px;opacity:.8;">{htmlmod.escape(post_cfg.note.format(sort=sort))}</p>'
 
-    women_html = build_table("여성의류 TOP 20", women_items)
-    men_html = build_table("남성의류 TOP 20", men_items)
+    women_html = build_table(f"여성의류 검색 결과 {len(women_items)}개", women_items)
+    men_html = build_table(f"남성의류 검색 결과 {len(men_items)}개", men_items)
 
     return f"{disclosure}{head}{note}{women_html}<hr/>{men_html}"
 
@@ -515,7 +512,7 @@ def debug_test_wp(cfg: AppConfig) -> None:
 # Main logic
 # -----------------------------
 def run_daily(cfg: AppConfig) -> None:
-    date_str = datetime.now().strftime("%Y-%m-%d")
+    date_str = datetime.now(timezone(timedelta(hours=9))).strftime("%Y-%m-%d")
 
     init_db(cfg.storage.sqlite_path)
 
@@ -526,11 +523,14 @@ def run_daily(cfg: AppConfig) -> None:
         women_items = naver_shop_search(session, cfg.naver, women_q)
         men_items = naver_shop_search(session, cfg.naver, men_q)
 
+    require_items(women_items + men_items, "의류 검색 결과")
     upsert_rankings(cfg.storage.sqlite_path, date_str, "women", women_items)
     upsert_rankings(cfg.storage.sqlite_path, date_str, "men", men_items)
 
     title = cfg.post.title_template.format(date=date_str)
     html = build_post_html(date_str, cfg.post, women_items, men_items, cfg.naver.sort)
+
+    save_preview(f"naver-fashion-{date_str}", title, html)
 
     if cfg.run.dry_run:
         print("[DRY_RUN] Posting skipped. HTML preview below:\n")
@@ -544,7 +544,7 @@ def run_daily(cfg: AppConfig) -> None:
         save_post_meta(cfg.storage.sqlite_path, date_str, wp_post_id, wp_link)
         print(f"OK(updated): {wp_post_id} {wp_link or old_link}")
     else:
-        wp_post_id, wp_link = wp_create_post(cfg.wordpress, title, html)
+        wp_post_id, wp_link = wp_create_post(cfg.wordpress, title, html, f"naver-fashion-{date_str}")
         save_post_meta(cfg.storage.sqlite_path, date_str, wp_post_id, wp_link)
         print(f"OK(created): {wp_post_id} {wp_link}")
 
@@ -596,3 +596,4 @@ if __name__ == "__main__":
         import traceback
         traceback.print_exc()
         raise
+

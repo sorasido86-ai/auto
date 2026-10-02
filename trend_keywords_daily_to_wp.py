@@ -34,6 +34,10 @@ from urllib.parse import quote
 
 import requests
 import xml.etree.ElementTree as ET
+from wp_common import write_post
+from content_quality import require_items, save_preview
+from wp_common import find_post
+
 
 KST = timezone(timedelta(hours=9))
 NAVER_DATALAB_ENDPOINT = "https://openapi.naver.com/v1/datalab/search"
@@ -147,15 +151,8 @@ def wp_auth_header(user: str, app_pass: str) -> Dict[str, str]:
 
 
 def wp_find_post_by_slug(wp: WPConfig, slug: str) -> Optional[Tuple[int, str]]:
-    url = f"{wp.base_url}/wp-json/wp/v2/posts"
-    r = requests.get(url, params={"slug": slug, "per_page": 1}, timeout=25)
-    if r.status_code != 200:
-        return None
-    arr = r.json()
-    if not arr:
-        return None
-    post = arr[0]
-    return int(post["id"]), str(post.get("link") or "")
+    post = find_post(wp.base_url.rstrip("/") + "/wp-json/wp/v2/posts", wp_auth_header(wp.user, wp.app_pass), slug)
+    return (int(post["id"]), str(post.get("link") or "")) if post else None
 
 
 def wp_create_post(wp: WPConfig, title: str, slug: str, html: str) -> Tuple[int, str]:
@@ -168,10 +165,7 @@ def wp_create_post(wp: WPConfig, title: str, slug: str, html: str) -> Tuple[int,
         "status": wp.status,
         "categories": [wp.category_id],
     }
-    r = requests.post(url, headers=headers, json=payload, timeout=35)
-    if r.status_code not in (200, 201):
-        raise RuntimeError(f"WP create failed: {r.status_code} body={r.text[:400]}")
-    data = r.json()
+    data = write_post(url, headers, payload)
     return int(data["id"]), str(data.get("link") or "")
 
 
@@ -185,10 +179,7 @@ def wp_update_post(wp: WPConfig, post_id: int, title: str, slug: str, html: str)
         "status": wp.status,
         "categories": [wp.category_id],
     }
-    r = requests.post(url, headers=headers, json=payload, timeout=35)
-    if r.status_code not in (200, 201):
-        raise RuntimeError(f"WP update failed: {r.status_code} body={r.text[:400]}")
-    data = r.json()
+    data = write_post(url, headers, payload)
     return int(data["id"]), str(data.get("link") or "")
 
 
@@ -248,7 +239,8 @@ def fetch_naver_datalab_rank(nc: NaverCfg, limit: int) -> List[Dict[str, Any]]:
 
     ranked: List[Dict[str, Any]] = []
     with requests.Session() as s:
-        for ch in chunks(pool, 5):
+        for ch in chunks(pool[1:], 4) if len(pool) > 1 else [[]]:
+            ch = [pool[0], *ch]
             payload = {
                 "startDate": start_s,
                 "endDate": end_s,
@@ -268,17 +260,25 @@ def fetch_naver_datalab_rank(nc: NaverCfg, limit: int) -> List[Dict[str, Any]]:
                 }]
 
             if r.status_code != 200:
-                return [{"note": f"네이버 DataLab 오류({r.status_code}). 응답: {r.text[:200]}"}]
+                return [{"note": "네이버 검색 관심도 자료를 가져오지 못했습니다."}]
 
             data = r.json()
             results = data.get("results", []) or []
+            anchor = next((res for res in results if res.get("title") == pool[0]), {})
+            anchor_peak = max([float(x.get("ratio", 0) or 0) for x in anchor.get("data", [])] + [0])
+            if anchor_peak <= 0:
+                return [{"note": "공통 기준 키워드의 데이터가 부족해 네이버 관심도 비교를 생략했습니다."}]
             for res in results:
+                if ch != [pool[0]] and res.get("title") == pool[0] and any(x["keyword"] == pool[0] for x in ranked):
+                    continue
                 kw = str(res.get("title") or "")
                 series = res.get("data", []) or []
-                if len(series) < 2:
+                daily = {x.get("period"): float(x.get("ratio", 0) or 0) for x in series}
+                previous_date = (end - timedelta(days=1)).strftime("%Y-%m-%d")
+                if end_s not in daily or previous_date not in daily:
                     continue
-                prev = float(series[-2].get("ratio", 0) or 0)
-                last = float(series[-1].get("ratio", 0) or 0)
+                prev = daily[previous_date] / anchor_peak * 100
+                last = daily[end_s] / anchor_peak * 100
                 ranked.append(
                     {
                         "keyword": kw,
@@ -359,15 +359,15 @@ def build_naver_table(items: List[Dict[str, Any]], 기준일: str) -> str:
         )
 
     return f"""
-    <h2>네이버 트렌드 TOP {len(items)}</h2>
-    <p style="font-size:13px;opacity:.75;margin-top:-6px;">기준일: <b>{esc(기준일)}</b> (DataLab 집계 기준)</p>
+    <h2>후보 키워드 관심도 상승순 {len(items)}개</h2>
+    <p style="font-size:13px;opacity:.75;margin-top:-6px;">기준일: <b>{esc(기준일)}</b> (DataLab 집계 기준). 공통 기준 키워드의 기간 내 최대 검색 관심도를 100으로 보정했습니다. 실제 검색 횟수는 아닙니다.</p>
     <table style="border-collapse:collapse;width:100%;font-size:14px;">
       <thead>
         <tr>
           <th style="padding:8px;border:1px solid #e5e5e5;">순위</th>
           <th style="padding:8px;border:1px solid #e5e5e5;">키워드</th>
-          <th style="padding:8px;border:1px solid #e5e5e5;">상승폭(Δ)</th>
-          <th style="padding:8px;border:1px solid #e5e5e5;">지수</th>
+          <th style="padding:8px;border:1px solid #e5e5e5;">보정 지수 변화</th>
+          <th style="padding:8px;border:1px solid #e5e5e5;">공통 기준 지수</th>
         </tr>
       </thead>
       <tbody>{''.join(rows)}</tbody>
@@ -378,7 +378,7 @@ def build_naver_table(items: List[Dict[str, Any]], 기준일: str) -> str:
 def build_post_html(date_str: str, slot_label: str, google_items: List[Dict[str, Any]], naver_items: List[Dict[str, Any]], naver_basis: str) -> str:
     disclosure = (
         '<p style="padding:10px;border-left:4px solid #111;background:#f7f7f7;">'
-        "※ 네이버는 NAVER_KEYWORD_POOL(후보 키워드 풀) 기반 DataLab 상대지수로 계산됩니다."
+        "※ 네이버는 미리 선정한 후보 키워드의 검색 관심도 변화를 비교합니다. 네이버 전체 실시간 검색어 순위가 아닙니다."
         "</p>"
     )
     head = f"<p>기준일: <b>{esc(date_str)}</b> / 구분: <b>{esc(slot_label)}</b></p>"
@@ -440,7 +440,10 @@ def main():
     naver_basis = (dt.date() - timedelta(days=1)).strftime("%Y-%m-%d")
     naver_items = fetch_naver_datalab_rank(naver, run.limit)
 
+    require_items(google_items or [x for x in naver_items if "keyword" in x], "검색 트렌드")
+    title = f"{date_str} {slot_label} 검색 관심도 | 구글 {len(google_items)}개·네이버 후보 비교"
     html = build_post_html(date_str, slot_label, google_items, naver_items, naver_basis)
+    save_preview(slug, title, html)
 
     if run.dry_run:
         print("[DRY_RUN] 아래 HTML을 WP에 올리지 않고 출력만 합니다.\n")
@@ -464,3 +467,4 @@ if __name__ == "__main__":
         import traceback
         traceback.print_exc()
         raise
+

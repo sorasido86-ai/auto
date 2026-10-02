@@ -1,74 +1,91 @@
 name: Hot Keyword -> Naver Shop -> WP (AM/PM)
-
-on:
+'on':
   workflow_dispatch:
+    inputs:
+      dry_run:
+        description: '1: HTML 미리보기만 생성 / 0: 게시'
+        type: choice
+        options:
+        - '1'
+        - '0'
+        default: '1'
+        required: false
   schedule:
-    - cron: "12 0 * * *"   # 09:12 KST
-    - cron: "12 6 * * *"   # 15:12 KST
-
+  - cron: 12 0 * * *
+  - cron: 12 6 * * *
 permissions:
   contents: read
-
 jobs:
   run:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Setup Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-
-      - name: Install deps
-        run: |
-          python -m pip install --upgrade pip
-          pip install requests
-
-      - name: Set RUN_SLOT (am/pm)
-        shell: bash
-        run: |
-          if [ "${{ github.event_name }}" = "schedule" ]; then
-            if [ "${{ github.event.schedule }}" = "5 0 * * *" ]; then
-              echo "RUN_SLOT=am" >> $GITHUB_ENV
-            else
-              echo "RUN_SLOT=pm" >> $GITHUB_ENV
-            fi
-          else
+    - name: Checkout
+      uses: actions/checkout@v4
+    - name: Setup Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.11'
+    - name: Install deps
+      run: |
+        python -m pip install --upgrade pip
+        python -m pip install -r requirements.txt
+        python -m compileall -q .
+        python -m unittest discover -s tests -v
+    - name: Restore history
+      uses: actions/cache/restore@v4
+      with:
+        path: data/hot_keyword_naver_shop.sqlite3
+        key: history-v2-${{ github.workflow }}-${{ github.ref_name }}-${{ github.run_id }}-${{ github.run_attempt }}
+        restore-keys: |
+          history-v2-${{ github.workflow }}-${{ github.ref_name }}-
+    - name: Set RUN_SLOT (am/pm)
+      shell: bash
+      run: |
+        if [ "${{ github.event_name }}" = "schedule" ]; then
+          if [ "${{ github.event.schedule }}" = "12 0 * * *" ]; then
             echo "RUN_SLOT=am" >> $GITHUB_ENV
+          else
+            echo "RUN_SLOT=pm" >> $GITHUB_ENV
           fi
-
-      - name: Cache sqlite
-        uses: actions/cache@v4
-        with:
-          path: data/hot_keyword_naver_shop.sqlite3
-          key: hotkw-${{ runner.os }}-${{ github.ref_name }}
-          restore-keys: |
-            hotkw-${{ runner.os }}-
-
-      - name: Run bot
-        env:
-          # ✅ 네이버 (이제 이 이름만 쓰면 됨)
-          NAVER_CLIENT_ID: ${{ secrets.NAVER_CLIENT_ID }}
-          NAVER_CLIENT_SECRET: ${{ secrets.NAVER_CLIENT_SECRET }}
-
-          # ✅ 워드프레스
-          WP_BASE_URL: ${{ secrets.WP_BASE_URL }}
-          WP_USER: ${{ secrets.WP_USER }}
-          WP_APP_PASS: ${{ secrets.WP_APP_PASS }}
-
-          # 옵션
-          RUN_SLOT: ${{ env.RUN_SLOT }}
-          WP_CATEGORY_IDS: "31"
-
-          HOT_KEYWORDS_LIMIT: "20"
-          NAVER_PER_KEYWORD: "5"
-          TRENDS_GEO: "KR"
-          NAVER_SORT: "sim"
-
-          DEBUG: "0"
-          DRY_RUN: "0"
-        run: |
-          ls -la
-          python hot_keyword_naver_shop_to_wp.py
+        else
+          echo "RUN_SLOT=am" >> $GITHUB_ENV
+        fi
+    - name: Run bot
+      env:
+        NAVER_CLIENT_ID: ${{ secrets.NAVER_CLIENT_ID }}
+        NAVER_CLIENT_SECRET: ${{ secrets.NAVER_CLIENT_SECRET }}
+        WP_BASE_URL: ${{ secrets.WP_BASE_URL }}
+        WP_USER: ${{ secrets.WP_USER }}
+        WP_APP_PASS: ${{ secrets.WP_APP_PASS }}
+        RUN_SLOT: ${{ env.RUN_SLOT }}
+        WP_CATEGORY_IDS: '31'
+        HOT_KEYWORDS_LIMIT: '20'
+        NAVER_PER_KEYWORD: '5'
+        TRENDS_GEO: KR
+        NAVER_SORT: sim
+        DEBUG: '0'
+      run: |
+        ls -la
+        python hot_keyword_naver_shop_to_wp.py
+    - name: Save history
+      if: ${{ success() && env.DRY_RUN != '1' }}
+      uses: actions/cache/save@v4
+      with:
+        path: data/hot_keyword_naver_shop.sqlite3
+        key: history-v2-${{ github.workflow }}-${{ github.ref_name }}-${{ github.run_id }}-${{ github.run_attempt }}
+    - name: Upload content preview
+      if: ${{ always() }}
+      uses: actions/upload-artifact@v4
+      with:
+        name: content-preview-hot_keyword_shop-${{ github.run_id }}
+        path: artifacts/*.html
+        if-no-files-found: ignore
+        retention-days: 14
+    timeout-minutes: 20
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+env:
+  TZ: Asia/Seoul
+  PYTHONUNBUFFERED: '1'
+  DRY_RUN: ${{ github.event.inputs.dry_run || '0' }}

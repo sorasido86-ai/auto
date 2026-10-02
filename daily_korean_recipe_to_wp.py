@@ -1,55 +1,11 @@
-# -*- coding: utf-8 -*-
-"""daily_korean_recipe_to_wp.py (홈피드형 1200자+ / 네이버 복붙 친화 / 타임아웃 강제)
-
-요약
-- 1순위: 식품안전나라(식약처) COOKRCP01 OpenAPI (MFDS_API_KEY 있으면)
-- 2순위: 내장 한식 레시피(폴백)
-- 글 구성: 도입부(200~300자 내외) + 굵은 소제목 3개 + 전체 1200자 이상
-- 말투: 친구에게 수다떠는 존댓말  마침표 없이  띄어쓰기와 여백으로 호흡
-- 특수문자/불릿(• ✅ 등) 제거
-- 이미지: MFDS 메인 이미지가 없으면
-  1) DEFAULT_THUMB_URL 있으면 그걸 사용
-  2) 없으면 AUTO_IMAGE=1일 때 Unsplash Source(원격 링크)로 임시 대체
-- "자동 생성"/"기준시각 슬롯"/"출처" 문구는 기본적으로 넣지 않음
-- 실행이 1시간씩 늘어지는 문제 방지:
-  - 네트워크 호출에 "하드 타임아웃"(signal) + requests timeout 동시 적용
-  - MFDS 호출 전체 예산(MFDS_BUDGET_SEC) 초과 시 즉시 폴백
-
-필수 환경변수
-- WP_BASE_URL, WP_USER, WP_APP_PASS
-
-권장 환경변수
-- MFDS_API_KEY (없으면 내장 레시피만)
-- DEFAULT_THUMB_URL (대표이미지 확실히 보이게 하려면 강력 추천)
-
-옵션
-- RUN_SLOT=day|am|pm (기본 day)
-- FORCE_NEW=0|1 (기본 0)
-- DRY_RUN=0|1 (기본 0)
-- DEBUG=0|1 (기본 0)
-- AVOID_REPEAT_DAYS=90 (기본 90)
-
-이미지
-- UPLOAD_THUMB=1 (기본 1)  : 원격 이미지를 WP 미디어로 업로드 시도
-- SET_FEATURED=1 (기본 1)  : 업로드 성공 시 featured_media 설정
-- EMBED_IMAGE_IN_BODY=1 (기본 1) : 본문 상단 이미지 1장 삽입
-- AUTO_IMAGE=1 (기본 1)     : DEFAULT_THUMB_URL 없고 MFDS 이미지도 없을 때 Unsplash Source 링크 생성
-
-태그
-- AUTO_TAGS=1 (기본 1) : 제목 토큰+기본 태그를 WP 태그로 자동 생성/연결(권한/속도 이슈 시 0)
-- TAG_NAMES="한식레시피,집밥,오늘뭐먹지" 같은 형태로 추가 가능
-
-SQLite
-- SQLITE_PATH=data/daily_korean_recipe.sqlite3
-
-"""
+"""식품안전나라 또는 기본 한식 레시피의 재료·조리 순서를 발행합니다.
+원문 계량·문장부호를 그대로 보존하고 임의 조리 팁·경험담을 추가하지 않습니다.
+DRY_RUN=1은 게시 없이 HTML을 저장합니다."""
 
 from __future__ import annotations
 
 import base64
 import hashlib
-import html
-import json
 import os
 import random
 import re
@@ -64,6 +20,9 @@ from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import quote
 
 import requests
+from content_quality import render_recipe, require_recipe, save_preview
+from wp_common import write_post, find_post
+
 
 KST = timezone(timedelta(hours=9))
 
@@ -526,10 +485,7 @@ def wp_create_post(cfg: WordPressConfig, title: str, slug: str, html_body: str, 
     if featured_media:
         payload["featured_media"] = featured_media
 
-    r = safe_post(url, headers=headers, json=payload, timeout=25, hard=35)
-    if r.status_code not in (200, 201):
-        raise RuntimeError(f"WP create failed: {r.status_code} body={r.text[:500]}")
-    data = r.json()
+    data = write_post(url, headers, payload)
     return int(data["id"]), str(data.get("link") or "")
 
 
@@ -544,10 +500,7 @@ def wp_update_post(cfg: WordPressConfig, post_id: int, title: str, html_body: st
     if featured_media:
         payload["featured_media"] = featured_media
 
-    r = safe_post(url, headers=headers, json=payload, timeout=25, hard=35)
-    if r.status_code not in (200, 201):
-        raise RuntimeError(f"WP update failed: {r.status_code} body={r.text[:500]}")
-    data = r.json()
+    data = write_post(url, headers, payload)
     return int(data["id"]), str(data.get("link") or "")
 
 
@@ -842,60 +795,6 @@ def get_recipe_by_id(cfg: AppConfig, source: str, recipe_id: str) -> Optional[Re
 # Text helpers (no bullets, no periods)
 # -----------------------------
 
-def _strip_tags(s: str) -> str:
-    return re.sub(r"<[^>]+>", "", s or "")
-
-
-def _text_len_html(s: str) -> int:
-    return len((_strip_tags(s) or "").replace("\n", "").replace("\r", "").replace("\t", ""))
-
-
-def _no_ai_symbols(s: str) -> str:
-    s = s or ""
-    s = s.replace("•", " ").replace("●", " ").replace("○", " ").replace("✅", " ").replace("✔", " ").replace("★", " ")
-    s = s.replace("※", " ").replace("-", " ")
-    s = re.sub(r"[\u2022\u25cf\u25cb\u2713\u2714]+", " ", s)
-    s = re.sub(r"\s+", " ", s).strip()
-    return s
-
-
-def _remove_period_like(s: str) -> str:
-    s = s or ""
-    for ch in [".", "!", "?", ";", ":", "…", "·"]:
-        s = s.replace(ch, " ")
-    s = re.sub(r"\s+", " ", s).strip()
-    return s
-
-
-def _sanitize_sentence(s: str) -> str:
-    return _remove_period_like(_no_ai_symbols(s))
-
-
-def _josa_eul_reul(word: str) -> str:
-    """목적격 조사(을/를) 선택"""
-    word = (word or "").strip()
-    if not word:
-        return "을"
-    last = word[-1]
-    if "가" <= last <= "힣":
-        code = ord(last) - 0xAC00
-        jong = code % 28
-        return "를" if jong == 0 else "을"
-    return "을"
-
-
-def _p(lines: List[str]) -> str:
-    out: List[str] = []
-    for ln in lines:
-        ln = _sanitize_sentence(ln)
-        if ln == "":
-            out.append("<p>&nbsp;</p>")
-            continue
-        if not ln:
-            continue
-        out.append(f"<p>{html.escape(ln)}</p>")
-    return "\n".join(out)
-
 
 def _seed_rng(seed: str) -> random.Random:
     h = hashlib.sha1(seed.encode("utf-8")).hexdigest()[:8]
@@ -907,16 +806,7 @@ def _seed_rng(seed: str) -> random.Random:
 # -----------------------------
 
 def build_post_title(date_str: str, slot_label: str, recipe_title: str, rng: random.Random) -> str:
-    hooks = [
-        "집에서 진짜 잘되는 포인트만 정리",
-        "실패 확률 줄이는 흐름 그대로",
-        "오늘 저녁 고민 끝내는 메뉴",
-        "재료 적어도 맛이 나는 방식",
-        "한 번 해두면 계속 쓰는 레시피",
-        "이 단계만 놓치면 맛이 확 달라져요",
-    ]
-    pick = rng.choice(hooks)
-    return _sanitize_sentence(f"{recipe_title} 레시피 {pick} {date_str} {slot_label}")
+    return f"{recipe_title} 레시피 | 재료와 만드는 순서"
 
 
 # -----------------------------
@@ -995,183 +885,14 @@ def ensure_media(cfg: AppConfig, image_url: str, stable_name: str) -> Tuple[int,
 # Body builder (homefeed)
 # -----------------------------
 
-def _compose_intro(recipe: Recipe, rng: random.Random, min_len: int, max_len: int) -> str:
-    title = recipe.title
-    base = [
-        f"오늘은 {title} 얘기 좀 해볼게요",
-        "요리 글 보면 다들 말은 쉬운데 막상 해보면 애매한 포인트가 있잖아요",
-        "저도 그게 싫어서 진짜 집에서 잘 되는 흐름으로만 정리했어요",
-        "시간 없을 때도 그대로 따라가면 맛이 나게끔 순서랑 간 타이밍을 맞춰놨어요",
-        "혹시 오늘 뭐 먹지 고민 중이면 이거 한 번만 따라가봐요",
-    ]
-    # 길이 맞추기
-    txt = " ".join([_sanitize_sentence(x) for x in base])
-    if len(txt) < min_len:
-        extra = [
-            "대충 만들어도 되는 메뉴 같지만 은근히 불 조절 하나로 맛이 갈려요",
-            "그래서 제가 자주 하는 실수도 같이 적어둘게요",
-        ]
-        txt = txt + " " + _sanitize_sentence(rng.choice(extra))
-
-    txt = txt.strip()
-    if len(txt) > max_len:
-        txt = txt[:max_len].rstrip()
-    return txt
-
-
-def _recipe_list_block(recipe: Recipe) -> str:
-    # 사용자가 말한 "레시피 목록" -> 재료 목록 + 만드는 순서 목록
-    lines: List[str] = []
-    lines.append("재료 목록")
-    if recipe.ingredients:
-        for x in recipe.ingredients[:30]:
-            lines.append(f"{x}")
-    else:
-        lines.append("집에 있는 재료로도 가능해요")
-
-    lines.append("")
-    lines.append("만드는 순서")
-    if recipe.steps:
-        ords = [
-            "첫째", "둘째", "셋째", "넷째", "다섯째", "여섯째", "일곱째", "여덟째", "아홉째", "열째",
-            "열한째", "열둘째", "열셋째", "열넷째", "열다섯째", "열여섯째", "열일곱째", "열여덟째", "열아홉째", "스무째",
-        ]
-        for i, s in enumerate(recipe.steps[:25], start=1):
-            prefix = ords[i-1] if (i-1) < len(ords) else f"{i}번째"
-            lines.append(f"{prefix} {s}")
-    else:
-        lines.append("과정은 간단하게 끓이고 간 맞추면 끝이에요")
-
-    # 헤더는 굵게 처리
-    out: List[str] = []
-    for ln in lines:
-        if ln in ("재료 목록", "만드는 순서"):
-            out.append(f"<p><b>{html.escape(ln)}</b></p>")
-        elif ln == "":
-            out.append("<p>&nbsp;</p>")
-        else:
-            out.append(f"<p>{html.escape(_sanitize_sentence(ln))}</p>")
-    return "\n".join(out)
-
-
-def _section1(recipe: Recipe, rng: random.Random) -> List[str]:
-    t = recipe.title
-    return [
-        f"{t} 할 때 제가 제일 신경 쓰는 건 시작 5분이에요",
-        "처음에 불을 너무 세게 하면 향이 먼저 날아가고 나중에 간을 잡아도 밍밍해지더라고요",
-        "그래서 저는 중불로 시작해서 재료가 숨이 죽을 때까지 기다리는 편이에요",
-        "그리고 간은 중간에 확 넣기보단 마지막에 한 번만 조절하는 게 결과가 안정적이었어요",
-        "재료가 조금 부족해도 괜찮아요",
-        "대신 지금 있는 재료로 뭘 살릴지 한 가지 포인트만 잡아보면 맛이 확 달라져요",
-        "예를 들면 국물은 육수 쪽  볶음은 불향 쪽  조림은 농도 쪽 이런 느낌이요",
-        "저는 오늘은 실패 확률 줄이는 흐름으로만 적어둘게요",
-    ]
-
-
-def _section2(recipe: Recipe, rng: random.Random) -> List[str]:
-    return [
-        "재료는 목록 그대로 준비하면 제일 편해요",
-        "근데 솔직히 집밥은 늘 딱 맞게 준비하기 어렵잖아요",
-        "그래서 저는 대체 기준을 이렇게 잡아요",
-        "양파나 대파 같은 향채는 있으면 넣고 없으면 마늘 타이밍을 조금 늦춰요",
-        "두부나 버섯 같은 부재료는 식감용이라서 취향대로 빼도 괜찮아요",
-        "대신 간장 소금 된장 고추장 같은 핵심 간 재료는 마지막에 조금씩 추가하는 방식으로 가요",
-        "그리고 손질은 너무 완벽하게 하려고 하면 지쳐요",
-        "대충 같은 크기로만 맞춰도 익는 속도가 비슷해져서 결과가 좋아요",
-        "이렇게만 해도 집에서 먹는 맛이 훨씬 안정적이에요",
-    ]
-
-
-def _section3(recipe: Recipe, rng: random.Random) -> List[str]:
-    return [
-        "이제 만드는 순서를 그대로 따라가면 되는데요",
-        "저는 한 가지를 꼭 해요",
-        "중간에 맛을 볼 때 간을 확 올리지 않고  물이나 육수 양을 먼저 조절해요",
-        "그래야 짜지지 않고  마지막에 딱 맞추기 쉬워요",
-        "그리고 불 조절은 중불에서 시작해서  끓거나 볶이는 느낌이 잡히면 약불로 내려요",
-        "이게 진짜 체감이 큰데  같은 재료로도 맛이 훨씬 부드럽게 나와요",
-        "응용은 간단해요",
-        "칼칼하게 가고 싶으면 고춧가루를 마지막에 아주 조금만 추가하고  단맛은 올리고당을 소량만 써요",
-        "마지막으로 남은 건 냉장 보관했다가 데울 때  한 번 끓이고 간을 다시 마지막에만 보시면 돼요",
-        "이렇게 하면 다음날 먹어도 맛이 크게 안 무너져요",
-    ]
-
 
 def build_body_html(cfg: AppConfig, recipe: Recipe, display_img_url: str, rng: random.Random) -> Tuple[str, str]:
-    # 도입부
-    intro = _compose_intro(recipe, rng, cfg.content.intro_min, cfg.content.intro_max)
-
-    # 3섹션 + 레시피 목록
-    s1 = _section1(recipe, rng)
-    s2 = _section2(recipe, rng)
-    s3 = _section3(recipe, rng)
-
-    # 레시피 목록(재료/순서)
-    recipe_list = _recipe_list_block(recipe)
-
-    # 태그(본문 하단에 해시태그 형태)
-    tag_names = build_tag_names(recipe.title, cfg.tags.tag_names)
-    def _to_hash(t: str) -> str:
-        return "#" + re.sub(r"\s+", "", t or "").strip()
-    hashtags = " ".join([_to_hash(t) for t in tag_names[:12] if t])
-
-    # 이미지(상단 1장)
-    img_html = ""
-    if cfg.img.embed_image_in_body and display_img_url:
-        img_html = f"<p><img src=\"{html.escape(display_img_url)}\" alt=\"{html.escape(recipe.title)}\"/></p>"
-
-    # 굵은 소제목 3개
-    obj = _josa_eul_reul(recipe.title)
-    h1 = f"<p><b>{html.escape(_sanitize_sentence('오늘 ' + recipe.title + obj + ' 추천하는 이유'))}</b></p>"
-    h2 = f"<p><b>{html.escape(_sanitize_sentence('재료 준비하면서 제가 꼭 지키는 기준'))}</b></p>"
-    h3 = f"<p><b>{html.escape(_sanitize_sentence('만드는 흐름과 실패 줄이는 포인트'))}</b></p>"
-
-    # 본문 조립
-    blocks: List[str] = []
-    blocks.append(_p([intro]))
-    blocks.append("<p>&nbsp;</p>")
-    if img_html:
-        blocks.append(img_html)
-        blocks.append("<p>&nbsp;</p>")
-
-    blocks.append(h1)
-    blocks.append(_p(s1))
-    blocks.append("<p>&nbsp;</p>")
-
-    blocks.append(h2)
-    blocks.append(_p(s2))
-    blocks.append("<p>&nbsp;</p>")
-
-    blocks.append(h3)
-    blocks.append(_p(s3))
-    blocks.append("<p>&nbsp;</p>")
-
-    # 레시피 목록
-    blocks.append(f"<p><b>{html.escape(_sanitize_sentence('레시피 목록'))}</b></p>")
-    blocks.append(recipe_list)
-
-    blocks.append("<p>&nbsp;</p>")
-    blocks.append(_p(["저는 이렇게 해먹는 편인데요  혹시 {0}는 어떤 재료를 추가하는 편이세요  댓글로 추천해주시면 다음 글에도 반영해볼게요".format(recipe.title)]))
-
-    if hashtags:
-        blocks.append("<p>&nbsp;</p>")
-        blocks.append(_p([hashtags]))
-
-    body = "\n".join(blocks)
-
-    # 길이 부족하면 섹션3 보강
-    if _text_len_html(body) < cfg.content.body_min:
-        extra = [
-            "그리고 남은 재료가 애매하면 반찬처럼 곁들이는 쪽으로 돌리는 것도 좋아요",
-            "계란이나 김 같은 건 진짜 실패를 줄여줘요",
-            "맛이 조금 약하면 간을 올리기 전에 먼저 한 번 더 끓여보는 게 도움이 되더라고요",
-            "저는 이 방식이 제일 마음이 편했어요",
-        ]
-        while _text_len_html(body) < cfg.content.body_min and extra:
-            body += "\n" + _p([extra.pop(0)])
-
-    excerpt = f"{recipe.title} 레시피  집에서 잘되는 흐름으로만 정리했어요"[:140]
-    return body, excerpt
+    require_recipe(recipe.ingredients, recipe.steps)
+    intro = f"{recipe.title}의 재료와 조리 순서를 정리했습니다. 아래 계량과 단계는 레시피 원문을 기준으로 안내합니다."
+    article = {"title": recipe.title, "intro": intro, "ingredients": recipe.ingredients, "steps": recipe.steps}
+    source = "https://www.foodsafetykorea.go.kr/" if recipe.source == "mfds" else ""
+    label = f"식품안전나라 공개 레시피 (레시피 번호 {recipe.recipe_id})" if recipe.source == "mfds" else "저장소 기본 레시피"
+    return render_recipe(article, source, label, display_img_url if cfg.img.embed_image_in_body else ""), intro
 
 
 # -----------------------------
@@ -1188,6 +909,12 @@ def run(cfg: AppConfig) -> None:
     init_db(cfg.sqlite_path)
 
     today_meta = get_today_post(cfg.sqlite_path, date_slot)
+    if not cfg.run.dry_run and not cfg.run.force_new:
+        endpoint = cfg.wp.base_url.rstrip("/") + "/wp-json/wp/v2/posts"
+        existing = find_post(endpoint, wp_auth_header(cfg.wp.user, cfg.wp.app_pass), f"korean-recipe-{date_str}-{slot}")
+        if existing:
+            print("SKIP(already posted):", existing["id"])
+            return
     recent_pairs = get_recent_recipe_ids(cfg.sqlite_path, cfg.run.avoid_repeat_days)
 
     rng = _seed_rng(date_slot)
@@ -1245,6 +972,8 @@ def run(cfg: AppConfig) -> None:
 
     body_html, excerpt = build_body_html(cfg, chosen, display_img_url, rng)
 
+    save_preview(slug, title, body_html)
+
     if cfg.run.dry_run:
         print("[DRY_RUN] 발행 생략  HTML 일부")
         print(body_html[:2000])
@@ -1258,20 +987,12 @@ def run(cfg: AppConfig) -> None:
     wp_link = ""
 
     print("[WP] publishing...")
-    try:
-        if today_meta and today_meta.get("wp_post_id"):
-            post_id = int(today_meta["wp_post_id"])
-            wp_post_id, wp_link = wp_update_post(cfg.wp, post_id, title, body_html, excerpt, tag_ids, featured_media=featured_id)
-            print("OK(updated):", wp_post_id, wp_link)
-        else:
-            wp_post_id, wp_link = wp_create_post(cfg.wp, title, slug, body_html, excerpt, tag_ids, featured_media=featured_id)
-            print("OK(created):", wp_post_id, wp_link)
-    except Exception as e:
-        # 업데이트 실패 등 -> 새로 생성
-        if cfg.run.debug:
-            print("[WARN] post create/update failed, fallback to create:", repr(e))
+    if today_meta and today_meta.get("wp_post_id"):
+        wp_post_id, wp_link = wp_update_post(cfg.wp, int(today_meta["wp_post_id"]), title, body_html, excerpt, tag_ids, featured_media=featured_id)
+        print("OK(updated):", wp_post_id, wp_link)
+    else:
         wp_post_id, wp_link = wp_create_post(cfg.wp, title, slug, body_html, excerpt, tag_ids, featured_media=featured_id)
-        print("OK(created-fallback):", wp_post_id, wp_link)
+        print("OK(created):", wp_post_id, wp_link)
 
     save_post_meta(
         cfg.sqlite_path,
@@ -1304,3 +1025,4 @@ if __name__ == "__main__":
 
         traceback.print_exc()
         sys.exit(1)
+

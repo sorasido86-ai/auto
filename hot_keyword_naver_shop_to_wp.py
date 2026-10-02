@@ -34,6 +34,9 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import requests
+from wp_common import write_post
+from content_quality import require_items, save_preview
+
 
 KST = timezone(timedelta(hours=9))
 NAVER_SHOP_ENDPOINT = "https://openapi.naver.com/v1/search/shop.json"
@@ -252,12 +255,12 @@ def get_existing_post(db_path: str, date_str: str, slot: str) -> Optional[Tuple[
     return int(row[0]), str(row[1] or "")
 
 
-def get_prev_traffic(db_path: str, prev_date: str, keyword: str) -> Optional[int]:
+def get_prev_traffic(db_path: str, prev_date: str, keyword: str, slot: str) -> Optional[int]:
     con = sqlite3.connect(db_path)
     cur = con.cursor()
     cur.execute(
-        "SELECT traffic_int FROM keywords WHERE date=? AND keyword=? ORDER BY traffic_int DESC LIMIT 1",
-        (prev_date, keyword),
+        "SELECT traffic_int FROM keywords WHERE date=? AND keyword=? AND slot=? LIMIT 1",
+        (prev_date, keyword, slot),
     )
     row = cur.fetchone()
     con.close()
@@ -462,20 +465,18 @@ def wp_auth_header(user: str, app_pass: str) -> Dict[str, str]:
     return {"Authorization": f"Basic {token}", "User-Agent": "hotkw/1.0"}
 
 
-def wp_create_post(cfg: WPCfg, title: str, html: str) -> Tuple[int, str]:
+def wp_create_post(cfg: WPCfg, title: str, html: str, slug: str) -> Tuple[int, str]:
     url = cfg.base_url.rstrip("/") + "/wp-json/wp/v2/posts"
     headers = {**wp_auth_header(cfg.user, cfg.app_pass), "Content-Type": "application/json"}
     payload: Dict[str, Any] = {
         "title": title,
+        "slug": slug,
         "content": html,
         "status": cfg.status,
         "categories": cfg.category_ids,
     }
-    r = requests.post(url, headers=headers, json=payload, timeout=30)
-    if r.status_code not in (200, 201):
-        raise RuntimeError(f"WP create failed: {r.status_code} body={r.text[:300]}")
-    j = r.json()
-    return int(j["id"]), str(j.get("link") or "")
+    data = write_post(url, headers, payload)
+    return int(data["id"]), str(data.get("link") or "")
 
 
 def wp_update_post(cfg: WPCfg, post_id: int, title: str, html: str) -> Tuple[int, str]:
@@ -487,11 +488,8 @@ def wp_update_post(cfg: WPCfg, post_id: int, title: str, html: str) -> Tuple[int
         "status": cfg.status,
         "categories": cfg.category_ids,
     }
-    r = requests.post(url, headers=headers, json=payload, timeout=30)
-    if r.status_code not in (200, 201):
-        raise RuntimeError(f"WP update failed: {r.status_code} body={r.text[:300]}")
-    j = r.json()
-    return int(j["id"]), str(j.get("link") or "")
+    data = write_post(url, headers, payload)
+    return int(data["id"]), str(data.get("link") or "")
 
 
 # -----------------------------
@@ -602,14 +600,14 @@ def build_products_table(keyword: str, items: List[Dict[str, Any]]) -> str:
         )
 
     return f"""
-    <h3 style="margin-top:18px;">{htmlmod.escape(keyword)} → 네이버 쇼핑 추천 TOP {len(items)}</h3>
+    <h3 style="margin-top:18px;">{htmlmod.escape(keyword)} → 네이버 쇼핑 검색 결과 {len(items)}개</h3>
     <table style="border-collapse:collapse;width:100%;font-size:14px;">
       <thead>
         <tr>
           <th style="padding:8px;border:1px solid #e5e5e5;">순위</th>
           <th style="padding:8px;border:1px solid #e5e5e5;">이미지</th>
           <th style="padding:8px;border:1px solid #e5e5e5;">상품</th>
-          <th style="padding:8px;border:1px solid #e5e5e5;">최저가</th>
+          <th style="padding:8px;border:1px solid #e5e5e5;">검색 최저가</th>
         </tr>
       </thead>
       <tbody>
@@ -623,13 +621,13 @@ def build_post_html(date_str: str, slot: str, geo: str, items: List[Dict[str, An
     slot_label = "오전" if slot == "am" else "오후"
     disclosure = (
         '<p style="padding:10px;border-left:4px solid #111;background:#f7f7f7;">'
-        "※ 이 포스팅은 자료모으는 용도입니다."
+        "검색 결과의 가격과 판매처를 비교하기 위한 자료입니다. 배송비·옵션·판매 상태는 판매 페이지에서 확인하세요."
         "</p>"
     )
     head = f"<p>기준일: <b>{htmlmod.escape(date_str)}</b> / 슬롯: <b>{slot_label}</b> / 지역: <b>{htmlmod.escape(geo)}</b></p>"
-    note = '<p style="font-size:13px;opacity:.8;">키워드 출처: Google Trends. 상품 출처: 네이버 쇼핑 검색 API.</p>'
+    note = '<p style="font-size:13px;opacity:.8;">키워드 출처: Google Trends. 상품 출처: 네이버 쇼핑 검색 API. 검색 정렬 결과이며 판매량·품질 순위를 의미하지 않습니다.</p>'
 
-    parts = [disclosure, head, note, build_overview(items), "<hr/>", "<h2>키워드별 추천 상품</h2>"]
+    parts = [disclosure, head, note, build_overview(items), "<hr/>", "<h2>키워드별 쇼핑 검색 결과</h2>"]
     for it in items:
         kw = str(it.get("keyword", ""))
         parts.append(build_products_table(kw, kw_to_products.get(kw, [])))
@@ -647,9 +645,11 @@ def run(cfg: AppCfg) -> None:
 
     hot = fetch_google_hot_keywords(cfg.google.geo, cfg.google.limit, cfg.google.timeout, cfg.debug)
 
+    require_items(hot, "트렌드 키워드")
+
     prev_date = (now_kst - timedelta(days=1)).strftime("%Y-%m-%d")
     for it in hot:
-        prev = get_prev_traffic(cfg.sqlite_path, prev_date, str(it.get("keyword", "")))
+        prev = get_prev_traffic(cfg.sqlite_path, prev_date, str(it.get("keyword", "")), cfg.slot)
         it["change"] = pct_change(int(it.get("traffic_int", 0) or 0), prev)
 
     upsert_keywords(cfg.sqlite_path, date_str, cfg.slot, hot)
@@ -666,8 +666,10 @@ def run(cfg: AppCfg) -> None:
             kw_to_products[kw] = items
             time.sleep(cfg.naver.throttle)
 
-    title = f"{date_str} {'오전' if cfg.slot=='am' else '오후'} 핫 키워드 → 네이버 쇼핑 추천 TOP상품"
+    title = f"{date_str} {'오전' if cfg.slot=='am' else '오후'} 핫 키워드와 쇼핑 검색 결과"
     html = build_post_html(date_str, cfg.slot, cfg.google.geo, hot, kw_to_products)
+
+    save_preview(f"hot-keyword-shop-{date_str}-{cfg.slot}", title, html)
 
     if cfg.dry_run:
         print("[DRY_RUN] 발행 생략. 미리보기(앞 2000자):")
@@ -681,7 +683,7 @@ def run(cfg: AppCfg) -> None:
         save_post_meta(cfg.sqlite_path, date_str, cfg.slot, wp_post_id, wp_link or old_link)
         print("OK(updated):", wp_post_id, wp_link or old_link)
     else:
-        wp_post_id, wp_link = wp_create_post(cfg.wp, title, html)
+        wp_post_id, wp_link = wp_create_post(cfg.wp, title, html, f"hot-keyword-shop-{date_str}-{cfg.slot}")
         save_post_meta(cfg.sqlite_path, date_str, cfg.slot, wp_post_id, wp_link)
         print("OK(created):", wp_post_id, wp_link)
 
@@ -731,3 +733,4 @@ if __name__ == "__main__":
 
         traceback.print_exc()
         raise
+

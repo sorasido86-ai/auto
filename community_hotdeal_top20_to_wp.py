@@ -46,6 +46,8 @@ from urllib.parse import urljoin
 import requests
 import feedparser
 from bs4 import BeautifulSoup
+from wp_common import write_post
+from content_quality import require_items, save_preview
 
 
 KST = timezone(timedelta(hours=9))
@@ -267,10 +269,7 @@ def wp_create_post(cfg: WordPressConfig, title: str, slug: str, html: str) -> Tu
     if cfg.tag_ids:
         payload["tags"] = cfg.tag_ids
 
-    r = requests.post(url, headers=headers, json=payload, timeout=25)
-    if r.status_code not in (200, 201):
-        raise RuntimeError(f"WP create failed: {r.status_code} body={r.text[:500]}")
-    data = r.json()
+    data = write_post(url, headers, payload)
     return int(data["id"]), str(data.get("link") or "")
 
 
@@ -287,10 +286,7 @@ def wp_update_post(cfg: WordPressConfig, post_id: int, title: str, html: str) ->
     if cfg.tag_ids:
         payload["tags"] = cfg.tag_ids
 
-    r = requests.post(url, headers=headers, json=payload, timeout=25)
-    if r.status_code not in (200, 201):
-        raise RuntimeError(f"WP update failed: {r.status_code} body={r.text[:500]}")
-    data = r.json()
+    data = write_post(url, headers, payload)
     return int(data["id"]), str(data.get("link") or "")
 
 
@@ -670,7 +666,9 @@ def publish_one_slot(cfg: AppConfig, slot: str, now: datetime, deals: List[Deal]
 
     title = f"{date_str} 커뮤니티 핫딜 TOP{len(deals)} ({slot_label})"
     slug = f"community-hotdeal-{date_str}-{slot}"
+    require_items(deals, "핫딜")
     html = build_html(slot_label, now, deals)
+    save_preview(slug, title, html)
 
     if cfg.run.dry_run:
         print(f"[DRY_RUN] 슬롯={slot_label} 발행 생략. 미리보기 HTML ↓\n")
@@ -721,3 +719,4 @@ if __name__ == "__main__":
         import traceback
         traceback.print_exc()
         raise
+

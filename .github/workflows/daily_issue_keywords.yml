@@ -1,97 +1,107 @@
 name: daily_issue_keywords
-
-on:
+'on':
   workflow_dispatch:
+    inputs:
+      dry_run:
+        description: '1: HTML 미리보기만 생성 / 0: 게시'
+        type: choice
+        options:
+        - '1'
+        - '0'
+        default: '1'
+        required: false
   schedule:
-    # KST 기준 오전 9시 / 오후 6시
-    # GitHub Actions는 UTC로 돌아감
-    # 09:07 KST = 00:07 UTC
-    # 18:07 KST = 09:07 UTC
-    - cron: "7 0 * * *"
-    - cron: "7 9 * * *"
-
+  - cron: 7 0 * * *
+  - cron: 7 9 * * *
 jobs:
   post:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
-
+    timeout-minutes: 20
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+    - name: Checkout
+      uses: actions/checkout@v4
+    - name: Setup Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.11'
+    - name: Install deps
+      run: |
+        python -m pip install --upgrade pip
+        python -m pip install -r requirements.txt
+        python -m compileall -q .
+        python -m unittest discover -s tests -v
+    - name: Restore history
+      uses: actions/cache/restore@v4
+      with:
+        path: data/issue_trends.sqlite3
+        key: history-v2-${{ github.workflow }}-${{ github.ref_name }}-${{ github.run_id }}-${{ github.run_attempt }}
+        restore-keys: |
+          history-v2-${{ github.workflow }}-${{ github.ref_name }}-
+    - name: Decide AM/PM slot (KST)
+      id: slot
+      shell: bash
+      run: |
+        HOUR=$(TZ=Asia/Seoul date +%H)
+        if [ "$HOUR" -lt 12 ]; then
+          echo "RUN_SLOT=am" >> $GITHUB_ENV
+        else
+          echo "RUN_SLOT=pm" >> $GITHUB_ENV
+        fi
+        echo "KST time: $(TZ=Asia/Seoul date)"
+        echo "RUN_SLOT=$RUN_SLOT"
+    - name: Run bot (unbuffered)
+      shell: bash
+      env:
+        WP_BASE_URL: ${{ secrets.WP_BASE_URL }}
+        WP_USER: ${{ secrets.WP_USER }}
+        WP_APP_PASS: ${{ secrets.WP_APP_PASS }}
+        WP_STATUS: publish
+        WP_CATEGORY_IDS: '4'
+        LIMIT: '50'
+        EXAMPLE_LINKS: '5'
+        TREND_LIMIT: '20'
+        WINDOW_HOURS: '12'
+        FEEDS_MAX: '100'
+        FEED_TIMEOUT: '8'
+        MAX_WORKERS: '20'
+        SQLITE_PATH: data/issue_trends.sqlite3
+        DEBUG: '1'
+      run: |
+        set -e
+        echo "RUN_SLOT=${RUN_SLOT}"
+        echo "UTC: $(date)"
+        echo "KST: $(TZ=Asia/Seoul date)"
 
-      - name: Setup Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
+        TARGET=$(find . -maxdepth 5 -type f -name "daily_issue_keywords_to_wp.py" | head -n 1)
+        if [ -z "$TARGET" ]; then
+          echo "ERROR: daily_issue_keywords_to_wp.py 파일을 레포에서 찾을 수 없습니다."
+          echo "repo 내 .py 목록:"
+          find . -maxdepth 5 -type f -name "*.py" -print
+          exit 1
+        fi
 
-      - name: Install deps
-        run: |
-          python -m pip install --upgrade pip
-          pip install requests feedparser
-
-      # ✅ 전날 대비를 위해 SQLite 파일 캐시(저장/복원)
-      - name: Cache sqlite (day-over-day)
-        uses: actions/cache@v4
-        with:
-          path: data/issue_trends.sqlite3
-          key: issue-trends-db-${{ runner.os }}-${{ github.run_number }}
-          restore-keys: |
-            issue-trends-db-${{ runner.os }}-
-
-      # ✅ 오전/오후 슬롯 자동 결정 (KST 기준)
-      - name: Decide AM/PM slot (KST)
-        id: slot
-        shell: bash
-        run: |
-          HOUR=$(TZ=Asia/Seoul date +%H)
-          if [ "$HOUR" -lt 12 ]; then
-            echo "RUN_SLOT=am" >> $GITHUB_ENV
-          else
-            echo "RUN_SLOT=pm" >> $GITHUB_ENV
-          fi
-          echo "KST time: $(TZ=Asia/Seoul date)"
-          echo "RUN_SLOT=$RUN_SLOT"
-
-      # ✅ 스크립트 파일 위치 실수 방지: 레포에서 찾아서 실행
-      - name: Run bot (unbuffered)
-        shell: bash
-        env:
-          # --- WordPress Secrets ---
-          WP_BASE_URL: ${{ secrets.WP_BASE_URL }}
-          WP_USER: ${{ secrets.WP_USER }}
-          WP_APP_PASS: ${{ secrets.WP_APP_PASS }}
-
-          # --- Posting options ---
-          WP_STATUS: "publish"
-          WP_CATEGORY_IDS: "4"
-
-          # --- Bot options (요청 반영) ---
-          LIMIT: "50"
-          EXAMPLE_LINKS: "5"
-          TREND_LIMIT: "20"
-          WINDOW_HOURS: "12"
-          FEEDS_MAX: "100"
-          FEED_TIMEOUT: "8"
-          MAX_WORKERS: "20"
-
-          # --- Storage (캐시 대상) ---
-          SQLITE_PATH: "data/issue_trends.sqlite3"
-
-          # --- Debug ---
-          DEBUG: "1"
-        run: |
-          set -e
-          echo "RUN_SLOT=${RUN_SLOT}"
-          echo "UTC: $(date)"
-          echo "KST: $(TZ=Asia/Seoul date)"
-
-          TARGET=$(find . -maxdepth 5 -type f -name "daily_issue_keywords_to_wp.py" | head -n 1)
-          if [ -z "$TARGET" ]; then
-            echo "ERROR: daily_issue_keywords_to_wp.py 파일을 레포에서 찾을 수 없습니다."
-            echo "repo 내 .py 목록:"
-            find . -maxdepth 5 -type f -name "*.py" -print
-            exit 1
-          fi
-
-          echo "Found: $TARGET"
-          python -u "$TARGET" --slot "${RUN_SLOT}"
+        echo "Found: $TARGET"
+        python -u "$TARGET" --slot "${RUN_SLOT}"
+    - name: Save history
+      if: ${{ success() && env.DRY_RUN != '1' }}
+      uses: actions/cache/save@v4
+      with:
+        path: data/issue_trends.sqlite3
+        key: history-v2-${{ github.workflow }}-${{ github.ref_name }}-${{ github.run_id }}-${{ github.run_attempt }}
+    - name: Upload content preview
+      if: ${{ always() }}
+      uses: actions/upload-artifact@v4
+      with:
+        name: content-preview-daily_issue_keywords-${{ github.run_id }}
+        path: artifacts/*.html
+        if-no-files-found: ignore
+        retention-days: 14
+permissions:
+  contents: read
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+env:
+  TZ: Asia/Seoul
+  PYTHONUNBUFFERED: '1'
+  DRY_RUN: ${{ github.event.inputs.dry_run || '0' }}

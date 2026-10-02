@@ -1,67 +1,82 @@
 name: run-daily-post
-
-on:
+'on':
   workflow_dispatch:
+    inputs:
+      dry_run:
+        description: '1: HTML 미리보기만 생성 / 0: 게시'
+        type: choice
+        options:
+        - '1'
+        - '0'
+        default: '1'
+        required: false
   schedule:
-    # GitHub Actions cron은 UTC 기준
-    # 09:18 KST = 00:18 UTC
-    - cron: "18 0 * * *"
-
+  - cron: 18 0 * * *
 jobs:
   post:
     runs-on: ubuntu-latest
-
-    concurrency:
-      group: run-daily-post
-      cancel-in-progress: true
-
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+    - name: Checkout
+      uses: actions/checkout@v4
+    - name: Setup Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.11'
+    - name: Install deps
+      run: |
+        python -m pip install --upgrade pip
+        python -m pip install -r requirements.txt
+        python -m compileall -q .
+        python -m unittest discover -s tests -v
+    - name: Create bot_config.json from Secrets
+      env:
+        WP_BASE_URL: ${{ secrets.WP_BASE_URL }}
+        WP_USER: ${{ secrets.WP_USER }}
+        WP_APP_PASS: ${{ secrets.WP_APP_PASS }}
+        KAKAO_REST_KEY: ${{ secrets.KAKAO_REST_KEY }}
+        KAKAO_REFRESH_TOKEN: ${{ secrets.KAKAO_REFRESH_TOKEN }}
+      run: |
+        python - <<'PY'
+        import os, json, sys
+        required = ["WP_BASE_URL", "WP_USER", "WP_APP_PASS"]
+        missing = [k for k in required if not os.getenv(k)]
+        if missing:
+          sys.exit("Missing secrets: " + ", ".join(missing))
 
-      - name: Setup Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
+        cfg = {
+          "wp_base_url": os.environ["WP_BASE_URL"].rstrip("/"),
+          "wp_user": os.environ["WP_USER"],
+          "wp_app_pass": os.environ["WP_APP_PASS"],
+        }
 
-      - name: Install deps
-        run: |
-          python -m pip install --upgrade pip
-          pip install requests beautifulsoup4 lxml feedparser
+        if os.getenv("KAKAO_REST_KEY") and os.getenv("KAKAO_REFRESH_TOKEN"):
+          cfg["kakao_rest_key"] = os.environ["KAKAO_REST_KEY"]
+          cfg["kakao_refresh_token"] = os.environ["KAKAO_REFRESH_TOKEN"]
 
-      - name: Create bot_config.json from Secrets
-        env:
-          WP_BASE_URL: ${{ secrets.WP_BASE_URL }}
-          WP_USER: ${{ secrets.WP_USER }}
-          WP_APP_PASS: ${{ secrets.WP_APP_PASS }}
-          # 선택(안쓰면 비워두기)
-          KAKAO_REST_KEY: ${{ secrets.KAKAO_REST_KEY }}
-          KAKAO_REFRESH_TOKEN: ${{ secrets.KAKAO_REFRESH_TOKEN }}
-        run: |
-          python - <<'PY'
-          import os, json, sys
-          required = ["WP_BASE_URL", "WP_USER", "WP_APP_PASS"]
-          missing = [k for k in required if not os.getenv(k)]
-          if missing:
-            sys.exit("Missing secrets: " + ", ".join(missing))
-
-          cfg = {
-            "wp_base_url": os.environ["WP_BASE_URL"].rstrip("/"),
-            "wp_user": os.environ["WP_USER"],
-            "wp_app_pass": os.environ["WP_APP_PASS"],
-          }
-
-          if os.getenv("KAKAO_REST_KEY") and os.getenv("KAKAO_REFRESH_TOKEN"):
-            cfg["kakao_rest_key"] = os.environ["KAKAO_REST_KEY"]
-            cfg["kakao_refresh_token"] = os.environ["KAKAO_REFRESH_TOKEN"]
-
-          with open("bot_config.json","w",encoding="utf-8") as f:
-            json.dump(cfg,f,ensure_ascii=False,indent=2)
-          print("bot_config.json written")
-          PY
-
-      - name: Run
-        env:
-          TZ: Asia/Seoul
-          TEST_MODE: "0"
-        run: python -u daily_post.py
+        with open("bot_config.json","w",encoding="utf-8") as f:
+          json.dump(cfg,f,ensure_ascii=False,indent=2)
+        print("bot_config.json written")
+        PY
+    - name: Run
+      env:
+        TZ: Asia/Seoul
+        TEST_MODE: '0'
+      run: python -u daily_post.py
+    - name: Upload content preview
+      if: ${{ always() }}
+      uses: actions/upload-artifact@v4
+      with:
+        name: content-preview-daily_post-${{ github.run_id }}
+        path: artifacts/*.html
+        if-no-files-found: ignore
+        retention-days: 14
+    timeout-minutes: 20
+permissions:
+  contents: read
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+env:
+  TZ: Asia/Seoul
+  PYTHONUNBUFFERED: '1'
+  DRY_RUN: ${{ github.event.inputs.dry_run || '0' }}

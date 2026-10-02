@@ -1,69 +1,88 @@
 name: Daily Recipe to WordPress (Naver-friendly)
-
-on:
+'on':
   workflow_dispatch:
     inputs:
       run_slot:
-        description: "day / am / pm"
+        description: day / am / pm
         required: false
-        default: "day"
+        default: day
+      dry_run:
+        description: '1: HTML 미리보기만 생성 / 0: 게시'
+        type: choice
+        options:
+        - '1'
+        - '0'
+        default: '1'
+        required: false
   schedule:
-    # 매일 09:10 KST = 00:10 UTC
-    - cron: "10 0 * * *"
-
+  - cron: 10 0 * * *
 jobs:
   post:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Setup Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-
-      - name: Install deps
-        run: |
-          python -m pip install --upgrade pip
-          pip install requests openai
-
-      - name: Make data dir
-        run: mkdir -p data
-
-      - name: Run
-        env:
-          WP_BASE_URL: ${{ secrets.WP_BASE_URL }}
-          WP_USER: ${{ secrets.WP_USER }}
-          WP_APP_PASS: ${{ secrets.WP_APP_PASS }}
-          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-
-          # 선택값(원하면 Secrets/Variables로)
-          WP_STATUS: publish
-          WP_CATEGORY_IDS: "7"
-          # WP_TAG_IDS: "1,2,3"
-          SQLITE_PATH: "data/daily_recipe.sqlite3"
-
-          OPENAI_MODEL: "gpt-5.2"
-          STRICT_KOREAN: "1"
-          FORCE_NEW: "0"
-          AVOID_REPEAT_DAYS: "90"
-          MAX_TRIES: "20"
-          OPENAI_MAX_RETRIES: "3"
-
-          NAVER_STYLE: "1"
-          BLOG_TONE: "home"
-          HASHTAG_COUNT: "12"
-          # EXTRA_HASHTAGS: "#집밥 #오늘뭐먹지"
-
-          # PREFER_AREAS: "Korean,Japanese"
-          # PREFER_KEYWORDS: "kimchi,bulgogi"
-
-          # 디버그용
-          # DEBUG: "1"
-          # DRY_RUN: "1"
-
-          RUN_SLOT: ${{ github.event.inputs.run_slot || 'day' }}
-
-        run: |
-          python daily_recipe_to_wp.py
+    - name: Checkout
+      uses: actions/checkout@v4
+    - name: Setup Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.11'
+    - name: Install deps
+      run: |
+        python -m pip install --upgrade pip
+        python -m pip install -r requirements.txt
+        python -m compileall -q .
+        python -m unittest discover -s tests -v
+    - name: Restore history
+      uses: actions/cache/restore@v4
+      with:
+        path: data/daily_recipe.sqlite3
+        key: history-v2-${{ github.workflow }}-${{ github.ref_name }}-${{ github.run_id }}-${{ github.run_attempt }}
+        restore-keys: |
+          history-v2-${{ github.workflow }}-${{ github.ref_name }}-
+    - name: Make data dir
+      run: mkdir -p data
+    - name: Run
+      env:
+        WP_BASE_URL: ${{ secrets.WP_BASE_URL }}
+        WP_USER: ${{ secrets.WP_USER }}
+        WP_APP_PASS: ${{ secrets.WP_APP_PASS }}
+        OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        WP_STATUS: publish
+        WP_CATEGORY_IDS: '7'
+        SQLITE_PATH: data/daily_recipe.sqlite3
+        OPENAI_MODEL: gpt-5.2
+        STRICT_KOREAN: '1'
+        FORCE_NEW: '0'
+        AVOID_REPEAT_DAYS: '90'
+        MAX_TRIES: '20'
+        OPENAI_MAX_RETRIES: '3'
+        NAVER_STYLE: '1'
+        BLOG_TONE: home
+        HASHTAG_COUNT: '12'
+        RUN_SLOT: ${{ github.event.inputs.run_slot || 'day' }}
+      run: |
+        python daily_recipe_to_wp.py
+    - name: Save history
+      if: ${{ success() && env.DRY_RUN != '1' }}
+      uses: actions/cache/save@v4
+      with:
+        path: data/daily_recipe.sqlite3
+        key: history-v2-${{ github.workflow }}-${{ github.ref_name }}-${{ github.run_id }}-${{ github.run_attempt }}
+    - name: Upload content preview
+      if: ${{ always() }}
+      uses: actions/upload-artifact@v4
+      with:
+        name: content-preview-daily_recipe-${{ github.run_id }}
+        path: artifacts/*.html
+        if-no-files-found: ignore
+        retention-days: 14
+    timeout-minutes: 20
+permissions:
+  contents: read
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+env:
+  TZ: Asia/Seoul
+  PYTHONUNBUFFERED: '1'
+  DRY_RUN: ${{ github.event.inputs.dry_run || '0' }}

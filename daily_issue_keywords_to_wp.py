@@ -31,6 +31,10 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import requests
 import feedparser
 import xml.etree.ElementTree as ET
+from wp_common import write_post
+from content_quality import require_items, save_preview
+from wp_common import find_post
+
 
 KST = timezone(timedelta(hours=9))
 
@@ -486,7 +490,9 @@ def fetch_feed(session: requests.Session, url: str, timeout: int) -> Tuple[str, 
             if not t:
                 continue
             link = (getattr(e, "link", "") or "").strip()
-            dt = _entry_dt(e) or now
+            dt = _entry_dt(e)
+            if dt is None or dt > now:
+                continue
             items.append(FeedItem(title=t, link=link, source=src, published=dt))
         return url, items, None
 
@@ -592,7 +598,16 @@ def score_keywords(cfg: AppConfig, items: List[FeedItem], trends: List[str]) -> 
     sources: Dict[str, Set[str]] = {}
     examples: Dict[str, List[FeedItem]] = {}
 
-    recent = [it for it in items if it.published >= cutoff]
+    recent = []
+    seen_links, seen_titles = set(), set()
+    for it in items:
+        title_key = normalize_title(it.title).casefold()
+        if not cutoff <= it.published <= now or title_key in seen_titles or (it.link and it.link in seen_links):
+            continue
+        seen_titles.add(title_key)
+        if it.link:
+            seen_links.add(it.link)
+        recent.append(it)
 
     for it in recent:
         toks = tokenize(cfg, it.title)
@@ -676,15 +691,8 @@ def wp_auth_header(user: str, app_pass: str) -> Dict[str, str]:
 
 
 def wp_find_post_by_slug(cfg: WordPressConfig, slug: str) -> Optional[Tuple[int, str]]:
-    url = cfg.base_url.rstrip("/") + "/wp-json/wp/v2/posts"
-    headers = wp_auth_header(cfg.username, cfg.app_password)
-    r = requests.get(url, headers=headers, params={"slug": slug, "per_page": 1}, timeout=25)
-    if r.status_code != 200:
-        return None
-    arr = r.json()
-    if not arr:
-        return None
-    return int(arr[0]["id"]), str(arr[0].get("link") or "")
+    post = find_post(cfg.base_url.rstrip("/") + "/wp-json/wp/v2/posts", wp_auth_header(cfg.username, cfg.app_password), slug)
+    return (int(post["id"]), str(post.get("link") or "")) if post else None
 
 
 def wp_create_post(cfg: WordPressConfig, title: str, slug: str, html: str) -> Tuple[int, str]:
@@ -697,10 +705,7 @@ def wp_create_post(cfg: WordPressConfig, title: str, slug: str, html: str) -> Tu
         "status": cfg.status,
         "categories": cfg.category_ids,  # ✅ 카테고리는 env(WP_CATEGORY_IDS)에서 들어온 값 그대로
     }
-    r = requests.post(url, headers=headers, json=payload, timeout=35)
-    if r.status_code not in (200, 201):
-        raise RuntimeError(f"WP create failed: {r.status_code} body={r.text[:400]}")
-    data = r.json()
+    data = write_post(url, headers, payload)
     return int(data["id"]), str(data.get("link") or "")
 
 
@@ -714,10 +719,7 @@ def wp_update_post(cfg: WordPressConfig, post_id: int, title: str, slug: str, ht
         "status": cfg.status,
         "categories": cfg.category_ids,  # ✅ 동일
     }
-    r = requests.post(url, headers=headers, json=payload, timeout=35)
-    if r.status_code not in (200, 201):
-        raise RuntimeError(f"WP update failed: {r.status_code} body={r.text[:400]}")
-    data = r.json()
+    data = write_post(url, headers, payload)
     return int(data["id"]), str(data.get("link") or "")
 
 
@@ -772,7 +774,7 @@ def build_trends_delta_table(today: List[Dict[str, Any]], yday: List[Dict[str, A
             else:
                 rchg = "—"
 
-        d_tr = tr_num - y_tr_num
+        d_tr = tr_num - y_tr_num if y_rank is not None else None
         bar_w = int(round((tr_num / max_tr) * 100)) if max_tr > 0 else 0
 
         kw_html = f'<a href="{esc(link)}" target="_blank" rel="nofollow noopener">{esc(kw)}</a>' if link else esc(kw)
@@ -787,7 +789,7 @@ def build_trends_delta_table(today: List[Dict[str, Any]], yday: List[Dict[str, A
                 {esc(tr_txt)}<div style="font-size:12px;opacity:.7;">(전날: {esc(y_tr_txt) if y_rank is not None else "—"})</div>
               </td>
               <td style="padding:8px;border:1px solid #e5e5e5;text-align:right;white-space:nowrap;">
-                {esc(fmt_delta(d_tr))}
+                {esc(fmt_delta(d_tr)) if d_tr is not None else "—"}
               </td>
               <td style="padding:8px;border:1px solid #e5e5e5;">
                 <div style="height:10px;background:#f0f0f0;border-radius:999px;overflow:hidden;">
@@ -888,7 +890,7 @@ def build_html(cfg: AppConfig, date_str: str, trends_today: List[Dict[str, Any]]
     trends_html = build_trends_delta_table(trends_today, trends_yday)
     kw_html = build_keywords_table(cfg, keywords)
 
-    return disclosure + head + trends_html + "<hr/>" + kw_html + "<hr/><p style='font-size:12px;opacity:.7;'>자동 포스팅 봇</p>"
+    return disclosure + head + trends_html + "<hr/>" + kw_html
 
 
 # -----------------------------
@@ -976,8 +978,11 @@ def main() -> None:
     keywords = score_keywords(cfg, items, trend_keywords)
     print(f"[SCORE] keywords={len(keywords)}")
 
+    require_items(keywords, "이슈 키워드")
+    title = f"{date_str} 데일리 이슈 키워드 {len(keywords)}개 ({slot_label(cfg.run.slot)})"
     stats = {"items": len(items), "ok_feeds": ok_feeds, "err_feeds": err_feeds}
     html = build_html(cfg, date_str, trends_today, trends_yday, keywords, stats)
+    save_preview(slug, title, html)
 
     if cfg.run.dry_run:
         print("[DRY_RUN] Posting skipped. HTML preview:\n")
@@ -1002,3 +1007,4 @@ if __name__ == "__main__":
         import traceback
         traceback.print_exc()
         raise
+
