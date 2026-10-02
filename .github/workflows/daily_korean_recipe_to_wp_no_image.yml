@@ -42,6 +42,8 @@ jobs:
         WP_BASE_URL: ${{ secrets.WP_BASE_URL }}
         WP_USER: ${{ secrets.WP_USER }}
         WP_APP_PASS: ${{ secrets.WP_APP_PASS }}
+        OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        OPENAI_MODEL: ${{ secrets.OPENAI_MODEL }}
         MFDS_API_KEY: ${{ secrets.MFDS_API_KEY }}
         DEFAULT_THUMB_URL: ${{ secrets.DEFAULT_THUMB_URL }}
         WP_STATUS: publish

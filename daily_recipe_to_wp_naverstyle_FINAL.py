@@ -20,7 +20,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import requests
 import openai  # 예외 타입용
 from openai import OpenAI
-from content_quality import generate_recipe_article, render_recipe, save_preview, safe_url
+from content_quality import generate_recipe_article, render_recipe, save_preview, safe_url, recent_editorials, remember_editorial
 from wp_common import write_post, find_post
 
 
@@ -559,7 +559,7 @@ def run(cfg: AppConfig) -> None:
     ingredients = [f"{x.get('name', '')} {x.get('measure', '')}".strip() for x in ingredients_en]
     def call(instructions, payload):
         return _openai_call_with_retry(client, cfg.openai.model, instructions, payload, cfg.run.openai_max_retries, cfg.run.debug)
-    article = generate_recipe_article(call, title_en, ingredients, steps_en)
+    article = generate_recipe_article(call, title_en, ingredients, steps_en, recent=recent_editorials(cfg.sqlite_path))
     main_kw = article["title"]
     source = safe_url(recipe.get("source")) or f"https://www.themealdb.com/meal/{recipe_id}"
     body_html = render_recipe(article, source, "TheMealDB 레시피 원문")
@@ -603,6 +603,7 @@ def run(cfg: AppConfig) -> None:
     date_key = now.strftime("%Y-%m-%d") + "_" + slot
     save_post_meta(cfg.sqlite_path, date_key, slot, recipe_id, title_en, post_id, link)
 
+    remember_editorial(cfg.sqlite_path, slug, article)
     print("OK(created):", post_id, link)
 
 

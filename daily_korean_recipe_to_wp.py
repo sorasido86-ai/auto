@@ -20,7 +20,9 @@ from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import quote
 
 import requests
-from content_quality import render_recipe, require_recipe, save_preview
+from openai import OpenAI
+from content_quality import (generate_recipe_article, render_recipe, require_recipe,
+                             save_preview, recent_editorials, remember_editorial)
 from wp_common import write_post, find_post
 
 
@@ -806,7 +808,7 @@ def _seed_rng(seed: str) -> random.Random:
 # -----------------------------
 
 def build_post_title(date_str: str, slot_label: str, recipe_title: str, rng: random.Random) -> str:
-    return f"{recipe_title} 레시피 | 재료와 만드는 순서"
+    return recipe_title
 
 
 # -----------------------------
@@ -860,11 +862,21 @@ def ensure_media(cfg: AppConfig, image_url: str, stable_name: str) -> Tuple[int,
 
 def build_body_html(cfg: AppConfig, recipe: Recipe, display_img_url: str, rng: random.Random) -> Tuple[str, str]:
     require_recipe(recipe.ingredients, recipe.steps)
-    intro = f"{recipe.title}의 재료와 조리 순서를 정리했습니다. 아래 계량과 단계는 레시피 원문을 기준으로 안내합니다."
-    article = {"title": recipe.title, "intro": intro, "ingredients": recipe.ingredients, "steps": recipe.steps}
+    key = _env("OPENAI_API_KEY", "")
+    if key:
+        client = OpenAI(api_key=key, timeout=60.0, max_retries=2)
+        model = _env("OPENAI_MODEL", "gpt-4.1-mini") or "gpt-4.1-mini"
+        def call(instructions, payload):
+            return client.responses.create(model=model, instructions=instructions, input=payload)
+        article = generate_recipe_article(call, recipe.title, recipe.ingredients, recipe.steps,
+                                          recent=recent_editorials(cfg.sqlite_path))
+    else:
+        # Without an API key, present the recipe itself without a canned introduction.
+        article = {"title": recipe.title, "intro": "", "ingredients": recipe.ingredients, "steps": recipe.steps}
+    cfg.run.editorial_article = article
     source = "https://www.foodsafetykorea.go.kr/" if recipe.source == "mfds" else ""
     label = f"식품안전나라 공개 레시피 (레시피 번호 {recipe.recipe_id})" if recipe.source == "mfds" else "저장소 기본 레시피"
-    return render_recipe(article, source, label, display_img_url if cfg.img.embed_image_in_body else ""), intro
+    return render_recipe(article, source, label, display_img_url if cfg.img.embed_image_in_body else ""), article["intro"]
 
 
 # -----------------------------
@@ -943,6 +955,7 @@ def run(cfg: AppConfig) -> None:
     display_img_url = (media_url or thumb_url or "").strip()
 
     body_html, excerpt = build_body_html(cfg, chosen, display_img_url, rng)
+    title = cfg.run.editorial_article["title"]
 
     save_preview(slug, title, body_html)
 
@@ -980,6 +993,9 @@ def run(cfg: AppConfig) -> None:
             "created_at": datetime.utcnow().isoformat(),
         },
     )
+
+    if cfg.run.editorial_article["intro"]:
+        remember_editorial(cfg.sqlite_path, slug, cfg.run.editorial_article)
 
 
 def main() -> None:
