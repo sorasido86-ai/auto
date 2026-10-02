@@ -23,6 +23,9 @@ from urllib.parse import quote
 import requests
 from bs4 import BeautifulSoup
 import feedparser
+from wp_common import write_post
+from content_quality import require_items, save_preview
+from wp_common import find_post
 
 
 KST = timezone(timedelta(hours=9))
@@ -109,14 +112,8 @@ def wp_headers(cfg: Dict[str, str]) -> Dict[str, str]:
 
 
 def wp_find_post_id_by_slug(cfg: Dict[str, str], slug: str) -> Optional[int]:
-    url = f"{cfg['wp_base_url']}/wp-json/wp/v2/posts"
-    r = requests.get(url, headers=wp_headers(cfg), params={"slug": slug, "per_page": 1}, timeout=30)
-    if r.status_code == 200:
-        arr = r.json()
-        if arr:
-            return int(arr[0]["id"])
-        return None
-    raise RuntimeError(f"WP 조회 실패: {r.status_code} {r.text[:200]}")
+    post = find_post(cfg['wp_base_url'].rstrip("/") + "/wp-json/wp/v2/posts", wp_headers(cfg), slug)
+    return int(post["id"]) if post else None
 
 
 def wp_create_post(cfg: Dict[str, str], title: str, slug: str, content_html: str) -> str:
@@ -133,10 +130,8 @@ def wp_create_post(cfg: Dict[str, str], title: str, slug: str, content_html: str
         "categories": [cat_id],  # ✅ 팁(8)
     }
 
-    r = requests.post(url, headers=wp_headers(cfg), data=json.dumps(payload), timeout=30)
-    if r.status_code in (200, 201):
-        return r.json().get("link", "")
-    raise RuntimeError(f"WP 발행 실패: {r.status_code} {r.text[:300]}")
+    data = write_post(url, wp_headers(cfg), payload)
+    return str(data.get("link") or "")
 
 
 def _to_float(s: str) -> float:
@@ -324,7 +319,7 @@ def build_post_html(quotes: List[Quote], errors: List[str], run_tag: str) -> str
         """
 
     html = f"""
-    <div class="wrap">
+    <div class="daily-report-wrap">
       <h1>오늘의 지표 리포트 ({datetime.now(KST).date()}) <span class="tag">{htmlmod.escape(run_tag)}</span></h1>
 
       {err_html}
@@ -356,7 +351,7 @@ def build_post_html(quotes: List[Quote], errors: List[str], run_tag: str) -> str
         </table>
       </div>
 
-      <h2>왜 움직였나? (원인 참고)</h2>
+      <h2>관련 뉴스와 확인할 맥락</h2>
       <p class="muted">헤드라인 기반 참고입니다. 실제 원인은 복합적일 수 있어요.</p>
 
       <div class="grid">
@@ -371,22 +366,22 @@ def build_post_html(quotes: List[Quote], errors: List[str], run_tag: str) -> str
     </div>
 
     <style>
-      .wrap {{ max-width: 920px; margin: 0 auto; padding: 8px 10px; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Apple SD Gothic Neo", "Noto Sans KR", Arial, sans-serif; }}
-      h1 {{ font-size: 30px; margin: 10px 0 16px; }}
-      h2 {{ font-size: 22px; margin: 18px 0 10px; }}
-      .tag {{ display:inline-block; margin-left:8px; padding:6px 10px; border-radius:999px; background:#eef2ff; color:#3730a3; font-size:12px; vertical-align:middle; }}
-      .muted {{ color:#6b7280; font-size: 13px; }}
-      .card {{ background:#fff; border:1px solid #e5e7eb; border-radius:14px; padding:14px 16px; box-shadow: 0 1px 2px rgba(0,0,0,.03); }}
-      .alert {{ background:#fff5f5; border:1px solid #fecaca; color:#7f1d1d; border-radius:14px; padding:12px 14px; margin: 10px 0 14px; }}
-      .tablebox {{ border:1px solid #e5e7eb; border-radius:14px; overflow:hidden; }}
-      table {{ width:100%; border-collapse: collapse; }}
-      thead th {{ background:#0b1220; color:#fff; text-align:left; padding:12px 12px; font-size:14px; }}
-      tbody td {{ padding:12px 12px; border-top:1px solid #eef2f7; font-size:14px; }}
-      .grid {{ display:grid; grid-template-columns: 1fr; gap: 12px; }}
+      .daily-report-wrap {{ max-width: 920px; margin: 0 auto; padding: 8px 10px; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Apple SD Gothic Neo", "Noto Sans KR", Arial, sans-serif; }}
+      .daily-report-wrap h1 {{ font-size: 30px; margin: 10px 0 16px; }}
+      .daily-report-wrap h2 {{ font-size: 22px; margin: 18px 0 10px; }}
+      .daily-report-wrap .tag {{ display:inline-block; margin-left:8px; padding:6px 10px; border-radius:999px; background:#eef2ff; color:#3730a3; font-size:12px; vertical-align:middle; }}
+      .daily-report-wrap .muted {{ color:#6b7280; font-size: 13px; }}
+      .daily-report-wrap .card {{ background:#fff; border:1px solid #e5e7eb; border-radius:14px; padding:14px 16px; box-shadow: 0 1px 2px rgba(0,0,0,.03); }}
+      .daily-report-wrap .alert {{ background:#fff5f5; border:1px solid #fecaca; color:#7f1d1d; border-radius:14px; padding:12px 14px; margin: 10px 0 14px; }}
+      .daily-report-wrap .tablebox {{ border:1px solid #e5e7eb; border-radius:14px; overflow:hidden; }}
+      .daily-report-wrap table {{ width:100%; border-collapse: collapse; }}
+      .daily-report-wrap thead th {{ background:#0b1220; color:#fff; text-align:left; padding:12px 12px; font-size:14px; }}
+      .daily-report-wrap tbody td {{ padding:12px 12px; border-top:1px solid #eef2f7; font-size:14px; }}
+      .daily-report-wrap .grid {{ display:grid; grid-template-columns: 1fr; gap: 12px; }}
       @media (min-width: 860px) {{ .grid {{ grid-template-columns: 1fr 1fr 1fr; }} }}
-      a {{ color:#2563eb; text-decoration:none; }}
-      a:hover {{ text-decoration:underline; }}
-      ul {{ margin: 8px 0 0 18px; }}
+      .daily-report-wrap a {{ color:#2563eb; text-decoration:none; }}
+      .daily-report-wrap a:hover {{ text-decoration:underline; }}
+      .daily-report-wrap ul {{ margin: 8px 0 0 18px; }}
     </style>
     """
     return html.strip()
@@ -411,7 +406,12 @@ def main():
             return
 
     quotes, errors = fetch_all_quotes()
+    require_items([q for q in quotes if q.last is not None], "시장 지표")
     content_html = build_post_html(quotes, errors, run_tag=run_tag)
+    save_preview(slug, title, content_html)
+    if os.getenv("DRY_RUN", "0") == "1":
+        print("[DRY_RUN]", title)
+        return
 
     link = wp_create_post(cfg, title=title, slug=slug, content_html=content_html)
     print("✅ 발행 완료:", link)
@@ -419,3 +419,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

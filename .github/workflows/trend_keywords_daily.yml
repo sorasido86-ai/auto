@@ -1,56 +1,65 @@
 name: Daily Trend Keywords to WordPress (AM/PM Separate Posts)
-
-on:
+'on':
   schedule:
-    # UTC 기준
-    # 09:10 KST = 00:10 UTC
-    - cron: "10 0 * * *"
-    # 18:10 KST = 09:10 UTC
-    - cron: "10 9 * * *"
+  - cron: 10 0 * * *
+  - cron: 10 9 * * *
   workflow_dispatch:
-
+    inputs:
+      dry_run:
+        description: '1: HTML 미리보기만 생성 / 0: 게시'
+        type: choice
+        options:
+        - '1'
+        - '0'
+        default: '1'
+        required: false
 jobs:
   run:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Setup Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-
-      - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install requests
-
-      - name: Run bot
-        env:
-          # WP
-          WP_BASE_URL: ${{ secrets.WP_BASE_URL }}
-          WP_USER: ${{ secrets.WP_USER }}
-          WP_APP_PASS: ${{ secrets.WP_APP_PASS }}
-          WP_CATEGORY_ID: "31"
-          WP_STATUS: "publish"
-
-          # Google
-          GOOGLE_GEO: "KR"
-          LIMIT: "20"
-
-          # Naver (네가 쓰는 이름)
-          XNAVERCLIENT_ID: ${{ secrets.XNAVERCLIENT_ID }}
-          XNAVERCLIENT_SECRET: ${{ secrets.XNAVERCLIENT_SECRET }}
-          NAVER_KEYWORD_POOL: ${{ secrets.NAVER_KEYWORD_POOL }}
-          NAVER_POOL_LIMIT: "50"
-          NAVER_LOOKBACK_DAYS: "7"
-
-          # 필요시
-          # DEBUG: "1"
-          # DRY_RUN: "1"
-
-          # 수동 실행 시 원하는 슬롯 강제하려면(예: workflow_dispatch에서)
-          # RUN_SLOT: "am"
-        run: |
-          python trend_keywords_daily_to_wp.py
+    - name: Checkout
+      uses: actions/checkout@v4
+    - name: Setup Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.11'
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        python -m pip install -r requirements.txt
+        python -m compileall -q .
+        python -m unittest discover -s tests -v
+    - name: Run bot
+      env:
+        WP_BASE_URL: ${{ secrets.WP_BASE_URL }}
+        WP_USER: ${{ secrets.WP_USER }}
+        WP_APP_PASS: ${{ secrets.WP_APP_PASS }}
+        WP_CATEGORY_ID: '31'
+        WP_STATUS: publish
+        GOOGLE_GEO: KR
+        LIMIT: '20'
+        XNAVERCLIENT_ID: ${{ secrets.XNAVERCLIENT_ID }}
+        XNAVERCLIENT_SECRET: ${{ secrets.XNAVERCLIENT_SECRET }}
+        NAVER_KEYWORD_POOL: ${{ secrets.NAVER_KEYWORD_POOL }}
+        NAVER_POOL_LIMIT: '50'
+        NAVER_LOOKBACK_DAYS: '7'
+      run: |
+        python trend_keywords_daily_to_wp.py
+    - name: Upload content preview
+      if: ${{ always() }}
+      uses: actions/upload-artifact@v4
+      with:
+        name: content-preview-trend_keywords_daily-${{ github.run_id }}
+        path: artifacts/*.html
+        if-no-files-found: ignore
+        retention-days: 14
+    timeout-minutes: 20
+permissions:
+  contents: read
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+env:
+  TZ: Asia/Seoul
+  PYTHONUNBUFFERED: '1'
+  DRY_RUN: ${{ github.event.inputs.dry_run || '0' }}

@@ -1,51 +1,70 @@
 name: Naver Fashion Daily to WordPress
-
-on:
-  workflow_dispatch: {}
+'on':
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: '1: HTML 미리보기만 생성 / 0: 게시'
+        type: choice
+        options:
+        - '1'
+        - '0'
+        default: '1'
+        required: false
   schedule:
-    - cron: "13 0 * * *"  # 09:13 KST (UTC 기준)
-
+  - cron: 13 0 * * *
 permissions:
-  contents: write
-
+  contents: read
 jobs:
   run:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-          cache: "pip"
-
-      - name: Install deps
-        run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
-
-      - name: Run bot (debug)
-        run: |
-          python naver_fashion_daily_to_wp.py --debug
-        env:
-          NAVER_CLIENT_ID: ${{ secrets.NAVER_CLIENT_ID }}
-          NAVER_CLIENT_SECRET: ${{ secrets.NAVER_CLIENT_SECRET }}
-
-          # ✅ 너가 등록한 워드프레스 Secrets 이름 그대로
-          WP_BASE_URL: ${{ secrets.WP_BASE_URL }}
-          WP_USER: ${{ secrets.WP_USER }}
-          WP_APP_PASS: ${{ secrets.WP_APP_PASS }}
-
-          SQLITE_PATH: data/naver_fashion_rankings.sqlite3
-
-      - name: Commit DB back to repo (optional)
-        run: |
-          if [[ -n "$(git status --porcelain data/naver_fashion_rankings.sqlite3)" ]]; then
-            git config user.name "github-actions[bot]"
-            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-            git add data/naver_fashion_rankings.sqlite3
-            git commit -m "Update rankings db (UTC $(date -u +%F))"
-            git push
-          else
-            echo "No DB changes"
-          fi
+    - uses: actions/checkout@v4
+    - uses: actions/setup-python@v5
+      with:
+        python-version: '3.11'
+        cache: pip
+    - name: Install deps
+      run: |
+        python -m pip install --upgrade pip
+        python -m pip install -r requirements.txt
+        python -m compileall -q .
+        python -m unittest discover -s tests -v
+    - name: Restore history
+      uses: actions/cache/restore@v4
+      with:
+        path: data/naver_fashion_rankings.sqlite3
+        key: history-v2-${{ github.workflow }}-${{ github.ref_name }}-${{ github.run_id }}-${{ github.run_attempt }}
+        restore-keys: |
+          history-v2-${{ github.workflow }}-${{ github.ref_name }}-
+    - name: Run bot (debug)
+      run: |
+        python naver_fashion_daily_to_wp.py --debug
+      env:
+        NAVER_CLIENT_ID: ${{ secrets.NAVER_CLIENT_ID }}
+        NAVER_CLIENT_SECRET: ${{ secrets.NAVER_CLIENT_SECRET }}
+        WP_BASE_URL: ${{ secrets.WP_BASE_URL }}
+        WP_USER: ${{ secrets.WP_USER }}
+        WP_APP_PASS: ${{ secrets.WP_APP_PASS }}
+        SQLITE_PATH: data/naver_fashion_rankings.sqlite3
+    - name: Save history
+      if: ${{ success() && env.DRY_RUN != '1' }}
+      uses: actions/cache/save@v4
+      with:
+        path: data/naver_fashion_rankings.sqlite3
+        key: history-v2-${{ github.workflow }}-${{ github.ref_name }}-${{ github.run_id }}-${{ github.run_attempt }}
+    - name: Upload content preview
+      if: ${{ always() }}
+      uses: actions/upload-artifact@v4
+      with:
+        name: content-preview-naver-fashion-daily-${{ github.run_id }}
+        path: artifacts/*.html
+        if-no-files-found: ignore
+        retention-days: 14
+    timeout-minutes: 20
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+env:
+  TZ: Asia/Seoul
+  PYTHONUNBUFFERED: '1'
+  DRY_RUN: ${{ github.event.inputs.dry_run || '0' }}

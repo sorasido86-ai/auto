@@ -1,5 +1,5 @@
-requests
-beautifulsoup4
-lxml
-feedparser
-openai
+requests==2.34.2
+beautifulsoup4==4.15.0
+lxml==6.1.1
+feedparser==6.0.14
+openai==3.23.0
