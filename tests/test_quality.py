@@ -4,6 +4,7 @@ import inspect
 from contextlib import redirect_stdout
 from io import StringIO
 import json
+import os
 import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
@@ -12,7 +13,8 @@ from unittest.mock import Mock, patch
 
 import requests
 from content_quality import (ContentQualityError, generate_recipe_article,
-                             render_recipe, safe_url, validate_article)
+                             render_recipe, safe_url, validate_article,
+                             recent_editorials, remember_editorial)
 from wp_common import WordPressError, find_post, write_post
 
 
@@ -93,12 +95,14 @@ class RecipeQualityTests(unittest.TestCase):
         bot = importlib.import_module("daily_korean_recipe_to_wp")
         cfg = bot.load_cfg()
         recipe = bot.Recipe("local", "test", "두부 조림", ["두부 150g", "간장 1.5큰술"], ["두부를 썬다.", "5분 끓인다."])
-        body, excerpt = bot.build_body_html(cfg, recipe, "", None)
+        with patch.dict(os.environ, {"OPENAI_API_KEY": ""}):
+            body, excerpt = bot.build_body_html(cfg, recipe, "", None)
         self.assertIn("1.5큰술", body)
         self.assertIn("5분 끓인다.", body)
         self.assertNotIn("저는", body)
         self.assertNotIn("중불", body)
         self.assertIn("<ol>", body)
+        self.assertEqual(excerpt, "")
 
     def test_missing_recipe_image_does_not_get_generic_stock_photo(self):
         bot = importlib.import_module("daily_korean_recipe_to_wp")
@@ -107,6 +111,108 @@ class RecipeQualityTests(unittest.TestCase):
         cfg.img.auto_image = True
         recipe = bot.Recipe("local", "test", "두부 조림", ["두부 150g"], ["두부를 썬다."])
         self.assertEqual(bot.choose_thumb_url(cfg, recipe), "")
+
+
+class EditorialQualityTests(unittest.TestCase):
+    def article(self):
+        result = copy.deepcopy(ARTICLE)
+        result["intro"] = "두부를 깍둑썰기한 뒤 끓이는 조림입니다.\n\n재료는 두부와 간장으로 구성됩니다."
+        result["angle"] = "두부를 써는 준비 과정"
+        return result
+
+    def focus(self, position="before_steps"):
+        return {"heading": "썰기에서 끓이기로", "body": "두부를 먼저 썰고 끓이는 순서로 진행합니다.",
+                "source_steps": [1, 2], "position": position}
+
+    def test_optional_focus_and_paragraphs_preserve_recipe_order(self):
+        for position in ("before_steps", "after_steps"):
+            article = self.article()
+            article["focus"] = self.focus(position)
+            validate_article(article, INGREDIENTS, STEPS)
+            body = render_recipe(article)
+            self.assertIn("</p>\n<p>재료는", body)
+            self.assertLess(body.index(ARTICLE["steps"][0]), body.index(ARTICLE["steps"][1]))
+            self.assertEqual(body.count("<li"), 4)
+            if position == "before_steps":
+                self.assertLess(body.index("썰기에서 끓이기로"), body.index("<ol>"))
+            else:
+                self.assertGreater(body.index("썰기에서 끓이기로"), body.index("</ol>"))
+        self.assertNotIn("썰기에서 끓이기로", render_recipe(self.article()))
+
+    def test_focus_requires_valid_source_references_and_numbers(self):
+        for refs, body in (([], "두부를 먼저 썹니다."), ([0], "두부를 먼저 썹니다."), ([True], "두부를 먼저 썹니다."), ([1], "180도에서 익힙니다."), ([1], "5분 동안 끓입니다.")):
+            article = self.article()
+            article["focus"] = self.focus()
+            article["focus"].update(source_steps=refs, body=body)
+            with self.assertRaises(ContentQualityError):
+                validate_article(article, INGREDIENTS, STEPS)
+
+    def test_intro_cannot_invent_time_or_use_boilerplate(self):
+        for intro in ("10분이면 완성하는 두부 요리입니다.", "오늘은 두부 조림을 소개합니다.", "누구나 쉽게 만들 수 있습니다."):
+            article = self.article()
+            article["intro"] = intro
+            with self.assertRaises(ContentQualityError):
+                validate_article(article, INGREDIENTS, STEPS)
+
+    def test_long_paragraph_and_repeated_sentence_rejected(self):
+        for intro in ("두부를 썰어 끓이는 순서로 재료를 준비해 만드는 조림입니다. " * 8,
+                      "두부를 깍둑썰기한 뒤 간장과 함께 끓이는 조림입니다. 두부를 깍둑썰기한 뒤 간장과 함께 끓이는 조림입니다."):
+            article = self.article()
+            article["intro"] = intro
+            with self.assertRaises(ContentQualityError):
+                validate_article(article, INGREDIENTS, STEPS)
+
+    def test_dish_name_swap_in_same_intro_rejected(self):
+        previous = self.article()
+        previous["intro"] = "두부를 깍둑썰기한 뒤 간장과 함께 끓이는 순서로 조리합니다. 먼저 재료를 준비하고 다음 단계에서 끓이는 과정으로 이어집니다."
+        article = copy.deepcopy(previous)
+        article["intro"] = article["intro"].replace("두부", "감자").replace("간장", "양념장").replace("다음 단계", "이어지는 단계")
+        with self.assertRaises(ContentQualityError):
+            validate_article(article, INGREDIENTS, STEPS, [previous])
+
+    def test_different_fact_led_openings_are_allowed(self):
+        previous = self.article()
+        article = self.article()
+        article["intro"] = "두부 150 g에 간장 1.5 큰술을 사용하는 레시피입니다. 깍둑썰기는 끓이기 전에 진행합니다."
+        self.assertEqual(validate_article(article, INGREDIENTS, STEPS, [previous]), article)
+
+    def test_recent_openings_supplied_and_repetition_corrected(self):
+        previous = self.article()
+        changed = self.article()
+        changed["intro"] = "두부와 간장을 준비해 만드는 조림입니다. 썬 두부는 5분 동안 끓입니다."
+        call = Mock(side_effect=[SimpleNamespace(output_text=json.dumps(previous)), SimpleNamespace(output_text=json.dumps(changed))])
+        self.assertEqual(generate_recipe_article(call, "Tofu", INGREDIENTS, STEPS, [previous]), changed)
+        self.assertEqual(call.call_count, 2)
+        self.assertEqual(json.loads(call.call_args_list[0].args[1])["recent_editorials"], [previous])
+        self.assertIn("최근", call.call_args_list[1].args[0])
+
+    def test_history_is_bounded_and_replaces_same_post(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = directory + "/history.sqlite3"
+            self.assertEqual(recent_editorials(path), [])
+            for i in range(35):
+                article = self.article()
+                article["title"] = f"두부 조림 {i}"
+                remember_editorial(path, str(i), article)
+            self.assertEqual(len(recent_editorials(path, 100)), 30)
+            self.assertEqual(recent_editorials(path)[0]["title"], "두부 조림 34")
+            remember_editorial(path, "34", ARTICLE)
+            self.assertEqual(len(recent_editorials(path, 100)), 30)
+            self.assertEqual(recent_editorials(path)[0]["title"], ARTICLE["title"])
+            self.assertNotIn("ingredients", recent_editorials(path)[0])
+
+    def test_korean_workflow_uses_same_editorial_generator(self):
+        bot = importlib.import_module("daily_korean_recipe_to_wp")
+        cfg = bot.load_cfg()
+        recipe = bot.Recipe("local", "test", "두부 조림", ARTICLE["ingredients"], ARTICLE["steps"])
+        with patch.dict(os.environ, {"OPENAI_API_KEY": "test-key", "OPENAI_MODEL": "test-model"}), patch.object(bot, "OpenAI") as client, patch.object(bot, "generate_recipe_article", return_value=ARTICLE) as generate, patch.object(bot, "recent_editorials", return_value=[]):
+            body, excerpt = bot.build_body_html(cfg, recipe, "", None)
+            generate.assert_called_once()
+            generate.call_args.args[0]("instructions", "payload")
+            self.assertEqual(client.return_value.responses.create.call_args.kwargs["model"], "test-model")
+            self.assertEqual(excerpt, ARTICLE["intro"])
+            self.assertEqual(cfg.run.editorial_article["title"], ARTICLE["title"])
+            self.assertIn(ARTICLE["steps"][1], body)
 
 
 class PublishingTests(unittest.TestCase):
@@ -223,11 +329,30 @@ class BotIntegrationTests(unittest.TestCase):
             cfg.openai.api_key = "test-key"
             cfg.run.dry_run = True
             recipe = {"id": "1", "title": "Tofu", "thumb": "https://example.com/image.jpg", "ingredients": [{"name": "Tofu", "measure": "150g"}], "instructions": "Cook tofu."}
-            with patch.object(bot, "OpenAI"), patch.object(bot, "pick_recipe", return_value=recipe), patch.object(bot, "generate_recipe_article", return_value=ARTICLE), patch.object(bot, "wp_upload_media") as upload, patch("requests.post") as post, patch.object(bot, "save_preview"):
+            with patch.object(bot, "OpenAI"), patch.object(bot, "pick_recipe", return_value=recipe), patch.object(bot, "generate_recipe_article", return_value=ARTICLE), patch.object(bot, "wp_upload_media") as upload, patch("requests.post") as post, patch.object(bot, "save_preview"), patch.object(bot, "remember_editorial") as remember:
                 with redirect_stdout(StringIO()):
                     bot.run(cfg)
                 upload.assert_not_called()
                 post.assert_not_called()
+                remember.assert_not_called()
+
+    def test_editorial_history_is_recorded_only_after_publish_success(self):
+        bot = importlib.import_module("daily_recipe_to_wp_naverstyle_FINAL")
+        for failure in (True, False):
+            with tempfile.TemporaryDirectory() as directory:
+                cfg = bot.load_cfg()
+                cfg.sqlite_path = directory + "/test.sqlite3"
+                cfg.run.dry_run = False
+                cfg.run.upload_thumb = False
+                recipe = {"id": "1", "title": "Tofu", "ingredients": [{"name": "Tofu", "measure": "150g"}], "instructions": "Cook tofu."}
+                with patch.object(bot, "find_post", return_value=None), patch.object(bot, "OpenAI"), patch.object(bot, "pick_recipe", return_value=recipe), patch.object(bot, "generate_recipe_article", return_value=ARTICLE), patch.object(bot, "save_preview"), patch.object(bot, "wp_create_post", side_effect=WordPressError("publish failed") if failure else None, return_value=(7, "url")):
+                    with redirect_stdout(StringIO()):
+                        if failure:
+                            with self.assertRaises(WordPressError):
+                                bot.run(cfg)
+                        else:
+                            bot.run(cfg)
+                    self.assertEqual(recent_editorials(cfg.sqlite_path), [] if failure else [{"title": ARTICLE["title"], "intro": ARTICLE["intro"]}])
 
     def test_headline_duplicates_do_not_inflate_mentions(self):
         bot = importlib.import_module("daily_issue_keywords_to_wp")

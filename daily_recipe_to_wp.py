@@ -19,7 +19,7 @@ import requests
 
 import openai  # 예외 타입 용도
 from openai import OpenAI  # 공식 SDK
-from content_quality import generate_recipe_article, render_recipe, save_preview, safe_url
+from content_quality import generate_recipe_article, render_recipe, save_preview, safe_url, recent_editorials, remember_editorial
 from wp_common import write_post
 import html
 from wp_common import find_post
@@ -578,42 +578,18 @@ def _openai_call_with_retry(
 # -----------------------------
 # Hashtags (네이버 느낌: 과다 금지)
 # -----------------------------
-BASE_HASHTAGS = [
-    "#레시피", "#집밥", "#홈쿡", "#오늘뭐먹지", "#간단요리", "#요리기록", "#한끼", "#밥상",
-    "#요리", "#주말요리", "#자취요리", "#맛있는한끼", "#푸드", "#food",
-]
-
-
 def build_hashtags(cfg: AppConfig, recipe: Dict[str, Any], title_ko: str) -> List[str]:
-    tags = []
-
-    # 기본 태그 + 사용자 추가
-    tags.extend(BASE_HASHTAGS)
-    tags.extend(cfg.run.extra_hashtags or [])
-
-    # 제목에서 한글 단어(2~6자) 몇 개만 해시태그 후보로 (과다 금지)
-    words = re.findall(r"[가-힣]{2,6}", title_ko or "")
-    random.shuffle(words)
-    for w in words[:3]:
-        tags.append("#" + w)
-
-    # 중복 제거(순서 유지)
-    seen = set()
-    uniq = []
-    for t in tags:
-        t = t.strip()
-        if not t:
-            continue
-        if not t.startswith("#"):
-            t = "#" + t
-        if t in seen:
-            continue
-        seen.add(t)
-        uniq.append(t)
-
-    # 너무 많으면 컷
-    n = max(6, min(20, int(cfg.run.hashtag_count or 12)))
-    return uniq[:n]
+    count = max(0, min(20, int(cfg.run.hashtag_count)))
+    if not count:
+        return []
+    # Avoid automatically appending the same broad tags to every article.
+    tags = list(cfg.run.extra_hashtags or [])
+    unique = []
+    for tag in tags:
+        tag = "#" + tag.strip().lstrip("#")
+        if tag != "#" and tag not in unique:
+            unique.append(tag)
+    return unique[:count]
 
 
 def append_hashtags_if_missing(body_html: str, hashtags: List[str]) -> str:
@@ -634,7 +610,8 @@ def generate_korean_blog_naverish(cfg: AppConfig, recipe: Dict[str, Any]) -> Tup
     steps = split_steps(recipe.get("instructions", ""))
     def call(instructions, payload):
         return _openai_call_with_retry(client, cfg.openai.model, instructions, payload, cfg.run.openai_max_retries, cfg.run.debug)
-    article = generate_recipe_article(call, recipe.get("title", ""), ingredients, steps)
+    article = generate_recipe_article(call, recipe.get("title", ""), ingredients, steps, recent=recent_editorials(cfg.sqlite_path))
+    cfg.run.editorial_article = article
     source = safe_url(recipe.get("source")) or f"https://www.themealdb.com/meal/{recipe['id']}"
     return article["title"], render_recipe(article, source, "TheMealDB 레시피 원문")
 
@@ -685,7 +662,6 @@ def run(cfg: AppConfig) -> None:
     now = datetime.now(tz=KST)
     date_str = now.strftime("%Y-%m-%d")
     slot = cfg.run.run_slot
-    slot_label = "오전" if slot == "am" else ("오후" if slot == "pm" else "오늘")
 
     date_key = f"{date_str}_{slot}" if slot in ("am", "pm") else date_str
     slug = f"daily-recipe-{date_str}-{slot}" if slot in ("am", "pm") else f"daily-recipe-{date_str}"
@@ -733,7 +709,7 @@ def run(cfg: AppConfig) -> None:
         if img:
             body_html = f'<p><img src="{html.escape(safe_url(img), quote=True)}" alt="{html.escape(title_ko, quote=True)}" style="max-width:100%;height:auto;border-radius:12px;"></p>\n' + body_html
 
-    title = f"{date_str} {slot_label} 레시피 | {title_ko}"
+    title = title_ko
 
     save_preview(slug, title, body_html)
 
@@ -753,6 +729,10 @@ def run(cfg: AppConfig) -> None:
         new_id, wp_link = wp_create_post(cfg.wp, title, slug, body_html, featured_media=featured)
         save_post_meta(cfg.sqlite_path, date_key, slot, recipe_id, recipe_title_en, new_id, wp_link, media_id, media_url)
         print("OK(created):", new_id, wp_link)
+
+    article = getattr(cfg.run, "editorial_article", None)
+    if article:
+        remember_editorial(cfg.sqlite_path, slug, article)
 
 
 def main():
