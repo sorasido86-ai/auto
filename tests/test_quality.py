@@ -47,16 +47,33 @@ class RecipeQualityTests(unittest.TestCase):
         call = Mock(return_value=SimpleNamespace(output_text=json.dumps(article)))
         self.assertEqual(generate_recipe_article(call, "Tofu", INGREDIENTS, STEPS), ARTICLE)
 
-    def test_output_contract_requires_every_item_and_original_numbers(self):
-        import re
+    def test_output_contract_requires_every_source_item(self):
         fmt = recipe_response_format(json.dumps({"ingredients": INGREDIENTS, "steps": STEPS}))
         self.assertTrue(fmt["format"]["strict"])
         ingredients = fmt["format"]["schema"]["properties"]["ingredients"]
         self.assertEqual(ingredients["required"], ["item_001", "item_002"])
-        pattern = ingredients["properties"]["item_002"]["pattern"]
-        self.assertIsNotNone(re.fullmatch(pattern, "간장 1.5 큰술"))
-        for value in ("간장 15 큰술", "간장 1.5 큰술과 물 2 큰술", "간장 약간"):
-            self.assertIsNone(re.fullmatch(pattern, value))
+        self.assertFalse(ingredients["additionalProperties"])
+
+    def test_written_source_numbers_translate_without_false_alarm(self):
+        article = copy.deepcopy(ARTICLE)
+        article["steps"][0] = "냄비 2개에 두부를 나눕니다."
+        validate_article(article, INGREDIENTS, ["Divide tofu between two saucepans.", STEPS[1]])
+        article["steps"][0] = "냄비 두 개에 두부를 나눕니다."
+        validate_article(article, INGREDIENTS, ["Divide tofu between two saucepans.", STEPS[1]])
+        article["steps"][0] = "냄비 3개에 두부를 나눕니다."
+        with self.assertRaises(ContentQualityError):
+            validate_article(article, INGREDIENTS, ["Divide tofu between two saucepans.", STEPS[1]])
+
+    def test_ingredient_amount_cannot_be_added_to_step(self):
+        article = copy.deepcopy(ARTICLE)
+        article["steps"][0] = "두부 150 g을 썹니다."
+        with self.assertRaises(ContentQualityError):
+            validate_article(article, INGREDIENTS, STEPS)
+
+    def test_equivalent_fraction_glyphs_are_allowed(self):
+        article = copy.deepcopy(ARTICLE)
+        article["ingredients"][1] = "간장 1/2 큰술"
+        validate_article(article, [INGREDIENTS[0], "Soy sauce ½ tbsp"], STEPS)
 
     def test_valid_source_translation(self):
         self.assertEqual(validate_article(ARTICLE, INGREDIENTS, STEPS), ARTICLE)

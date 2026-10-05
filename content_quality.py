@@ -3,6 +3,7 @@ import html
 import json
 import re
 import sqlite3
+import unicodedata
 from collections import Counter
 from difflib import SequenceMatcher
 from pathlib import Path
@@ -32,7 +33,15 @@ def parse_json_object(text):
 
 def numbers(text):
     # Decimals, fractions, ranges and temperatures must survive translation.
+    for glyph, value in {"½": "1/2", "¼": "1/4", "¾": "3/4", "⅓": "1/3", "⅔": "2/3", "⅛": "1/8", "⅜": "3/8", "⅝": "5/8", "⅞": "7/8"}.items():
+        text = str(text).replace(glyph, " " + value)
+    text = "".join(str(unicodedata.decimal(c)) if c.isdecimal() else c for c in str(text))
     return Counter(re.findall(r"\d+(?:[.,]\d+)?(?:/\d+)?", str(text)))
+
+
+def spelled_numbers(text):
+    values = {word: str(i) for i, word in enumerate("zero one two three four five six seven eight nine ten eleven twelve thirteen fourteen fifteen sixteen seventeen eighteen nineteen twenty".split())}
+    return Counter(values[word.lower()] for word in re.findall(r"\b(?:" + "|".join(values) + r")\b", text, flags=re.I))
 
 
 def recipe_response_format(payload):
@@ -43,14 +52,7 @@ def recipe_response_format(payload):
     string = {"type": "string"}
     properties = {key: string for key in ("title", "intro", "angle")}
     for key in ("ingredients", "steps"):
-        items = {}
-        for i, text in enumerate(source[key], 1):
-            tokens = re.findall(r"\d+(?:[.,]\d+)?(?:/\d+)?", text)
-            pattern = "^[^0-9]*" + "[^0-9]*".join(re.escape(n) for n in tokens)
-            if tokens:
-                pattern += "[^0-9]*"
-            items[f"item_{i:03d}"] = {"type": "string", "pattern": pattern + "$"}
-        properties[key] = obj(items)
+        properties[key] = obj({f"item_{i:03d}": string for i in range(1, len(source[key]) + 1)})
     properties["focus"] = {"anyOf": [{"type": "null"}, obj({
         "heading": string, "body": string,
         "source_steps": {"type": "array", "items": {"type": "integer", "enum": list(range(1, len(source["steps"]) + 1))}},
@@ -99,7 +101,9 @@ def validate_article(article, ingredients, steps, recent=None):
         for index, (original, value) in enumerate(zip(source, translated), 1):
             if not isinstance(value, str) or not value.strip():
                 raise ContentQualityError(f"{key}에 빈 항목이 있습니다.")
-            if numbers(original) != numbers(value):
+            expected, actual = numbers(original), numbers(value)
+            # Written English numbers may remain words or become equivalent digits.
+            if expected - actual or (actual - expected) - spelled_numbers(original):
                 raise ContentQualityError(f"{key}[{index}]의 수량·시간·온도가 원문과 다릅니다. 필요한 숫자: {dict(numbers(original))}; 응답 숫자: {dict(numbers(value))}")
     focus = article.get("focus")
     if focus is not None:
@@ -113,7 +117,8 @@ def validate_article(article, ingredients, steps, recent=None):
         for key, limit in (("heading", 45), ("body", 240)):
             if not isinstance(focus.get(key), str) or not focus[key].strip() or len(focus[key]) > limit:
                 raise ContentQualityError("설명 문단의 제목 또는 길이가 잘못되었습니다.")
-        if set(numbers(focus["heading"] + " " + focus["body"])) - set(numbers(" ".join(steps[i - 1] for i in refs))):
+        reference = " ".join(steps[i - 1] for i in refs)
+        if set(numbers(focus["heading"] + " " + focus["body"])) - set(numbers(reference) + spelled_numbers(reference)):
             raise ContentQualityError("설명 문단의 숫자가 인용한 원문 단계에 없습니다.")
     extra = [focus["heading"], focus["body"]] if focus else []
     angle = article.get("angle")
@@ -131,7 +136,8 @@ def validate_article(article, ingredients, steps, recent=None):
         raise ContentQualityError("근거 없는 경험담 또는 과장 표현이 있습니다.")
     if re.search(r"오늘은.{0,40}소개|재료와 조리 순서를 정리|원문을 기준으로 안내|누구나 쉽게|한 번 만들어 보|입맛을 사로잡|풍미가 가득|이 글에서는", editorial):
         raise ContentQualityError("요리의 특징이 없는 상투적인 도입 또는 설명입니다.")
-    source_numbers = numbers(" ".join(ingredients + steps))
+    reference = " ".join(ingredients + steps)
+    source_numbers = numbers(reference) + spelled_numbers(reference)
     if set(numbers(article["title"] + " " + article["intro"])) - set(source_numbers):
         raise ContentQualityError("제목 또는 도입에 원문에 없는 숫자가 있습니다.")
     for text in [article["intro"], *([focus["body"]] if focus else [])]:
@@ -176,6 +182,8 @@ recent_editorials가 있으면 첫 문장 패턴·설명 소재·소제목·전�
 다양성을 위해 원문과 맞지 않는 이야기를 끼우거나 조리 단계를 섞지 마세요.
 재료와 단계를 각각 같은 순서와 같은 개수로 번역하고 합치거나 생략하지 마세요.
 재료, 수량, 시간, 온도, 불 세기, 순서를 변경하거나 추가하지 마세요.
+조리 단계에 없는 재료 계량을 재료 목록에서 가져와 추가하지 마세요.
+원문의 two saucepans 같은 글자 수량은 냄비 두 개 또는 냄비 2개처럼 같은 의미로 번역하세요.
 숫자 표기는 소수·분수까지 원문 그대로 유지하고 단위만 한국어로 번역하세요.
 단위를 환산하거나 분수 1/2를 0.5로 바꾸지 마세요.
 문장부호를 정상적으로 사용하고 긴 단계는 그 항목 안에서 문장을 나누세요.

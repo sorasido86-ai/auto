@@ -598,7 +598,7 @@ def append_hashtags_if_missing(body_html: str, hashtags: List[str]) -> str:
 # OpenAI: 네이버 복붙 친화 + 사람 말투
 # -----------------------------
 def generate_korean_blog_naverish(cfg: AppConfig, recipe: Dict[str, Any]) -> Tuple[str, str]:
-    client = OpenAI(api_key=cfg.openai.api_key)
+    client = OpenAI(api_key=cfg.openai.api_key, timeout=120.0, max_retries=0)
     ingredients = [f"{x.get('name', '')} {x.get('measure', '')}".strip() for x in recipe.get("ingredients", [])]
     steps = split_steps(recipe.get("instructions", ""))
     def call(instructions, payload):
