@@ -152,6 +152,13 @@ class RecipeQualityTests(unittest.TestCase):
         self.assertIn("<ol>", body)
         self.assertEqual(excerpt, "")
 
+    def test_mfds_display_labels_are_not_recipe_quantities(self):
+        bot = importlib.import_module("daily_korean_recipe_to_wp")
+        recipe = bot.mfds_row_to_recipe({"RCP_SEQ": "1", "RCP_NM": "두부 조림", "RCP_PARTS_DTLS": "두부 150g, 간장 1.5큰술", "MANUAL01": "1.두부를 썬다.", "MANUAL02": "2. 1.5분 동안 끓인다.", "MANUAL03": "3) 180C"})
+        self.assertEqual(recipe.steps, ["두부를 썬다.", "1.5분 동안 끓인다.", "180C"])
+        recipe = bot.mfds_row_to_recipe({"RCP_NM": "볶음", "MANUAL01": "1.5cm로 자른다."})
+        self.assertEqual(recipe.steps, ["1.5cm로 자른다."])
+
     def test_missing_recipe_image_does_not_get_generic_stock_photo(self):
         bot = importlib.import_module("daily_korean_recipe_to_wp")
         cfg = bot.load_cfg()

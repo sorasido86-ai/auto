@@ -697,8 +697,11 @@ def mfds_row_to_recipe(row: Dict[str, Any]) -> Recipe:
     for i in range(1, 21):
         s = str(row.get(f"MANUAL{str(i).zfill(2)}") or "").strip()
         if s:
-            s = re.sub(r"[a-zA-Z]\s*$", "", s).strip()
-            steps.append(s)
+            # MANUAL fields carry display labels such as "1.손질한다".
+            # Do not mistake labels for quantities or strip decimal values/units.
+            s = re.sub(r"^\d+[.)](?!\d)\s*", "", s).strip()
+            if s:
+                steps.append(s)
 
     img_main = str(row.get("ATT_FILE_NO_MAIN") or "").strip()
     if not img_main:
@@ -1013,4 +1016,3 @@ if __name__ == "__main__":
 
         traceback.print_exc()
         sys.exit(1)
-
