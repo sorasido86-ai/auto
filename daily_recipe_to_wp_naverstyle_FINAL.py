@@ -548,7 +548,7 @@ def run(cfg: AppConfig) -> None:
     ingredients_en = recipe.get("ingredients", []) or []
     steps_en = split_steps(recipe.get("instructions", ""))
 
-    client = OpenAI(api_key=cfg.openai.api_key)
+    client = OpenAI(api_key=cfg.openai.api_key, timeout=120.0, max_retries=0)
 
     ingredients = [f"{x.get('name', '')} {x.get('measure', '')}".strip() for x in ingredients_en]
     def call(instructions, payload):

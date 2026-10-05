@@ -864,7 +864,7 @@ def build_body_html(cfg: AppConfig, recipe: Recipe, display_img_url: str, rng: r
     require_recipe(recipe.ingredients, recipe.steps)
     key = _env("OPENAI_API_KEY", "")
     if key:
-        client = OpenAI(api_key=key, timeout=60.0, max_retries=2)
+        client = OpenAI(api_key=key, timeout=120.0, max_retries=1)
         model = _env("OPENAI_MODEL", "gpt-4.1-mini") or "gpt-4.1-mini"
         def call(instructions, payload):
             return client.responses.create(model=model, instructions=instructions, input=payload, text=recipe_response_format(payload))
