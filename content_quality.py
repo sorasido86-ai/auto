@@ -35,6 +35,40 @@ def numbers(text):
     return Counter(re.findall(r"\d+(?:[.,]\d+)?(?:/\d+)?", str(text)))
 
 
+def recipe_response_format(payload):
+    """Required numbered fields prevent merging or dropping source items."""
+    source = json.loads(payload)
+    def obj(properties):
+        return {"type": "object", "properties": properties, "required": list(properties), "additionalProperties": False}
+    string = {"type": "string"}
+    properties = {key: string for key in ("title", "intro", "angle")}
+    for key in ("ingredients", "steps"):
+        items = {}
+        for i, text in enumerate(source[key], 1):
+            tokens = re.findall(r"\d+(?:[.,]\d+)?(?:/\d+)?", text)
+            pattern = "^[^0-9]*" + "[^0-9]*".join(re.escape(n) for n in tokens)
+            if tokens:
+                pattern += "[^0-9]*"
+            items[f"item_{i:03d}"] = {"type": "string", "pattern": pattern + "$"}
+        properties[key] = obj(items)
+    properties["focus"] = {"anyOf": [{"type": "null"}, obj({
+        "heading": string, "body": string,
+        "source_steps": {"type": "array", "items": {"type": "integer", "enum": list(range(1, len(source["steps"]) + 1))}},
+        "position": {"type": "string", "enum": ["before_steps", "after_steps"]}})]}
+    return {"format": {"type": "json_schema", "name": "source_recipe", "strict": True, "schema": obj(properties)}}
+
+
+def split_recipe_steps(instructions):
+    text = str(instructions or "").strip()
+    parts = [p.strip() for p in re.split(r"\r?\n+", text) if p.strip()]
+    # STEP 1 is a source label, not an instruction to translate as another step.
+    parts = [re.sub(r"^(?:step\s+\d+\s*[:.)-]?\s*|\d+[.)]\s+)", "", p, flags=re.I).strip() for p in parts]
+    parts = [p for p in parts if p]
+    if len(parts) <= 2 and len(text) > 400:
+        parts = [s.strip() for p in parts for s in re.split(r"(?<=[.!?])\s+", p) if s.strip()]
+    return parts
+
+
 def require_recipe(ingredients, steps):
     if not ingredients or not steps or any(not str(x).strip() for x in ingredients + steps):
         raise ContentQualityError("재료와 조리 단계가 없는 레시피는 발행하지 않습니다.")
@@ -62,11 +96,11 @@ def validate_article(article, ingredients, steps, recent=None):
         translated = article.get(key)
         if not isinstance(translated, list) or len(translated) != len(source):
             raise ContentQualityError(f"{key} 개수가 원문과 다릅니다.")
-        for original, value in zip(source, translated):
+        for index, (original, value) in enumerate(zip(source, translated), 1):
             if not isinstance(value, str) or not value.strip():
                 raise ContentQualityError(f"{key}에 빈 항목이 있습니다.")
             if numbers(original) != numbers(value):
-                raise ContentQualityError(f"{key}의 수량·시간·온도가 원문과 다릅니다.")
+                raise ContentQualityError(f"{key}[{index}]의 수량·시간·온도가 원문과 다릅니다. 필요한 숫자: {dict(numbers(original))}; 응답 숫자: {dict(numbers(value))}")
     focus = article.get("focus")
     if focus is not None:
         if not isinstance(focus, dict) or focus.get("position") not in ("before_steps", "after_steps"):
@@ -79,7 +113,7 @@ def validate_article(article, ingredients, steps, recent=None):
         for key, limit in (("heading", 45), ("body", 240)):
             if not isinstance(focus.get(key), str) or not focus[key].strip() or len(focus[key]) > limit:
                 raise ContentQualityError("설명 문단의 제목 또는 길이가 잘못되었습니다.")
-        if numbers(focus["heading"] + " " + focus["body"]) - numbers(" ".join(steps[i - 1] for i in refs)):
+        if set(numbers(focus["heading"] + " " + focus["body"])) - set(numbers(" ".join(steps[i - 1] for i in refs))):
             raise ContentQualityError("설명 문단의 숫자가 인용한 원문 단계에 없습니다.")
     extra = [focus["heading"], focus["body"]] if focus else []
     angle = article.get("angle")
@@ -98,7 +132,7 @@ def validate_article(article, ingredients, steps, recent=None):
     if re.search(r"오늘은.{0,40}소개|재료와 조리 순서를 정리|원문을 기준으로 안내|누구나 쉽게|한 번 만들어 보|입맛을 사로잡|풍미가 가득|이 글에서는", editorial):
         raise ContentQualityError("요리의 특징이 없는 상투적인 도입 또는 설명입니다.")
     source_numbers = numbers(" ".join(ingredients + steps))
-    if numbers(article["title"] + " " + article["intro"]) - source_numbers:
+    if set(numbers(article["title"] + " " + article["intro"])) - set(source_numbers):
         raise ContentQualityError("제목 또는 도입에 원문에 없는 숫자가 있습니다.")
     for text in [article["intro"], *([focus["body"]] if focus else [])]:
         if any(len(p.strip()) > 180 for p in text.split("\n\n")) or any(len(s) > 120 for s in sentences(text)):
@@ -153,20 +187,35 @@ recent_editorials가 있으면 첫 문장 패턴·설명 소재·소제목·전�
 
 def generate_recipe_article(call, title, ingredients, steps, recent=None):
     require_recipe(ingredients, steps)
-    payload = json.dumps({"title": title, "ingredients": ingredients, "steps": steps,
-                          "recent_editorials": list(recent or [])[-6:]}, ensure_ascii=False)
+    source = {"title": title, "ingredients": ingredients, "steps": steps,
+              "recent_editorials": list(recent or [])[-6:]}
     error = ""
     # One correction attempt, never an unvalidated fallback.
     for attempt in range(2):
         instructions = RECIPE_INSTRUCTIONS
+        instructions += "\n재료와 단계는 배열 대신 item_001, item_002 순서의 객체로 출력하세요. 각 원문 항목에 한 필드를 대응시키고 빠뜨리거나 합치지 마세요."
+        payload = json.dumps(source, ensure_ascii=False)
         if error:
             instructions += "\n이전 응답의 검증 오류를 고쳐 원문부터 다시 작성하세요: " + error
+            print("[RECIPE] 보정:", error)
         response = call(instructions, payload)
         try:
             article = parse_json_object(response.output_text)
+            source["previous_response"] = article.copy()
+            for key, items in (("ingredients", ingredients), ("steps", steps)):
+                if isinstance(article.get(key), dict):
+                    expected = [f"item_{i:03d}" for i in range(1, len(items) + 1)]
+                    if set(article[key]) != set(expected):
+                        raise ContentQualityError(f"{key}의 원문 항목 번호가 누락 또는 추가되었습니다.")
+                    article[key] = [article[key][k] for k in expected]
             return validate_article(article, ingredients, steps, recent)
         except (ValueError, TypeError, KeyError) as exc:
             error = str(exc)
+    target = Path("artifacts")
+    target.mkdir(exist_ok=True)
+    (target / "recipe_validation_failure.json").write_text(json.dumps(
+        {key: value for key, value in {**source, "validation_error": error}.items() if key != "recent_editorials"},
+        ensure_ascii=False, indent=2), encoding="utf-8")
     raise ContentQualityError("레시피 생성 검증 실패: " + error)
 
 

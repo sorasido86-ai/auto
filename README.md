@@ -43,3 +43,10 @@ python -m unittest discover -s tests -v
 숫자·항목 수 검사는 오역과 사실 오류의 일부를 잡습니다. 식재료명과 문장의 의미를 완전히 검증하는 것은 아니므로 미리보기로 문장 품질을 확인할 수 있습니다. AI 호출이나 수집 실패 때 검증되지 않은 내용으로 대체해 발행하지 않습니다.
 
 공식 데이터 정의: [네이버 쇼핑 검색 API](https://developers.naver.com/docs/serviceapi/search/shopping/shopping.md), [네이버 DataLab](https://developers.naver.com/docs/serviceapi/datalab/search/search.md), [WordPress Posts API](https://developer.wordpress.org/rest-api/reference/posts/).
+
+## 2026-10-05 게시 중단 복구
+
+- AI 출력에 원문 항목마다 필수 번호 필드를 지정하는 구조화 응답을 적용합니다. 각 필드의 숫자 패턴을 원문에서 생성하며, 기존 수량·단계·문장 품질 검사는 유지합니다. 보정 요청에는 실제 이전 응답과 오류 항목 번호·기대 숫자를 전달합니다. STEP 번호 전용 줄을 조리 단계로 세지 않습니다.
+- WordPress GET이 HTML 또는 404를 반환하면 공식 `?rest_route=/wp/v2/posts` 경로로 한 번 확인합니다. 유효한 목록을 받았을 때만 해당 경로를 게시에 사용합니다. 두 경로 모두 실패하면 게시를 중단합니다. POST는 경로를 바꿔 재전송하지 않고 slug 조회로만 결과를 복구합니다.
+- 세 레시피 작업은 main의 해당 코드·공통 모듈·의존성·워크플로 변경 시에도 실행됩니다. 적용 직후 게시 연결을 검증하며, 같은 날짜의 글은 기존 slug 조회로 중복을 막습니다. 예약 실행 설정은 유지합니다.
+- 생성 검증이 계속 실패하면 원문과 마지막 응답·오류를 JSON 진단 자료로 보관합니다. 미검증 내용은 발행하지 않습니다. 실행 Artifacts에는 HTML 미리보기 또는 JSON 진단 자료가 포함될 수 있습니다.

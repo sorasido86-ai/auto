@@ -20,7 +20,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import requests
 import openai  # 예외 타입용
 from openai import OpenAI
-from content_quality import generate_recipe_article, render_recipe, save_preview, safe_url, recent_editorials, remember_editorial
+from content_quality import generate_recipe_article, render_recipe, save_preview, safe_url, recent_editorials, remember_editorial, recipe_response_format, split_recipe_steps
 from wp_common import write_post, find_post
 
 
@@ -419,13 +419,7 @@ def _normalize_meal(m: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def split_steps(instructions: str) -> List[str]:
-    t = (instructions or "").strip()
-    if not t:
-        return []
-    parts = [p.strip() for p in re.split(r"\r?\n+", t) if p.strip()]
-    if len(parts) <= 2 and len(t) > 400:
-        parts = [p.strip() for p in re.split(r"(?<=[.!?])\s+", t) if p.strip()]
-    return parts
+    return split_recipe_steps(instructions)
 
 
 # -----------------------------
@@ -445,7 +439,7 @@ def _is_insufficient_quota_error(e: Exception) -> bool:
 def _openai_call_with_retry(client: OpenAI, model: str, instructions: str, input_text: str, max_retries: int, debug: bool = False):
     for attempt in range(max_retries + 1):
         try:
-            return client.responses.create(model=model, instructions=instructions, input=input_text)
+            return client.responses.create(model=model, instructions=instructions, input=input_text, text=recipe_response_format(input_text))
         except openai.RateLimitError as e:
             if _is_insufficient_quota_error(e):
                 raise
