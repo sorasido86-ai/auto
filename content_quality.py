@@ -117,7 +117,8 @@ def validate_article(article, ingredients, steps, recent=None):
         for key, limit in (("heading", 45), ("body", 240)):
             if not isinstance(focus.get(key), str) or not focus[key].strip() or len(focus[key]) > limit:
                 raise ContentQualityError("설명 문단의 제목 또는 길이가 잘못되었습니다.")
-        if set(numbers(focus["heading"] + " " + focus["body"])) - set(numbers(" ".join(steps[i - 1] for i in refs))):
+        reference = " ".join(steps[i - 1] for i in refs)
+        if set(numbers(focus["heading"] + " " + focus["body"])) - set(numbers(reference) + spelled_numbers(reference)):
             raise ContentQualityError("설명 문단의 숫자가 인용한 원문 단계에 없습니다.")
     extra = [focus["heading"], focus["body"]] if focus else []
     angle = article.get("angle")
@@ -135,7 +136,8 @@ def validate_article(article, ingredients, steps, recent=None):
         raise ContentQualityError("근거 없는 경험담 또는 과장 표현이 있습니다.")
     if re.search(r"오늘은.{0,40}소개|재료와 조리 순서를 정리|원문을 기준으로 안내|누구나 쉽게|한 번 만들어 보|입맛을 사로잡|풍미가 가득|이 글에서는", editorial):
         raise ContentQualityError("요리의 특징이 없는 상투적인 도입 또는 설명입니다.")
-    source_numbers = numbers(" ".join(ingredients + steps))
+    reference = " ".join(ingredients + steps)
+    source_numbers = numbers(reference) + spelled_numbers(reference)
     if set(numbers(article["title"] + " " + article["intro"])) - set(source_numbers):
         raise ContentQualityError("제목 또는 도입에 원문에 없는 숫자가 있습니다.")
     for text in [article["intro"], *([focus["body"]] if focus else [])]:
