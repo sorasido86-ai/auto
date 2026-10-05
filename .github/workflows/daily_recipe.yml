@@ -1,5 +1,13 @@
 name: Daily Recipe to WordPress (Naver-friendly)
 'on':
+  push:
+    branches: [main]
+    paths:
+    - daily_recipe_to_wp.py
+    - content_quality.py
+    - wp_common.py
+    - requirements.txt
+    - .github/workflows/daily_recipe.yml
   workflow_dispatch:
     inputs:
       run_slot:
@@ -73,7 +81,7 @@ jobs:
       uses: actions/upload-artifact@v4
       with:
         name: content-preview-daily_recipe-${{ github.run_id }}
-        path: artifacts/*.html
+        path: artifacts/*
         if-no-files-found: ignore
         retention-days: 14
     timeout-minutes: 20

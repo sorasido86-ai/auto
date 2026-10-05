@@ -19,7 +19,7 @@ import requests
 
 import openai  # 예외 타입 용도
 from openai import OpenAI  # 공식 SDK
-from content_quality import generate_recipe_article, render_recipe, save_preview, safe_url, recent_editorials, remember_editorial
+from content_quality import generate_recipe_article, render_recipe, save_preview, safe_url, recent_editorials, remember_editorial, recipe_response_format, split_recipe_steps
 from wp_common import write_post
 import html
 from wp_common import find_post
@@ -517,15 +517,7 @@ def _normalize_meal(m: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def split_steps(instructions: str) -> List[str]:
-    t = (instructions or "").strip()
-    if not t:
-        return []
-    parts = [p.strip() for p in re.split(r"\r?\n+", t) if p.strip()]
-    if len(parts) <= 2 and len(t) > 400:
-        parts = [p.strip() for p in re.split(r"(?<=[.!?])\s+", t) if p.strip()]
-    # 빈/너무 짧은 문장 제거
-    out = [p for p in parts if len(p) >= 3]
-    return out
+    return split_recipe_steps(instructions)
 
 
 # -----------------------------
@@ -551,6 +543,7 @@ def _openai_call_with_retry(
                 model=model,
                 instructions=instructions,
                 input=input_text,
+                text=recipe_response_format(input_text),
             )
         except openai.RateLimitError as e:
             if _is_insufficient_quota_error(e):

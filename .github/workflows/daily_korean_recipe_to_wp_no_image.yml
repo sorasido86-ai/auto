@@ -1,5 +1,13 @@
 name: Daily Korean Recipe to WordPress
 'on':
+  push:
+    branches: [main]
+    paths:
+    - daily_korean_recipe_to_wp.py
+    - content_quality.py
+    - wp_common.py
+    - requirements.txt
+    - .github/workflows/daily_korean_recipe_to_wp_no_image.yml
   schedule:
   - cron: 15 0 * * *
   workflow_dispatch:
@@ -77,7 +85,7 @@ jobs:
       uses: actions/upload-artifact@v4
       with:
         name: content-preview-daily_korean_recipe_to_wp_no_image-${{ github.run_id }}
-        path: artifacts/*.html
+        path: artifacts/*
         if-no-files-found: ignore
         retention-days: 14
     timeout-minutes: 20

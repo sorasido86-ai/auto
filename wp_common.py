@@ -1,11 +1,29 @@
 """WordPress writes with strict responses and recovery after ambiguous creates."""
 import time
+from urllib.parse import urlsplit, urlunsplit
 import requests
 from content_quality import readable_html
 
 
 class WordPressError(RuntimeError):
     pass
+
+
+_QUERY_ROUTE = set()
+
+
+def rest_target(endpoint):
+    parsed = urlsplit(endpoint)
+    prefix, separator, route = parsed.path.partition("/wp-json/")
+    if not separator:
+        return endpoint, {}, ""
+    base = urlunsplit((parsed.scheme, parsed.netloc, prefix + "/", "", ""))
+    return base, {"rest_route": "/" + route}, base
+
+
+def transport_target(endpoint):
+    alternate, params, base = rest_target(endpoint)
+    return (alternate, params) if base in _QUERY_ROUTE else (endpoint, {})
 
 
 def response_json(response):
@@ -15,16 +33,32 @@ def response_json(response):
         return response.json()
     except ValueError as exc:
         # Never log raw HTML; error pages can echo credentials or infrastructure data.
-        raise WordPressError(f"WordPress가 JSON 대신 다른 응답을 반환했습니다 (HTTP {response.status_code}). REST 차단·리디렉션·보안 플러그인을 확인하세요.") from exc
+        text = response.text if isinstance(response.text, str) else ""
+        kind = "접근 확인 페이지" if any(x in text.lower() for x in ("just a moment", "one moment", "captcha", "cf-chl-")) else "HTML 또는 빈 응답"
+        raise WordPressError(f"WordPress가 JSON 대신 {kind}을 반환했습니다 (HTTP {response.status_code}). REST 접근·캐시·보안 플러그인을 확인하세요.") from exc
 
 
 def find_post(endpoint, headers, slug):
+    request_headers = {**headers, "Accept": "application/json", "Cache-Control": "no-cache"}
+    query = {"slug": slug, "per_page": 1, "status": "any", "context": "edit"}
     for attempt in range(3):
-        response = requests.get(endpoint, headers=headers, params={"slug": slug, "per_page": 1, "status": "any", "context": "edit"}, timeout=(10, 30), allow_redirects=False)
+        target, route_params = transport_target(endpoint)
+        response = requests.get(target, headers=request_headers, params={**route_params, **query}, timeout=(10, 30), allow_redirects=False)
         if response.status_code in (429, 500, 502, 503, 504) and attempt < 2:
             time.sleep(2 ** attempt)
             continue
-        result = response_json(response)
+        try:
+            result = response_json(response)
+        except WordPressError:
+            alternate, params, base = rest_target(endpoint)
+            # WordPress supports both REST URL forms. Only reads may try another route.
+            if response.status_code not in (200, 201, 404) or not base or route_params:
+                raise
+            response = requests.get(alternate, headers=request_headers, params={**params, **query}, timeout=(10, 30), allow_redirects=False)
+            result = response_json(response)
+            if isinstance(result, list):
+                _QUERY_ROUTE.add(base)
+                print("[WP] REST 조회: WordPress 쿼리 경로 사용")
         if not isinstance(result, list):
             raise WordPressError("WordPress 글 조회 결과가 목록이 아닙니다.")
         return result[0] if result else None
@@ -43,7 +77,9 @@ def write_post(endpoint, headers, payload):
             # Lost local history must not create another post or overwrite its recipe.
             return existing
     try:
-        response = requests.post(endpoint, headers=headers, json=payload, timeout=(10, 45), allow_redirects=False)
+        target, params = transport_target(endpoint)
+        options = {"params": params} if params else {}
+        response = requests.post(target, headers={**headers, "Accept": "application/json"}, json=payload, timeout=(10, 45), allow_redirects=False, **options)
         result = response_json(response)
         if not isinstance(result, dict) or not isinstance(result.get("id"), int) or result["id"] <= 0:
             raise WordPressError("WordPress 글 ID가 없는 응답입니다.")

@@ -14,7 +14,8 @@ from unittest.mock import Mock, patch
 import requests
 from content_quality import (ContentQualityError, generate_recipe_article,
                              render_recipe, safe_url, validate_article,
-                             recent_editorials, remember_editorial)
+                             recent_editorials, remember_editorial,
+                             recipe_response_format, split_recipe_steps)
 from wp_common import WordPressError, find_post, write_post
 
 
@@ -35,8 +36,37 @@ def response(value=None, status=200, invalid=False):
 
 
 class RecipeQualityTests(unittest.TestCase):
+    def test_source_headings_not_counted_as_steps_and_decimals_kept(self):
+        self.assertEqual(split_recipe_steps("STEP 1\nUse 1.5 tbsp sauce.\nSTEP 2\n2. Cook for 5 minutes."), ["Use 1.5 tbsp sauce.", "Cook for 5 minutes."])
+        self.assertEqual(split_recipe_steps("1/2 cup of water is added."), ["1/2 cup of water is added."])
+
+    def test_numbered_output_restores_source_order(self):
+        article = copy.deepcopy(ARTICLE)
+        for key in ("ingredients", "steps"):
+            article[key] = {"item_002": article[key][1], "item_001": article[key][0]}
+        call = Mock(return_value=SimpleNamespace(output_text=json.dumps(article)))
+        self.assertEqual(generate_recipe_article(call, "Tofu", INGREDIENTS, STEPS), ARTICLE)
+
+    def test_output_contract_requires_every_item_and_original_numbers(self):
+        import re
+        fmt = recipe_response_format(json.dumps({"ingredients": INGREDIENTS, "steps": STEPS}))
+        self.assertTrue(fmt["format"]["strict"])
+        ingredients = fmt["format"]["schema"]["properties"]["ingredients"]
+        self.assertEqual(ingredients["required"], ["item_001", "item_002"])
+        pattern = ingredients["properties"]["item_002"]["pattern"]
+        self.assertIsNotNone(re.fullmatch(pattern, "간장 1.5 큰술"))
+        for value in ("간장 15 큰술", "간장 1.5 큰술과 물 2 큰술", "간장 약간"):
+            self.assertIsNone(re.fullmatch(pattern, value))
+
     def test_valid_source_translation(self):
         self.assertEqual(validate_article(ARTICLE, INGREDIENTS, STEPS), ARTICLE)
+
+    def test_supported_time_can_appear_in_title_and_explanation(self):
+        article = copy.deepcopy(ARTICLE)
+        article["title"] = "5분 끓이는 두부 조림"
+        article["intro"] = "두부를 썬 뒤 5분 동안 끓이는 레시피입니다."
+        article["focus"] = {"heading": "5분 동안 끓이기", "body": "원문의 끓이는 시간은 5분입니다.", "source_steps": [2], "position": "before_steps"}
+        self.assertEqual(validate_article(article, INGREDIENTS, STEPS), article)
 
     def test_changed_decimal_rejected(self):
         article = copy.deepcopy(ARTICLE)
@@ -68,6 +98,7 @@ class RecipeQualityTests(unittest.TestCase):
         call = Mock(side_effect=[SimpleNamespace(output_text=json.dumps(invalid)), SimpleNamespace(output_text=json.dumps(ARTICLE))])
         self.assertEqual(generate_recipe_article(call, "Tofu", INGREDIENTS, STEPS), ARTICLE)
         self.assertEqual(call.call_count, 2)
+        self.assertEqual(json.loads(call.call_args_list[1].args[1])["previous_response"], invalid)
         for args, _ in call.call_args_list:
             source = json.loads(args[1])
             self.assertEqual(source["ingredients"], INGREDIENTS)
@@ -208,7 +239,7 @@ class EditorialQualityTests(unittest.TestCase):
         with patch.dict(os.environ, {"OPENAI_API_KEY": "test-key", "OPENAI_MODEL": "test-model"}), patch.object(bot, "OpenAI") as client, patch.object(bot, "generate_recipe_article", return_value=ARTICLE) as generate, patch.object(bot, "recent_editorials", return_value=[]):
             body, excerpt = bot.build_body_html(cfg, recipe, "", None)
             generate.assert_called_once()
-            generate.call_args.args[0]("instructions", "payload")
+            generate.call_args.args[0]("instructions", json.dumps({"ingredients": INGREDIENTS, "steps": STEPS}))
             self.assertEqual(client.return_value.responses.create.call_args.kwargs["model"], "test-model")
             self.assertEqual(excerpt, ARTICLE["intro"])
             self.assertEqual(cfg.run.editorial_article["title"], ARTICLE["title"])
@@ -218,6 +249,40 @@ class EditorialQualityTests(unittest.TestCase):
 class PublishingTests(unittest.TestCase):
     endpoint = "https://example.com/wp-json/wp/v2/posts"
     payload = {"slug": "recipe-day", "title": "두부 조림", "content": "<p>본문</p>", "status": "publish"}
+
+    @patch("wp_common._QUERY_ROUTE", new_callable=set)
+    @patch("wp_common.requests.post")
+    @patch("wp_common.requests.get")
+    def test_html_lookup_uses_official_query_route_for_single_publish(self, get, post, modes):
+        get.side_effect = [response(invalid=True), response([])]
+        post.return_value = response({"id": 7}, status=201)
+        with redirect_stdout(StringIO()):
+            self.assertEqual(write_post(self.endpoint, {}, self.payload)["id"], 7)
+        self.assertEqual(get.call_args.args[0], "https://example.com/")
+        self.assertEqual(get.call_args.kwargs["params"]["rest_route"], "/wp/v2/posts")
+        self.assertEqual(post.call_count, 1)
+        self.assertEqual(post.call_args.args[0], "https://example.com/")
+        self.assertEqual(post.call_args.kwargs["params"]["rest_route"], "/wp/v2/posts")
+
+    @patch("wp_common._QUERY_ROUTE", new_callable=set)
+    @patch("wp_common.requests.post")
+    @patch("wp_common.requests.get")
+    def test_both_lookup_routes_fail_without_creating(self, get, post, modes):
+        get.return_value = response(invalid=True)
+        with self.assertRaises(WordPressError):
+            write_post(self.endpoint, {}, self.payload)
+        self.assertEqual(get.call_count, 2)
+        post.assert_not_called()
+
+    @patch("wp_common._QUERY_ROUTE", new_callable=set)
+    @patch("wp_common.requests.post")
+    @patch("wp_common.requests.get")
+    def test_query_route_recovers_post_timeout_without_second_write(self, get, post, modes):
+        get.side_effect = [response(invalid=True), response([]), response([{"id": 8}])]
+        post.side_effect = requests.Timeout("uncertain")
+        with redirect_stdout(StringIO()):
+            self.assertEqual(write_post(self.endpoint, {}, self.payload)["id"], 8)
+        self.assertEqual(post.call_count, 1)
 
     @patch("wp_common.requests.post")
     @patch("wp_common.requests.get")
