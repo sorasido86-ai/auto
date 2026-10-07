@@ -41,7 +41,9 @@ def numbers(text):
 
 def spelled_numbers(text):
     values = {word: str(i) for i, word in enumerate("zero one two three four five six seven eight nine ten eleven twelve thirteen fourteen fifteen sixteen seventeen eighteen nineteen twenty".split())}
-    return Counter(values[word.lower()] for word in re.findall(r"\b(?:" + "|".join(values) + r")\b", text, flags=re.I))
+    result = Counter(values[word.lower()] for word in re.findall(r"\b(?:" + "|".join(values) + r")\b", text, flags=re.I))
+    result["1"] += len(re.findall(r"\b(?:a|an)\s+(?:(?:large|small|heaped|level|generous)\s+)?(?:pinch|cup|teaspoon|tablespoon|clove|slice|piece)\b", text, re.I))
+    return +result
 
 
 def recipe_response_format(payload):
@@ -61,6 +63,7 @@ def recipe_response_format(payload):
     properties["story"] = {"type": "array", "items": obj({
         "heading": {"anyOf": [string, {"type": "null"}]}, "body": string,
         "source_steps": {"type": "array", "items": {"type": "integer", "enum": list(range(1, len(source["steps"]) + 1))}},
+        "source_ingredients": {"type": "array", "items": {"type": "integer", "enum": list(range(1, len(source["ingredients"]) + 1))}},
         "position": {"type": "string", "enum": ["before_ingredients", "before_steps", "after_steps"]}})}
     return {"format": {"type": "json_schema", "name": "source_recipe", "strict": True, "schema": obj(properties)}}
 
@@ -80,6 +83,7 @@ def split_recipe_steps(instructions):
     # STEP 1 is a source label, not an instruction to translate as another step.
     parts = [re.sub(r"^(?:step\s+\d+\s*[:.)-]?\s*|\d+[.)]\s+)", "", p, flags=re.I).strip() for p in parts]
     parts = [p for p in parts if p]
+    parts = [p for p in parts if not (re.fullmatch(r"[^.!?]{1,100}:", p) and not numbers(p))]
     # Editorial source headings are not cooking instructions. Keep actual commands.
     parts = [p for p in parts if not (
         re.fullmatch(r"(?:Prepare|Make|Shape|Cook|Assemble) (?:the )?[A-ZÀ-Ž][^.!?]{0,65}", p)
@@ -147,6 +151,23 @@ def require_recipe(ingredients, steps):
         raise ContentQualityError("재료와 조리 단계가 없는 레시피는 발행하지 않습니다.")
 
 
+def choose_validated_recipe(pick, author, attempts=3):
+    """Try another source candidate after a quality failure, never publish bad prose."""
+    seen, last_error = set(), None
+    for attempt in range(attempts):
+        recipe = pick()
+        identity = str(recipe.get("id", ""))
+        if identity and identity in seen:
+            continue
+        seen.add(identity)
+        try:
+            return recipe, author(recipe)
+        except ContentQualityError as exc:
+            last_error = exc
+            print(f"[RECIPE] 후보 {attempt + 1} 검증 실패: {exc}. 다른 원문 후보를 확인합니다.")
+    raise ContentQualityError("유효한 레시피 후보를 찾지 못했습니다. " + str(last_error or "후보 중복"))
+
+
 def prose(article):
     focus = article.get("focus") or {}
     return "\n\n".join([article["intro"], focus.get("body", ""),
@@ -204,11 +225,15 @@ def validate_article(article, ingredients, steps, recent=None):
             raise ContentQualityError("이야기 소제목은 생략하거나 45자 이내로 작성하세요.")
         if not isinstance(body, str) or not body.strip() or len(body) > 500:
             raise ContentQualityError("이야기 문단은 500자 이내로 작성하세요.")
-        if not isinstance(refs, list) or not refs or any(type(i) is not int or not 1 <= i <= len(steps) for i in refs) or len(set(refs)) != len(refs):
-            raise ContentQualityError("이야기 문단에 유효한 원문 단계 번호가 필요합니다.")
-        reference = " ".join(steps[i - 1] for i in refs)
+        ingredient_refs = block.get("source_ingredients", [])
+        if (not isinstance(refs, list) or not isinstance(ingredient_refs, list) or not (refs or ingredient_refs)
+            or any(type(i) is not int or not 1 <= i <= len(steps) for i in refs)
+            or any(type(i) is not int or not 1 <= i <= len(ingredients) for i in ingredient_refs)
+            or len(set(refs)) != len(refs) or len(set(ingredient_refs)) != len(ingredient_refs)):
+            raise ContentQualityError("이야기 문단에 유효한 원문 단계·재료 번호가 필요합니다.")
+        reference = " ".join([steps[i - 1] for i in refs] + [ingredients[i - 1] for i in ingredient_refs])
         if set(numbers((heading or "") + " " + body)) - set(numbers(reference) + spelled_numbers(reference)):
-            raise ContentQualityError("이야기 문단의 숫자가 근거 단계에 없습니다.")
+            raise ContentQualityError(f"이야기 문단의 숫자가 인용한 단계·재료에 없습니다. 허용 숫자: {dict(numbers(reference) + spelled_numbers(reference))}; 문단 숫자: {dict(numbers((heading or '') + ' ' + body))}")
         extra += [body] + ([heading] if heading else [])
     dish = article.get("dish_name")
     if dish is not None and (not isinstance(dish, str) or not dish.strip() or len(dish) > 45 or normalized_prose(dish) not in normalized_prose(article["title"])):
@@ -278,6 +303,8 @@ story는 0~3개입니다. intro에서 시작한 이야기를 이어가는 데 �
 각 문단의 heading은 필요할 때만 쓰고 45자 이내, 아니면 null입니다. body는 500자 이내입니다.
 position은 before_ingredients/before_steps/after_steps 중 내용의 흐름에 맞게 정하세요.
 source_steps에는 사실의 근거인 원문 단계 번호를 1부터 적으세요.
+재료의 계량이나 조합을 설명할 때는 source_ingredients에 근거 재료 번호를 1부터 적으세요.
+필요 없는 근거 목록은 []로 쓰되 두 목록 중 하나는 비워두지 마세요.
 소제목·문단 수·위치를 고정하지 마세요. 레시피를 다시 요약하는 문단이나 상투적인 맺음말은 생략하세요.
 기존 focus 필드는 null로 작성하세요. angle은 내부 편집 메모로 60자 이내의 짧은 핵심 구절입니다.
 따뜻한 해요체를 기본으로 자연스러운 문장 길이와 어순을 섞으세요. 독자에게 계속 말을 걸지는 마세요.
@@ -292,6 +319,7 @@ recent_editorials는 실제 최근 글입니다. 제목 문법, 첫 문장, 이�
 수량·시간·온도·불 세기·순서·원문의 조건문과 선택사항을 보존하세요. 원문에 없는 계량은 단계에 더하지 마세요.
 숫자는 소수·분수까지 원문 그대로 유지하고 단위만 번역하세요. 단위 환산이나 1/2를 0.5로 바꾸는 것은 금지입니다.
 one cup이나 two saucepans는 물 1컵, 냄비 두 개처럼 같은 의미로 번역하세요.
+a large pinch는 큰 한 꼬집 또는 큰 1꼬집처럼 같은 뜻으로 쓸 수 있습니다.
 수량이 없는 행에는 다른 행의 수량을 가져오지 마세요. 이전 응답을 고칠 때 맞는 재료와 단계까지 다시 배열하지 마세요.
 경험을 지어내거나 요리의 역사·날씨·건강 효능·소요 시간·맛·식감·인과관계를 원문 밖에서 추가하지 마세요.
 재료 조합과 눈에 보이는 과정은 생생하게 묘사하되 원문에 없는 감각적 평가를 확정하지 마세요.

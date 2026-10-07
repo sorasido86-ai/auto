@@ -21,7 +21,7 @@ import openai  # 예외 타입용
 from openai import OpenAI
 from content_quality import generate_recipe_article, render_recipe, save_preview, safe_url, recent_editorials, remember_editorial, recipe_response_format, split_recipe_steps
 from wp_common import write_post, find_post, recent_recipe_posts
-from content_quality import editorial_context, normalize_mealdb_source
+from content_quality import editorial_context, normalize_mealdb_source, choose_validated_recipe
 
 
 KST = timezone(timedelta(hours=9))
@@ -544,19 +544,17 @@ def run(cfg: AppConfig) -> None:
 
     init_db(cfg.sqlite_path, debug=cfg.run.debug)
 
-    recipe = pick_recipe(cfg)
-    recipe_id = recipe.get("id", "")
-    title_en = recipe.get("title", "") or "Daily Recipe"
-    ingredients_en = recipe.get("ingredients", []) or []
-    steps_en = split_steps(recipe.get("instructions", ""))
-
     client = OpenAI(api_key=cfg.openai.api_key, timeout=120.0, max_retries=0)
-
-    ingredients = [f"{x.get('name', '')} {x.get('measure', '')}".strip() for x in ingredients_en]
     def call(instructions, payload):
         return _openai_call_with_retry(client, cfg.openai.model, instructions, payload, cfg.run.openai_max_retries, cfg.run.debug)
     recent = editorial_context(recent_editorials(cfg.sqlite_path), recent_recipe_posts(cfg.wp.base_url))
-    article = generate_recipe_article(call, title_en, ingredients, steps_en, recent=recent)
+    def author(candidate):
+        ingredients = [f"{x.get('name', '')} {x.get('measure', '')}".strip() for x in candidate.get("ingredients", [])]
+        return generate_recipe_article(call, candidate.get("title", ""), ingredients,
+                                       split_steps(candidate.get("instructions", "")), recent=recent)
+    recipe, article = choose_validated_recipe(lambda: pick_recipe(cfg), author)
+    recipe_id = recipe.get("id", "")
+    title_en = recipe.get("title", "") or "Daily Recipe"
     source = safe_url(recipe.get("source")) or f"https://www.themealdb.com/meal/{recipe_id}"
     body_html = render_recipe(article, source, "TheMealDB 레시피 원문")
 

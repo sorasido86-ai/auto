@@ -21,7 +21,7 @@ import openai  # 예외 타입 용도
 from openai import OpenAI  # 공식 SDK
 from content_quality import generate_recipe_article, render_recipe, save_preview, safe_url, recent_editorials, remember_editorial, recipe_response_format, split_recipe_steps
 from wp_common import write_post, recent_recipe_posts
-from content_quality import editorial_context, normalize_mealdb_source
+from content_quality import editorial_context, normalize_mealdb_source, choose_validated_recipe
 from wp_common import find_post
 
 
@@ -683,7 +683,12 @@ def run(cfg: AppConfig) -> None:
     if wp_post_id and can_refresh:
         print("[EDITORIAL] 기존 글·원문 레시피를 유지해 문장을 다시 편집합니다:", wp_post_id)
 
-    recipe = pick_recipe(cfg, existing)
+    if wp_post_id or existing:
+        recipe = pick_recipe(cfg, existing)
+        title_ko, body_html = generate_korean_blog_naverish(cfg, recipe)
+    else:
+        recipe, (title_ko, body_html) = choose_validated_recipe(
+            lambda: pick_recipe(cfg, existing), lambda candidate: generate_korean_blog_naverish(cfg, candidate))
     recipe_id = recipe.get("id", "")
     recipe_title_en = recipe.get("title", "") or "Daily Recipe"
 
@@ -700,8 +705,6 @@ def run(cfg: AppConfig) -> None:
                 print("[WARN] media upload failed:", repr(e))
 
     featured = media_id if (cfg.run.set_featured and media_id) else None
-
-    title_ko, body_html = generate_korean_blog_naverish(cfg, recipe)
 
     article = getattr(cfg.run, "editorial_article", None)
     if article:

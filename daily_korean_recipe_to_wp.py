@@ -897,10 +897,13 @@ def run(cfg: AppConfig) -> None:
     init_db(cfg.sqlite_path)
 
     today_meta = get_today_post(cfg.sqlite_path, date_slot)
+    existing = None
+    refresh_editorial = _env("REFRESH_EDITORIAL", "0") == "1"
+    can_refresh = refresh_editorial and today_meta and today_meta.get("recipe_source") and today_meta.get("recipe_id")
     if not cfg.run.dry_run and not cfg.run.force_new:
         endpoint = cfg.wp.base_url.rstrip("/") + "/wp-json/wp/v2/posts"
         existing = find_post(endpoint, wp_auth_header(cfg.wp.user, cfg.wp.app_pass), f"korean-recipe-{date_str}-{slot}")
-        if existing:
+        if existing and not can_refresh:
             print("SKIP(already posted):", existing["id"])
             return
     recent_pairs = get_recent_recipe_ids(cfg.sqlite_path, cfg.run.avoid_repeat_days)
@@ -914,6 +917,8 @@ def run(cfg: AppConfig) -> None:
         chosen = get_recipe_by_id(cfg, today_meta["recipe_source"], today_meta["recipe_id"])
 
     if not chosen:
+        if existing and can_refresh:
+            raise RuntimeError("기존 글의 원문 레시피를 다시 읽지 못해 다른 요리로 덮어쓰지 않았습니다.")
         print("[RECIPE] ... choosing (mfds -> local)")
         chosen = pick_recipe_mfds(cfg, recent_pairs) or pick_recipe_local(cfg, recent_pairs)
 
