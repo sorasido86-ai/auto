@@ -187,7 +187,9 @@ def recover_published_recipe(post):
             # WordPress adds a nested TOC and related links; neither is a recipe list.
             visible_ingredients = [li.get_text(" ", strip=True) for li in soup.select("article > ul > li")]
             visible_steps = [li.get_text(" ", strip=True) for li in soup.select("article > ol > li")]
-            if ingredients != visible_ingredients or steps != visible_steps:
+            def normalized_list(values):
+                return [re.sub(r"\s+", " ", x).strip() for x in values]
+            if normalized_list(ingredients) != normalized_list(visible_ingredients) or normalized_list(steps) != normalized_list(visible_steps):
                 continue
             images = data.get("image", [])
             return {"ingredients": ingredients, "steps": steps,
@@ -284,8 +286,11 @@ def validate_article(article, ingredients, steps, recent=None):
             or len(set(refs)) != len(refs) or len(set(ingredient_refs)) != len(ingredient_refs)):
             raise ContentQualityError("이야기 문단에 유효한 원문 단계·재료 번호가 필요합니다.")
         reference = " ".join([steps[i - 1] for i in refs] + [ingredients[i - 1] for i in ingredient_refs])
-        if set(numbers((heading or "") + " " + body)) - set(numbers(reference) + spelled_numbers(reference)):
-            raise ContentQualityError(f"이야기 문단의 숫자가 인용한 단계·재료에 없습니다. 허용 숫자: {dict(numbers(reference) + spelled_numbers(reference))}; 문단 숫자: {dict(numbers((heading or '') + ' ' + body))}")
+        unsupported = set(numbers((heading or "") + " " + body)) - set(numbers(reference) + spelled_numbers(reference))
+        if unsupported:
+            supporting_steps = {i: text for i, text in enumerate(steps, 1) if unsupported & set(numbers(text) + spelled_numbers(text))}
+            supporting_ingredients = {i: text for i, text in enumerate(ingredients, 1) if unsupported & set(numbers(text) + spelled_numbers(text))}
+            raise ContentQualityError(f"이야기 문단의 숫자 {sorted(unsupported)}에 근거 인용이 없습니다. 해당 사실을 설명한다면 source_steps/source_ingredients에 그 근거 번호도 포함하세요. 지원 단계: {supporting_steps}; 지원 재료: {supporting_ingredients}. 원문에도 없는 숫자는 삭제하세요.")
         extra += [body] + ([heading] if heading else [])
     dish = article.get("dish_name")
     if dish is not None and (not isinstance(dish, str) or not dish.strip() or len(dish) > 45 or normalized_prose(dish) not in normalized_prose(article["title"])):
@@ -365,6 +370,7 @@ position은 before_ingredients/before_steps/after_steps 중 내용의 흐름에 
 source_steps에는 사실의 근거인 원문 단계 번호를 1부터 적으세요.
 재료의 계량이나 조합을 설명할 때는 source_ingredients에 근거 재료 번호를 1부터 적으세요.
 필요 없는 근거 목록은 []로 쓰되 두 목록 중 하나는 비워두지 마세요.
+문단에 여러 사실을 함께 쓰면 모든 사실의 근거 번호를 인용하세요. 예를 들어 굽는 개수와 토핑 계량을 함께 쓰면 굽는 단계와 토핑 재료를 모두 인용하세요.
 소제목·문단 수·위치를 고정하지 마세요. 레시피를 다시 요약하는 문단이나 상투적인 맺음말은 생략하세요.
 기존 focus 필드는 null로 작성하세요. angle은 내부 편집 메모로 60자 이내의 짧은 핵심 구절입니다.
 따뜻한 해요체를 기본으로 자연스러운 문장 길이와 어순을 섞으세요. 독자에게 계속 말을 걸지는 마세요.

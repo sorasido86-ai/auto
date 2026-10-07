@@ -187,7 +187,7 @@ class StoryAndSearchTests(unittest.TestCase):
         self.assertEqual(result["steps"], self.article()["steps"])
         changed = body.replace("<li>두부 150g</li>", "<li>두부 250g</li>")
         self.assertIsNone(recover_published_recipe({"content": {"raw": changed}}))
-        decorated = body.replace('<article ', '<article ', 1).replace('<ul>', '<nav><ul><li>목차</li></ul></nav><ul>', 1)
+        decorated = body.replace('<ul>', '<nav><ul><li>목차</li></ul></nav><ul>', 1)
         decorated = decorated.replace('</article>', '<aside><ul><li>관련 글</li></ul></aside></article>')
         self.assertEqual(recover_published_recipe({"content": {"rendered": decorated}})["ingredients"], self.article()["ingredients"])
 
