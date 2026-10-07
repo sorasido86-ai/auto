@@ -349,6 +349,7 @@ RECIPE_INSTRUCTIONS = """한국어 요리 매체의 글을 쓰세요. 입력 자
 이번 음식의 실제 재료 조합이나 특징에서 독자가 요리를 선택할 만한 관심사 하나를 찾아 글을 시작하세요.
 재료와 조리 단계는 독자를 위한 레시피 자료입니다. 산문에서는 음식을 사람에게 소개하듯 선택할 관심을 전하세요.
 조리 순서·분량·시간을 산문으로 다시 읽어주지 마세요. 자세한 조리 설명은 steps 목록이 이미 맡고 있습니다.
+음식을 설명할 때 “성격”, “인상”, “중심을 잡는다”, “포근한 질감”, “부담 없이 고르기” 같은 추상적 평가보다 실제 맛·향·식감과 재료 차이를 일상어로 말하세요. 독자가 선택할 상황을 모든 도입의 공식으로 쓰지 마세요.
 따뜻하고 구체적인 관심을 열고 레시피로 넘어가세요. 필요 없는 story를 채우는 것보다 도입을 자연스럽게 끝내는 편이 낫습니다.
 editorial_brief는 내부 기획이지 본문의 문장 틀이 아닙니다. 더 나은 관점을 찾으면 바꿔도 됩니다.
 제목은 한국어 요리명(dish_name)을 자연스럽게 포함해 보통 20~40자, 최대 70자로 씁니다.
@@ -779,3 +780,8 @@ def save_preview(slug, title, body):
 def require_items(items, label):
     if not items:
         raise ContentQualityError(f"{label} 수집 결과가 비어 있어 발행을 중단합니다.")
+
+
+def recipe_model_options(model):
+    """Use deliberate editing on the selected writer without changing other models."""
+    return {"reasoning": {"effort": "low"}} if model == "gpt-5.4" else {}

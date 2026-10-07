@@ -7,7 +7,7 @@ import requests
 from openai import OpenAI
 from content_quality import (editorial_context, generate_recipe_article,
                              recipe_response_format, recover_published_recipe,
-                             render_recipe, save_preview)
+                             render_recipe, save_preview, recipe_model_options)
 from wp_common import recent_recipe_posts
 
 
@@ -20,7 +20,8 @@ def main():
     client = OpenAI(api_key=os.environ["OPENAI_API_KEY"], timeout=120, max_retries=1)
     def call(instructions, payload):
         return client.responses.create(model=os.environ.get("OPENAI_MODEL", "gpt-5.2"),
-                                       instructions=instructions, input=payload, text=recipe_response_format(payload))
+                                       instructions=instructions, input=payload, text=recipe_response_format(payload),
+                                       **recipe_model_options(os.environ.get("OPENAI_MODEL", "gpt-5.2")))
     reports, seen = [], set()
     for post in posts:
         prefix = next((p for p in ("daily-recipe-", "korean-recipe-", "naverstyle-recipe-") if post["slug"].startswith(p)), None)
