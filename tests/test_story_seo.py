@@ -10,13 +10,18 @@ from content_quality import (ContentQualityError, validate_article, render_recip
                              review_recipe_article, generate_recipe_article, format_editorial_paragraphs,
                              recipe_response_format, normalize_mealdb_source, choose_validated_recipe,
                              recover_published_recipe, translate_recipe_items, numbers, normalize_recipe_units)
-from content_quality import plan_recipe_editorial, assess_recipe_editorial, EDITORIAL_CRITERIA
+from content_quality import plan_recipe_editorial, assess_recipe_editorial, EDITORIAL_CRITERIA, recipe_model_options
 from wp_common import recent_recipe_posts
 from site_search_health import page_metadata, xml_locations
 from refresh_site_sitemap import refresh
 
 
 class StoryAndSearchTests(unittest.TestCase):
+    def test_deliberate_editing_is_scoped_to_selected_model(self):
+        self.assertEqual(recipe_model_options("gpt-5.4"), {"reasoning": {"effort": "low"}})
+        for model in ("gpt-4.1-mini", "gpt-5.2", "custom-model"):
+            self.assertEqual(recipe_model_options(model), {})
+
     def brief(self):
         return {"reader_interest": "두부만 남은 날의 반찬", "factual_anchor": "두부와 간장",
                 "development": "작은 재료 조합에서 조림으로 이어가기", "avoid_recent": "도마에서 시작하는 글 반복 피하기",
