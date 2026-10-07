@@ -51,7 +51,7 @@ jobs:
         WP_USER: ${{ secrets.WP_USER }}
         WP_APP_PASS: ${{ secrets.WP_APP_PASS }}
         OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-        OPENAI_MODEL: ${{ secrets.OPENAI_MODEL }}
+        OPENAI_MODEL: gpt-5.2
         MFDS_API_KEY: ${{ secrets.MFDS_API_KEY }}
         DEFAULT_THUMB_URL: ${{ secrets.DEFAULT_THUMB_URL }}
         WP_STATUS: publish

@@ -51,8 +51,9 @@ def recipe_response_format(payload):
         return {"type": "object", "properties": properties, "required": list(properties), "additionalProperties": False}
     string = {"type": "string"}
     properties = {key: string for key in ("title", "dish_name", "intro", "excerpt", "angle")}
-    for key in ("ingredients", "steps"):
-        properties[key] = obj({f"item_{i:03d}": string for i in range(1, len(source[key]) + 1)})
+    if source.get("authoring_mode") != "editorial":
+        for key in ("ingredients", "steps"):
+            properties[key] = obj({f"item_{i:03d}": string for i in range(1, len(source[key]) + 1)})
     properties["focus"] = {"anyOf": [{"type": "null"}, obj({
         "heading": string, "body": string,
         "source_steps": {"type": "array", "items": {"type": "integer", "enum": list(range(1, len(source["steps"]) + 1))}},
@@ -81,7 +82,8 @@ def split_recipe_steps(instructions):
 
 
 def split_recipe_ingredients(text):
-    text = re.sub(r"(?m)^\s*(?:주재료|부재료|양념|양념장|소스|재료)\s*[:：]?\s*$", "", str(text or ""))
+    text = re.sub(r"\[(?:소재료|주재료|부재료|양념|양념장|소스|재료)\]", "\n", str(text or ""))
+    text = re.sub(r"(?m)^\s*(?:주재료|부재료|양념|양념장|소스|재료)\s*[:：]?\s*$", "", text)
     parts, buffer, depth = [], [], 0
     for i, char in enumerate(text):
         if char in "([":
@@ -267,15 +269,79 @@ one cup이나 two saucepans는 물 1컵, 냄비 두 개처럼 같은 의미로 �
 제목 재진술, 일반 조리 팁, SEO 키워드 반복, 정형적인 요약/FAQ/추천 이유/마무리 코너, HTML·마크다운을 넣지 마세요."""
 
 
-def generate_recipe_article(call, title, ingredients, steps, recent=None):
+def format_editorial_paragraphs(text, limit=180):
+    """Only insert paragraph breaks between complete sentences; never cut prose."""
+    paragraphs = []
+    for original in text.split("\n\n"):
+        current = ""
+        for sentence in sentences(original):
+            if current and len(current) + len(sentence) + 1 > limit:
+                paragraphs.append(current)
+                current = ""
+            current += (" " if current else "") + sentence
+        if current:
+            paragraphs.append(current)
+    return "\n\n".join(paragraphs)
+
+
+def format_article_prose(article):
+    if isinstance(article.get("intro"), str):
+        article["intro"] = format_editorial_paragraphs(article["intro"])
+    for block in [article.get("focus"), *article.get("story", [])]:
+        if isinstance(block, dict) and isinstance(block.get("body"), str):
+            block["body"] = format_editorial_paragraphs(block["body"])
+    return article
+
+
+EDITORIAL_REVIEW = """이 초안의 제목과 산문을 숙련된 한국어 편집자로서 다시 편집하세요.
+재료·조리 단계는 확정된 사실 자료입니다. 이 목록은 출력하거나 변경하지 마세요.
+원문에 없는 맛·식감·효과·인과관계, 역사, 작가 경험, 편의성 주장을 찾아 삭제하세요.
+글의 이야기 중 사실 자료로 확인할 수 있는 장면과 순서만 남기세요.
+소재가 바뀌는 연결이 자연스럽고 제목이 본문에서 충족되는지 확인하세요.
+제목과 도입이 조리 순서 요약이나 설명문을 그대로 반복하면 다시 쓰세요.
+과정 전체를 한 문장에 우겨 넣지 마세요. 늘어지는 문장과 어색한 동사·추상적인 평가를 고치세요.
+읽다가 뜻을 되짚어야 하는 문장, 억지 감상, 식재료를 과장되게 의인화한 표현은 삭제하세요.
+소제목은 아래 문단의 내용에 정확히 맞아야 합니다. 이유를 설명하지 않는 문단에 왜/이유라는 제목을 붙이지 마세요.
+이름과 형용사만 바꾼 상투적인 표현, 정형적인 맺음말을 만들지 마세요.
+제목을 독자가 실제로 얻을 정보와 연결하고, 이번 요리의 구체적인 호기심을 자연스럽게 드러내세요.
+최근 실제 게시글과 제목·첫 문장·전개·끝맺음이 겹치지 않는지 다시 비교하세요.
+식재료·요리의 한국어 이름을 정확히 쓰세요. 영문 이름을 어색하게 음역한 것은 바로잡으세요.
+분량을 늘릴 필요는 없습니다. 별도 설명이 도입·단계와 중복되면 story에서 빼세요.
+각 문장은 120자 이내, 문단은 180자 이내입니다. focus는 null로 작성하세요.
+JSON 스키마의 편집 필드만 출력하세요. 수정한 글이 원문의 의미를 벗어나지 않게 최종 확인하세요."""
+
+
+def review_recipe_article(call, draft, title, ingredients, steps, recent):
+    source = {"title": title, "ingredients": ingredients, "steps": steps,
+              "authoring_mode": "editorial", "draft": draft, "recent_editorials": list(recent or [])[:12]}
+    error = ""
+    for attempt in range(2):
+        response = call(RECIPE_INSTRUCTIONS + "\n\n" + EDITORIAL_REVIEW + ("\n검증 오류: " + error if error else ""),
+                        json.dumps(source, ensure_ascii=False))
+        try:
+            edited = parse_json_object(response.output_text)
+            # Recipe facts cannot be rewritten or shifted by the editing pass.
+            edited["ingredients"], edited["steps"] = draft["ingredients"], draft["steps"]
+            format_article_prose(edited)
+            return validate_article(edited, ingredients, steps, recent)
+        except (ValueError, TypeError, KeyError) as exc:
+            error = str(exc)
+            source["previous_response"] = edited if "edited" in locals() else {}
+    raise ContentQualityError("편집 검증 실패: " + error)
+
+
+def generate_recipe_article(call, title, ingredients, steps, recent=None, source_is_korean=False):
     require_recipe(ingredients, steps)
     source = {"title": title, "ingredients": ingredients, "steps": steps,
               "recent_editorials": list(recent or [])[:12]}
+    if source_is_korean:
+        source["authoring_mode"] = "editorial"
     error = ""
     # One correction attempt, never an unvalidated fallback.
     for attempt in range(2):
         instructions = RECIPE_INSTRUCTIONS
-        instructions += "\n재료와 단계는 배열 대신 item_001, item_002 순서의 객체로 출력하세요. 각 원문 항목에 한 필드를 대응시키고 빠뜨리거나 합치지 마세요."
+        instructions += ("\n원문은 이미 한국어입니다. 재료·단계는 출력하지 말고 편집 필드만 작성하세요." if source_is_korean else
+                         "\n재료와 단계는 배열 대신 item_001, item_002 순서의 객체로 출력하세요. 각 원문 항목에 한 필드를 대응시키고 빠뜨리거나 합치지 마세요.")
         payload = json.dumps(source, ensure_ascii=False)
         if error:
             instructions += "\n이전 응답의 검증 오류를 고쳐 원문부터 다시 작성하세요: " + error
@@ -284,13 +350,19 @@ def generate_recipe_article(call, title, ingredients, steps, recent=None):
         try:
             article = parse_json_object(response.output_text)
             source["previous_response"] = article.copy()
+            if source_is_korean:
+                article["ingredients"], article["steps"] = list(ingredients), list(steps)
             for key, items in (("ingredients", ingredients), ("steps", steps)):
                 if isinstance(article.get(key), dict):
                     expected = [f"item_{i:03d}" for i in range(1, len(items) + 1)]
                     if set(article[key]) != set(expected):
                         raise ContentQualityError(f"{key}의 원문 항목 번호가 누락 또는 추가되었습니다.")
                     article[key] = [article[key][k] for k in expected]
-            return validate_article(article, ingredients, steps, recent)
+            format_article_prose(article)
+            validate_article(article, ingredients, steps, recent)
+            if article.get("dish_name"):
+                return review_recipe_article(call, article, title, ingredients, steps, recent)
+            return article
         except (ValueError, TypeError, KeyError) as exc:
             error = str(exc)
     target = Path("artifacts")

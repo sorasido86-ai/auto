@@ -674,9 +674,14 @@ def run(cfg: AppConfig) -> None:
     elif not cfg.run.dry_run:
         wp_post_id = wp_find_post_by_slug(cfg.wp, slug)
 
-    if wp_post_id and not cfg.run.force_new:
+    refresh_editorial = _env("REFRESH_EDITORIAL", "0") == "1"
+    # A deliberate code-deployment refresh must reuse a known source recipe.
+    can_refresh = refresh_editorial and existing and existing.get("recipe_id")
+    if wp_post_id and not cfg.run.force_new and not can_refresh:
         print("SKIP(already posted):", wp_post_id)
         return
+    if wp_post_id and can_refresh:
+        print("[EDITORIAL] 기존 글·원문 레시피를 유지해 문장을 다시 편집합니다:", wp_post_id)
 
     recipe = pick_recipe(cfg, existing)
     recipe_id = recipe.get("id", "")

@@ -1,13 +1,17 @@
 import importlib
 import json
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch, Mock
 
 from bs4 import BeautifulSoup
 from content_quality import (ContentQualityError, validate_article, render_recipe,
-                             split_recipe_steps, split_recipe_ingredients, editorial_context)
+                             split_recipe_steps, split_recipe_ingredients, editorial_context,
+                             review_recipe_article, generate_recipe_article, format_editorial_paragraphs,
+                             recipe_response_format)
 from wp_common import recent_recipe_posts
 from site_search_health import page_metadata, xml_locations
+from refresh_site_sitemap import refresh
 
 
 class StoryAndSearchTests(unittest.TestCase):
@@ -93,6 +97,57 @@ class StoryAndSearchTests(unittest.TestCase):
         bot = importlib.import_module("daily_korean_recipe_to_wp")
         self.assertEqual(bot.mfds_row_to_recipe({"RCP_PARTS_DTLS": source}).ingredients, expected)
         self.assertEqual(split_recipe_ingredients("물 1,000ml, 당근(껍질 제거, 다짐) 30g"), ["물 1,000ml", "당근(껍질 제거, 다짐) 30g"])
+        self.assertEqual(split_recipe_ingredients("소금적당량 [소재료] 김치 20g, 오징어 30g [양념] 설탕 5g"), ["소금적당량", "김치 20g", "오징어 30g", "설탕 5g"])
+
+    def test_editor_cannot_change_fixed_recipe_facts(self):
+        article = self.article()
+        edited = {**article, "ingredients": ["두부 50g"], "steps": ["180도에 구워요."]}
+        call = Mock(return_value=SimpleNamespace(output_text=json.dumps(edited)))
+        result = review_recipe_article(call, article, "Tofu", ["Tofu 150g", "Soy sauce 1 tbsp"], ["Cut tofu into cubes.", "Simmer with soy sauce for 5 minutes."], [])
+        self.assertEqual(result["ingredients"], article["ingredients"])
+        self.assertEqual(result["steps"], article["steps"])
+        source = json.loads(call.call_args.args[1])
+        self.assertEqual(source["authoring_mode"], "editorial")
+        self.assertNotIn("ingredients", recipe_response_format(call.call_args.args[1])["format"]["schema"]["properties"])
+
+    def test_korean_source_quantities_never_depend_on_model_copying(self):
+        article = self.article()
+        article.pop("ingredients")
+        article.pop("steps")
+        call = Mock(return_value=SimpleNamespace(output_text=json.dumps(article)))
+        result = generate_recipe_article(call, "두부 조림", ["두부 150g", "간장 1큰술"], ["두부를 깍둑썰기해요.", "간장과 함께 5분 동안 끓여요."], source_is_korean=True)
+        self.assertEqual(result["ingredients"], ["두부 150g", "간장 1큰술"])
+        self.assertEqual(result["steps"], ["두부를 깍둑썰기해요.", "간장과 함께 5분 동안 끓여요."])
+        self.assertEqual(call.call_count, 2)
+
+    def test_paragraph_reflow_preserves_all_sentences(self):
+        parts = ["가나다 " * 14 + ending for ending in ("써요.", "옮겨요.", "끓여요.", "담아요.")]
+        original = " ".join(parts)
+        formatted = format_editorial_paragraphs(original)
+        self.assertEqual(formatted.replace("\n\n", " "), original)
+        self.assertTrue(all(len(p) <= 180 for p in formatted.split("\n\n")))
+
+    @patch("refresh_site_sitemap.find_post")
+    @patch("refresh_site_sitemap.save_sitemap")
+    @patch("refresh_site_sitemap.export_sitemap")
+    def test_sitemap_refresh_restores_observed_settings_including_exclusions(self, export, save, find):
+        original = {"links_per_sitemap": "200", "exclude_posts": "12,34", "include_images": "on"}
+        changed = {**original, "links_per_sitemap": 201}
+        export.side_effect = [original, changed, {**original, "links_per_sitemap": 200}]
+        result = refresh("https://example.com", {})
+        self.assertTrue(result["settings_restored"])
+        self.assertEqual([c.args[2] for c in save.call_args_list], [changed, original])
+
+    @patch("refresh_site_sitemap.find_post")
+    @patch("refresh_site_sitemap.save_sitemap")
+    @patch("refresh_site_sitemap.export_sitemap")
+    def test_failed_sitemap_write_is_read_back_and_restored(self, export, save, find):
+        original = {"links_per_sitemap": 200}
+        export.side_effect = [original, {"links_per_sitemap": 201}]
+        save.side_effect = [__import__("requests").Timeout(), None]
+        with self.assertRaises(__import__("requests").Timeout):
+            refresh("https://example.com", {})
+        self.assertEqual(save.call_args.args[2], original)
 
     @patch("wp_common.requests.get")
     def test_public_history_is_cross_workflow_and_ignores_non_recipe_or_scripts(self, get):
