@@ -224,7 +224,9 @@ class StoryAndSearchTests(unittest.TestCase):
         self.assertEqual(result["story"], [])
         rewrite = json.loads(call.call_args_list[2].args[1])
         self.assertEqual(rewrite["reader_assessment"], rejected)
-        self.assertEqual(rewrite["draft"]["story"], self.article()["story"])
+        self.assertNotIn("draft", rewrite)
+        self.assertIsNone(rewrite["editorial_brief"])
+        self.assertTrue(rewrite["rebuild_from_facts"])
         self.assertTrue(all(result["editorial_assessment"][key] for key in EDITORIAL_CRITERIA))
 
     def test_draft_prose_is_repaired_before_publication_checks(self):
