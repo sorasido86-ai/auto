@@ -21,7 +21,7 @@ jobs:
         run: python editorial_preview.py
         env:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-          OPENAI_MODEL: gpt-5.2
+          OPENAI_MODEL: gpt-5.4
           PYTHONUNBUFFERED: '1'
       - uses: actions/upload-artifact@v4
         if: always()
