@@ -227,6 +227,14 @@ class StoryAndSearchTests(unittest.TestCase):
         self.assertEqual(rewrite["draft"]["story"], self.article()["story"])
         self.assertTrue(all(result["editorial_assessment"][key] for key in EDITORIAL_CRITERIA))
 
+    def test_draft_prose_is_repaired_before_publication_checks(self):
+        draft = {**self.article(), "intro": "두부 조림, 한 팬 리듬으로 특별한 순간을 만들어요."}
+        values = [self.brief(), draft, self.article(), self.verdict()]
+        call = Mock(side_effect=[SimpleNamespace(output_text=json.dumps(x)) for x in values])
+        result = generate_recipe_article(call, "두부 조림", self.article()["ingredients"], self.article()["steps"], source_is_korean=True)
+        self.assertNotIn("한 팬 리듬", result["intro"])
+        self.assertEqual(json.loads(call.call_args_list[2].args[1])["draft"]["intro"], draft["intro"])
+
     def test_persistent_dry_story_is_not_published_as_valid_fallback(self):
         rejected = self.verdict(natural_prose=False, issues=[{"quote": "도마 위에 두부를 올려요.", "repair": "조리 지시를 도입으로 반복하지 마세요."}])
         values = [self.article(), rejected] * 3

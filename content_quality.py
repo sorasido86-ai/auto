@@ -644,9 +644,11 @@ def generate_recipe_article(call, title, ingredients, steps, recent=None, source
                         raise ContentQualityError(f"{key}의 원문 항목 번호가 누락 또는 추가되었습니다.")
                     article[key] = [article[key][k] for k in expected]
             format_article_prose(article)
-            validate_article(article, ingredients, steps, recent)
             if article.get("dish_name"):
+                # A draft is allowed to need editing. All publication checks run on
+                # each edited result before the reader assessment can accept it.
                 return review_recipe_article(call, article, title, ingredients, steps, recent, brief)
+            validate_article(article, ingredients, steps, recent)
             return article
         except (ValueError, TypeError, KeyError) as exc:
             error = str(exc)
