@@ -249,7 +249,8 @@ class EditorialQualityTests(unittest.TestCase):
         call = Mock(side_effect=[SimpleNamespace(output_text=json.dumps(previous)), SimpleNamespace(output_text=json.dumps(previous)), SimpleNamespace(output_text=json.dumps(changed))])
         self.assertEqual(generate_recipe_article(call, "Tofu", INGREDIENTS, STEPS, [previous]), changed)
         self.assertEqual(call.call_count, 3)
-        self.assertEqual(json.loads(call.call_args_list[1].args[1])["recent_editorials"], [previous])
+        self.assertNotIn("recent_editorials", json.loads(call.call_args_list[1].args[1]))
+        self.assertIn("recent_editorial_observations", json.loads(call.call_args_list[1].args[1]))
         self.assertIn("최근", call.call_args_list[2].args[0])
 
     def test_history_is_bounded_and_replaces_same_post(self):

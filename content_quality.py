@@ -351,7 +351,8 @@ editorial_brief는 내부 기획이지 본문의 문장 틀이 아닙니다. 더
 intro는 하나의 관심을 여는 짧은 2~4문장이면 충분합니다. 모든 조리 과정을 먼저 설명하지 마세요.
 독자가 이 음식을 고르는 상황은 가정으로 말할 수 있습니다. 작가의 경험이나 독자의 사정을 실제 있었던 일처럼 단정하지 마세요.
 말하듯 자연스러운 한국어를 쓰되 의미 없는 감상, 거창한 비유, 평범한 동작을 포장하는 평가를 붙이지 마세요.
-원문에 있는 사실을 선명하게 보여 주세요. 원문에 없는 맛·식감·효과·이유·역사·효능·판단 기준은 만들지 마세요.
+원문에 있는 사실을 선명하게 보여 주세요. 바나나의 단맛처럼 실제 재료의 일반적으로 알려진 특성은 자연스럽게 표현할 수 있습니다.
+완성품을 시식한 듯 맛·식감을 확정하거나, 원문에 없는 조리 효과·이유·역사·효능·판단 기준을 만들지 마세요.
 요리의 매력과 관심을 보여주는 데 실패 방지 팁이나 조리 효과의 설명이 반드시 필요한 것은 아닙니다.
 story는 도입이나 단계 목록에 없는 연결을 실제 자료로 설명할 때만 0~3개 만드세요. 반복 설명밖에 없다면 []가 좋습니다.
 각 story의 heading은 필요할 때만 45자 이내로 쓰고 아니면 null입니다. body는 500자 이내입니다.
@@ -362,7 +363,7 @@ position은 before_ingredients/before_steps/after_steps 중 글에 맞는 곳을
 따뜻한 해요체를 기본으로 자연스럽게 문장 길이와 어순을 섞으세요. 한 문장에는 중심 생각 하나만 담으세요.
 intro는 650자 이내, 문장은 120자 이내, 문단은 180자 이내이며 문단 사이는 빈 줄로 나눕니다.
 excerpt는 검색·목록에 따로 보이는 160자 이내의 설명입니다. 요리명과 실제 얻을 정보를 한두 문장으로 씁니다.
-최근 actual recent_editorials의 제목 문법·첫 문장·전개를 비교해 메뉴 이름만 바꾼 반복을 피하세요.
+editorial_brief의 avoid_recent와 편집 피드백을 보고 반복을 피하세요. 이전 글을 문장의 견본으로 삼지 마세요.
 정형적인 요약/FAQ/추천 이유/마무리 코너, 가짜 경험담, 성공 보장, 과장된 클릭 유도, HTML·마크다운은 넣지 마세요."""
 
 
@@ -482,7 +483,8 @@ EDITORIAL_PLANNING = """레시피를 쓰기 전에 이 자료에서 독자가 �
 독자의 상황은 가정으로 말할 수 있지만 작가의 체험, 효능, 역사, 맛의 평가를 지어내지 마세요.
 factual_anchor에는 그 관심을 뒷받침하는 실제 재료·단계와 확인 가능한 특징을 적으세요.
 기획에서도 원문 밖의 효과·이유·성공 보장을 만들지 마세요. 논스틱 팬이나 기름 사용법이 있다고 해서 찢어짐 방지·모양 안정 효과를 약속할 근거가 되지는 않습니다.
-원문에 없는 가장자리 변화·뒤집기 판단·보관·대체 팁을 본문 계획에 넣지 마세요. 맛과 식감의 평가도 원문에 명시된 경우만 사용하세요.
+원문에 없는 가장자리 변화·뒤집기 판단·보관·대체 팁을 본문 계획에 넣지 마세요. 완성품의 시식 평가는 지어내지 마세요.
+바나나의 단맛처럼 실제 재료의 일반적으로 알려진 특성을 관심과 연결할 수 있습니다. 이번 완성품을 직접 먹은 평가나 조리 성공 보장으로 바꾸지 마세요.
 원문에 없는 숫자는 합산·계산해서 만들지 마세요. 계량이나 몇 장 굽는지보다 어떤 음식을 만들고 싶은지가 기획의 중심입니다.
 development에는 도입에서 열린 관심이 본문에서 어떻게 발전하고 충족될지 적으세요. 전체 조리 과정을 나열하지 마세요.
 제목 후보 2~4개는 이번 자료를 보고 새로 생각하세요. 유형 목록이나 문장 틀을 만들거나 돌려 쓰지 마세요.
@@ -499,7 +501,7 @@ title_interest: 제목이 요리명+조리 지시를 길게 붙인 설명문을 
 natural_prose: 일상적인 한국어로 한 번에 읽히는가. 장면·순서·흐름·기준이라는 말로 평범한 동작을 의미 있어 보이게 포장하지 않는가.
 develops_interest: 도입이 하나의 관심을 열고 뒤의 글이 이를 발전시키는가. 도입·story·단계에서 같은 동작을 말만 바꿔 반복하지 않는가.
 distinct_recent: 최근 글과 제목의 문법·첫 문장·전개가 실제로 다른가. 단어가 다르다는 것만으로 통과시키지 마세요.
-grounded: 경험·맛·식감·이유·효과를 지어내지 않고 확정된 재료·단계와 일치하는가.
+grounded: 경험·완성품의 시식 평가·조리 이유·효과를 지어내지 않고 확정된 재료·단계와 일치하는가. 실제 식재료의 일반적으로 알려진 특성은 사용할 수 있다.
 단순한 레시피에는 짧고 자연스러운 글로 충분합니다. story가 없어도 좋고 질문형 제목·반전·감탄·긴 서사를 요구하지 마세요.
 하나라도 부족하면 해당 항목을 false로 하고 issues에 실제 문제 구절 quote와 구체적인 repair를 적으세요.
 기획의 설명이나 스스로 잘 썼다는 선언을 믿지 말고 최종 글을 읽어 판단하세요. 말투의 취향 차이만으로 탈락시키지 마세요.
@@ -507,7 +509,7 @@ grounded: 경험·맛·식감·이유·효과를 지어내지 않고 확정된 �
 
 EDITORIAL_ASSESSMENT += """
 평가 범위는 title/intro/story입니다. excerpt는 별도 검색·목록 미리보기이므로 도입과 정보가 겹친다고 반복으로 판정하지 마세요. excerpt는 사실 정합성만 확인하세요. facts는 읽기 전용 근거이며 평가·수정 대상이 아닙니다.
-repair에서도 원문에 없는 이유·효과·감각적 평가·계량 환산·익음 판단·대체 팁을 절대 요구하지 마세요.
+repair에서도 원문에 없는 조리 이유·효과·완성품의 시식 평가·계량 환산·익음 판단·대체 팁을 절대 요구하지 마세요.
 흥미를 높이려면 왜 좋은지나 실패 방지 요령을 반드시 추가해야 한다는 기준을 적용하지 마세요.
 원문에 없는 정보를 보태야만 성립하는 제목이나 문단은 삭제하거나 다른 확인 가능한 특징으로 재구성하라고 하세요.
 자료가 단순하면 자연스러운 짧은 도입과 story=[]도 충분히 통과할 수 있습니다. 유용한 새 팁, 서사의 길이, 소제목, 결말을 요구하지 마세요.
@@ -552,7 +554,7 @@ def assess_recipe_editorial(call, article, recent):
 def review_recipe_article(call, draft, title, ingredients, steps, recent, brief=None):
     source = {"title": title, "ingredients": ingredients, "steps": steps,
               "authoring_mode": "editorial", "draft": draft, "editorial_brief": brief,
-              "recent_editorials": list(recent or [])[:12]}
+              "recent_editorial_observations": (brief or {}).get("avoid_recent", "")}
     error = ""
     for attempt in range(3):
         editing = ("편집 평가에서 거절한 제목과 전개를 버리고, 확정된 사실 자료로 제목·도입부터 새로 작성하세요. 평가의 문제 구절을 초안처럼 재사용하지 마세요."
@@ -567,7 +569,9 @@ def review_recipe_article(call, draft, title, ingredients, steps, recent, brief=
             validate_article(edited, ingredients, steps, recent)
             verdict = assess_recipe_editorial(call, edited, recent)
             source["draft"] = edited
-            source["reader_assessment"] = verdict
+            # Give the writer repair goals, not another batch of bad prose to copy.
+            source["reader_assessment"] = {**{key: verdict[key] for key in EDITORIAL_CRITERIA},
+                                           "repair_goals": [item["repair"] for item in verdict["issues"]]}
             if all(verdict[key] for key in EDITORIAL_CRITERIA):
                 edited["editorial_assessment"] = verdict
                 edited["editorial_brief"] = brief
@@ -597,7 +601,7 @@ def generate_recipe_article(call, title, ingredients, steps, recent=None, source
     brief = plan_recipe_editorial(call, title, facts, recent)
     source = {"title": title, **facts, "authoring_mode": "editorial",
               "editorial_brief": brief,
-              "recent_editorials": list(recent or [])[:12]}
+              "recent_editorial_observations": brief.get("avoid_recent", "")}
     error = ""
     # One correction attempt, never an unvalidated fallback.
     for attempt in range(2):
