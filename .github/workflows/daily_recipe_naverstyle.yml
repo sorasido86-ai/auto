@@ -62,6 +62,7 @@ jobs:
         RUN_SLOT: ${{ github.event.inputs.run_slot || 'day' }}
         DEBUG: '0'
         ALWAYS_NEW: '0'
+        REFRESH_EDITORIAL: ${{ github.event_name == 'push' && '1' || '0' }}
         NAVER_RANDOM_LEVEL: '2'
         NAVER_EXPERIENCE_LEVEL: '2'
         NAVER_MAIN_KEYWORD: ''
