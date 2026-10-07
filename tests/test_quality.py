@@ -112,11 +112,11 @@ class RecipeQualityTests(unittest.TestCase):
     def test_correction_gets_actual_source(self):
         invalid = copy.deepcopy(ARTICLE)
         invalid["steps"].pop()
-        call = Mock(side_effect=[SimpleNamespace(output_text=json.dumps(invalid)), SimpleNamespace(output_text=json.dumps(ARTICLE))])
+        call = Mock(side_effect=[SimpleNamespace(output_text=json.dumps(invalid)), SimpleNamespace(output_text=json.dumps(ARTICLE)), SimpleNamespace(output_text=json.dumps(ARTICLE))])
         self.assertEqual(generate_recipe_article(call, "Tofu", INGREDIENTS, STEPS), ARTICLE)
-        self.assertEqual(call.call_count, 2)
+        self.assertEqual(call.call_count, 3)
         self.assertEqual(json.loads(call.call_args_list[1].args[1])["previous_response"], invalid)
-        for args, _ in call.call_args_list:
+        for args, _ in call.call_args_list[:2]:
             source = json.loads(args[1])
             self.assertEqual(source["ingredients"], INGREDIENTS)
             self.assertEqual(source["steps"], STEPS)
@@ -125,7 +125,7 @@ class RecipeQualityTests(unittest.TestCase):
         call = Mock(return_value=SimpleNamespace(output_text='{"title":"레시피"}'))
         with self.assertRaises(ContentQualityError):
             generate_recipe_article(call, "Tofu", INGREDIENTS, STEPS)
-        self.assertEqual(call.call_count, 2)
+        self.assertEqual(call.call_count, 3)
 
     def test_renderer_preserves_decimal_and_semantics(self):
         rendered = render_recipe(ARTICLE, "https://example.com/recipe?a=1&b=2")
@@ -235,11 +235,11 @@ class EditorialQualityTests(unittest.TestCase):
         previous = self.article()
         changed = self.article()
         changed["intro"] = "두부와 간장을 준비해 만드는 조림입니다. 썬 두부는 5분 동안 끓입니다."
-        call = Mock(side_effect=[SimpleNamespace(output_text=json.dumps(previous)), SimpleNamespace(output_text=json.dumps(changed))])
+        call = Mock(side_effect=[SimpleNamespace(output_text=json.dumps(previous)), SimpleNamespace(output_text=json.dumps(previous)), SimpleNamespace(output_text=json.dumps(changed))])
         self.assertEqual(generate_recipe_article(call, "Tofu", INGREDIENTS, STEPS, [previous]), changed)
-        self.assertEqual(call.call_count, 2)
-        self.assertEqual(json.loads(call.call_args_list[0].args[1])["recent_editorials"], [previous])
-        self.assertIn("최근", call.call_args_list[1].args[0])
+        self.assertEqual(call.call_count, 3)
+        self.assertEqual(json.loads(call.call_args_list[1].args[1])["recent_editorials"], [previous])
+        self.assertIn("최근", call.call_args_list[2].args[0])
 
     def test_history_is_bounded_and_replaces_same_post(self):
         with tempfile.TemporaryDirectory() as directory:
