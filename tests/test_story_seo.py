@@ -187,6 +187,9 @@ class StoryAndSearchTests(unittest.TestCase):
         self.assertEqual(result["steps"], self.article()["steps"])
         changed = body.replace("<li>두부 150g</li>", "<li>두부 250g</li>")
         self.assertIsNone(recover_published_recipe({"content": {"raw": changed}}))
+        decorated = body.replace('<article ', '<article ', 1).replace('<ul>', '<nav><ul><li>목차</li></ul></nav><ul>', 1)
+        decorated = decorated.replace('</article>', '<aside><ul><li>관련 글</li></ul></aside></article>')
+        self.assertEqual(recover_published_recipe({"content": {"rendered": decorated}})["ingredients"], self.article()["ingredients"])
 
     def test_korean_written_quantities_are_equivalent_and_wrong_values_still_differ(self):
         self.assertEqual(numbers("큰 한 꼬집을 넣고 두 분 끓여요."), numbers("1꼬집을 넣고 2분 끓여요."))

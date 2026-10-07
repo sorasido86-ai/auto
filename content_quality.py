@@ -184,8 +184,9 @@ def recover_published_recipe(post):
             if any(not isinstance(x, str) for x in ingredients + steps):
                 continue
             require_recipe(ingredients, steps)
-            visible_ingredients = [li.get_text(" ", strip=True) for li in soup.select("article ul li")]
-            visible_steps = [li.get_text(" ", strip=True) for li in soup.select("article ol li")]
+            # WordPress adds a nested TOC and related links; neither is a recipe list.
+            visible_ingredients = [li.get_text(" ", strip=True) for li in soup.select("article > ul > li")]
+            visible_steps = [li.get_text(" ", strip=True) for li in soup.select("article > ol > li")]
             if ingredients != visible_ingredients or steps != visible_steps:
                 continue
             images = data.get("image", [])
