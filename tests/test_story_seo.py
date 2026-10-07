@@ -248,11 +248,15 @@ class StoryAndSearchTests(unittest.TestCase):
 
     def test_persistent_dry_story_is_not_published_as_valid_fallback(self):
         rejected = self.verdict(natural_prose=False, issues=[{"quote": "도마 위에 두부를 올려요.", "repair": "조리 지시를 도입으로 반복하지 마세요."}])
-        values = [self.article(), rejected] * 3
+        values = [self.article(), rejected] * 4
         call = Mock(side_effect=[SimpleNamespace(output_text=json.dumps(x)) for x in values])
         with self.assertRaises(ContentQualityError):
             review_recipe_article(call, self.article(), "두부 조림", self.article()["ingredients"], self.article()["steps"], [])
-        self.assertEqual(call.call_count, 6)
+        self.assertEqual(call.call_count, 8)
+        correction = json.loads(call.call_args_list[2].args[1])
+        self.assertTrue(correction["copyedit_only"])
+        self.assertFalse(correction["rebuild_from_facts"])
+        self.assertIn("draft", correction)
 
     def test_assessment_requires_consistent_verdict_and_specific_repairs(self):
         for verdict in ({"issues": []}, self.verdict(title_interest=False), self.verdict(issues=[{"quote": "문장", "repair": "수정"}])):
