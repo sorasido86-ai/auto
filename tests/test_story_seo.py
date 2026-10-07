@@ -96,6 +96,13 @@ class StoryAndSearchTests(unittest.TestCase):
             with self.assertRaises(ContentQualityError):
                 self.validate(article)
 
+    def test_actual_generated_filler_does_not_pass_as_storytelling(self):
+        for intro in ("두부 조림은 재료 조합이 분명해요.", "한 접시 완성으로 식탁이 또렷해져요.", "썰기와 끓이기의 흐름이 단순합니다."):
+            article = self.article()
+            article["intro"] = intro
+            with self.assertRaises(ContentQualityError):
+                self.validate(article)
+
     def test_jsonld_matches_visible_recipe_and_anchor_links(self):
         article = self.article()
         page = "https://example.com/tofu/"
