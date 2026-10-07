@@ -563,9 +563,10 @@ def review_recipe_article(call, draft, title, ingredients, steps, recent, brief=
               "authoring_mode": "editorial", "draft": draft, "editorial_brief": brief,
               "recent_editorial_observations": (brief or {}).get("avoid_recent", "")}
     error = ""
+    evaluated = []
     for attempt in range(4):
         if source.get("copyedit_only"):
-            editing = "제목의 관심·전개·독창성·사실은 이미 평가를 통과했습니다. 관점을 다시 만들지 말고 현재 draft의 어색한 문장만 고치세요. 추상적인 명사와 완곡한 감상을 지우고 실제 식재료와 행동을 일상적인 한국어로 직접 말하세요. 지적된 포장 표현을 동의어로 바꾸지 말고 해당 군더더기를 삭제하세요. 새로운 story나 조리 팁을 붙이지 마세요."
+            editing = "현재 draft의 관심과 사실·전개는 사용할 수 있습니다. reader_assessment에서 false인 항목만 수리하고 통과한 부분은 유지하세요. 제목만 부족하면 제목을, 문장만 어색하면 그 문장을, 최근 글과 첫 문장이 겹치면 시작 문법을 고치세요. 관점과 본문 전체를 새로 만들지 마세요. 추상적인 명사와 완곡한 감상을 지우고 실제 식재료와 행동을 일상적인 한국어로 직접 말하세요. 포장 표현을 동의어로 바꾸지 말고 군더더기를 삭제하세요. 새로운 story나 조리 팁을 붙이지 마세요."
         else:
             editing = ("편집 평가에서 거절한 제목과 전개를 버리고, 확정된 사실 자료로 제목·도입부터 새로 작성하세요. 평가의 문제 구절을 초안처럼 재사용하지 마세요."
                        if source.get("rebuild_from_facts") else EDITORIAL_REVIEW)
@@ -578,6 +579,7 @@ def review_recipe_article(call, draft, title, ingredients, steps, recent, brief=
             format_article_prose(edited)
             validate_article(edited, ingredients, steps, recent)
             verdict = assess_recipe_editorial(call, edited, recent)
+            evaluated.append({"article": edited.copy(), "assessment": verdict})
             source["draft"] = edited
             # Give the writer repair goals, not another batch of bad prose to copy.
             source["reader_assessment"] = {**{key: verdict[key] for key in EDITORIAL_CRITERIA},
@@ -592,7 +594,7 @@ def review_recipe_article(call, draft, title, ingredients, steps, recent, brief=
             error = "독자 평가에서 지적한 문제 구절을 고치세요. 문장을 줄이는 데 그치지 말고 관심과 전개를 다시 연결하세요."
             # Keep a good angle when only wording needs repair; rebuild a bad one.
             source["editorial_brief"] = None
-            copyedit = all(verdict[key] for key in EDITORIAL_CRITERIA if key != "natural_prose")
+            copyedit = verdict["develops_interest"] and verdict["grounded"]
             source["copyedit_only"] = copyedit
             source["rebuild_from_facts"] = not copyedit
             if not copyedit:
@@ -603,7 +605,7 @@ def review_recipe_article(call, draft, title, ingredients, steps, recent, brief=
             error = str(exc)
             source["previous_response"] = edited if "edited" in locals() else {}
     Path("artifacts").mkdir(exist_ok=True)
-    Path("artifacts/recipe_editorial_failure.json").write_text(json.dumps(source, ensure_ascii=False, indent=2), encoding="utf-8")
+    Path("artifacts/recipe_editorial_failure.json").write_text(json.dumps({**source, "evaluated_candidates": evaluated}, ensure_ascii=False, indent=2), encoding="utf-8")
     raise ContentQualityError("편집 검증 실패: " + error)
 
 
