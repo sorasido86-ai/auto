@@ -20,8 +20,8 @@ import requests
 import openai  # 예외 타입 용도
 from openai import OpenAI  # 공식 SDK
 from content_quality import generate_recipe_article, render_recipe, save_preview, safe_url, recent_editorials, remember_editorial, recipe_response_format, split_recipe_steps
-from wp_common import write_post
-import html
+from wp_common import write_post, recent_recipe_posts
+from content_quality import editorial_context
 from wp_common import find_post
 
 
@@ -404,10 +404,12 @@ def wp_find_post_by_slug(cfg: WordPressConfig, slug: str) -> Optional[int]:
     return int(post["id"]) if post else None
 
 
-def wp_create_post(cfg: WordPressConfig, title: str, slug: str, html: str, featured_media: Optional[int]) -> Tuple[int, str]:
+def wp_create_post(cfg: WordPressConfig, title: str, slug: str, html: str, featured_media: Optional[int], excerpt: str = "") -> Tuple[int, str]:
     url = cfg.base_url.rstrip("/") + "/wp-json/wp/v2/posts"
     headers = {**wp_auth_header(cfg.user, cfg.app_pass), "Content-Type": "application/json"}
     payload: Dict[str, Any] = {"title": title, "slug": slug, "content": html, "status": cfg.status}
+    if excerpt:
+        payload["excerpt"] = excerpt
 
     if cfg.category_ids:
         payload["categories"] = cfg.category_ids
@@ -420,10 +422,12 @@ def wp_create_post(cfg: WordPressConfig, title: str, slug: str, html: str, featu
     return int(data["id"]), str(data.get("link") or "")
 
 
-def wp_update_post(cfg: WordPressConfig, post_id: int, title: str, html: str, featured_media: Optional[int]) -> Tuple[int, str]:
+def wp_update_post(cfg: WordPressConfig, post_id: int, title: str, html: str, featured_media: Optional[int], excerpt: str = "") -> Tuple[int, str]:
     url = cfg.base_url.rstrip("/") + f"/wp-json/wp/v2/posts/{post_id}"
     headers = {**wp_auth_header(cfg.user, cfg.app_pass), "Content-Type": "application/json"}
     payload: Dict[str, Any] = {"title": title, "content": html, "status": cfg.status}
+    if excerpt:
+        payload["excerpt"] = excerpt
 
     if cfg.category_ids:
         payload["categories"] = cfg.category_ids
@@ -603,9 +607,11 @@ def generate_korean_blog_naverish(cfg: AppConfig, recipe: Dict[str, Any]) -> Tup
     steps = split_steps(recipe.get("instructions", ""))
     def call(instructions, payload):
         return _openai_call_with_retry(client, cfg.openai.model, instructions, payload, cfg.run.openai_max_retries, cfg.run.debug)
-    article = generate_recipe_article(call, recipe.get("title", ""), ingredients, steps, recent=recent_editorials(cfg.sqlite_path))
+    cfg.run.recent_recipes = editorial_context(recent_editorials(cfg.sqlite_path), recent_recipe_posts(cfg.wp.base_url))
+    article = generate_recipe_article(call, recipe.get("title", ""), ingredients, steps, recent=cfg.run.recent_recipes)
     cfg.run.editorial_article = article
     source = safe_url(recipe.get("source")) or f"https://www.themealdb.com/meal/{recipe['id']}"
+    cfg.run.recipe_source = source
     return article["title"], render_recipe(article, source, "TheMealDB 레시피 원문")
 
 
@@ -692,15 +698,14 @@ def run(cfg: AppConfig) -> None:
 
     title_ko, body_html = generate_korean_blog_naverish(cfg, recipe)
 
-    # 해시태그 붙이기(없으면)
+    article = getattr(cfg.run, "editorial_article", None)
+    if article:
+        body_html = render_recipe(article, cfg.run.recipe_source, "TheMealDB 레시피 원문",
+                                  (media_url or thumb_url) if cfg.run.embed_image_in_body else "",
+                                  cfg.wp.base_url.rstrip("/") + "/" + slug + "/",
+                                  getattr(cfg.run, "recent_recipes", []))
     hashtags = build_hashtags(cfg, recipe, title_ko)
     body_html = append_hashtags_if_missing(body_html, hashtags)
-
-    # 이미지 삽입(업로드 성공 URL 우선)
-    if cfg.run.embed_image_in_body:
-        img = media_url or thumb_url
-        if img:
-            body_html = f'<p><img src="{html.escape(safe_url(img), quote=True)}" alt="{html.escape(title_ko, quote=True)}" style="max-width:100%;height:auto;border-radius:12px;"></p>\n' + body_html
 
     title = title_ko
 
@@ -715,11 +720,11 @@ def run(cfg: AppConfig) -> None:
 
     # 발행/업데이트
     if wp_post_id:
-        new_id, wp_link = wp_update_post(cfg.wp, wp_post_id, title, body_html, featured_media=featured)
+        new_id, wp_link = wp_update_post(cfg.wp, wp_post_id, title, body_html, featured_media=featured, excerpt=(article or {}).get("excerpt", ""))
         save_post_meta(cfg.sqlite_path, date_key, slot, recipe_id, recipe_title_en, new_id, wp_link, media_id, media_url)
         print("OK(updated):", new_id, wp_link)
     else:
-        new_id, wp_link = wp_create_post(cfg.wp, title, slug, body_html, featured_media=featured)
+        new_id, wp_link = wp_create_post(cfg.wp, title, slug, body_html, featured_media=featured, excerpt=(article or {}).get("excerpt", ""))
         save_post_meta(cfg.sqlite_path, date_key, slot, recipe_id, recipe_title_en, new_id, wp_link, media_id, media_url)
         print("OK(created):", new_id, wp_link)
 
@@ -737,4 +742,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

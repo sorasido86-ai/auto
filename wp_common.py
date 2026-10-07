@@ -2,7 +2,8 @@
 import time
 from urllib.parse import urlsplit, urlunsplit
 import requests
-from content_quality import readable_html
+from bs4 import BeautifulSoup
+from content_quality import readable_html, safe_url
 
 
 class WordPressError(RuntimeError):
@@ -10,6 +11,40 @@ class WordPressError(RuntimeError):
 
 
 _QUERY_ROUTE = set()
+
+
+def recent_recipe_posts(base_url):
+    """Public cross-workflow history is optional; a read failure cannot block posting."""
+    if not safe_url(base_url):
+        return []
+    endpoint = base_url.rstrip("/") + "/wp-json/wp/v2/posts"
+    try:
+        target, params = transport_target(endpoint)
+        response = requests.get(target, params={**params, "per_page": 24, "status": "publish",
+                                                "_fields": "title,content,link,slug"},
+                                headers={"Accept": "application/json", "Cache-Control": "no-cache"}, timeout=(5, 15))
+        posts = response_json(response)
+        if not isinstance(posts, list):
+            return []
+        result = []
+        for post in posts:
+            if not post.get("slug", "").startswith(("daily-recipe-", "naverstyle-recipe-", "korean-recipe-")):
+                continue
+            soup = BeautifulSoup(post.get("content", {}).get("rendered", ""), "html.parser")
+            for unwanted in soup.select("script,style,aside,.ez-toc-container"):
+                unwanted.decompose()
+            paragraphs = soup.select(".recipe-intro") or soup.select("article p")[:3]
+            intro = "\n\n".join(p.get_text(" ", strip=True) for p in paragraphs if not p.find("img"))[:650]
+            title = BeautifulSoup(post.get("title", {}).get("rendered", ""), "html.parser").get_text()
+            item = {"title": title, "intro": intro, "link": safe_url(post.get("link"))}
+            story = "\n\n".join(p.get_text(" ", strip=True) for p in soup.select(".recipe-story"))[:1500]
+            if story:
+                item["story"] = [{"body": story}]
+            result.append(item)
+        return result[:12]
+    except (requests.RequestException, WordPressError, TypeError, ValueError, AttributeError):
+        print("[EDITORIAL] 최근 사이트 글 조회 실패: 저장된 편집 이력 사용")
+        return []
 
 
 def rest_target(endpoint):

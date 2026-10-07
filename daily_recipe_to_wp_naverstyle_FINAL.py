@@ -6,7 +6,6 @@ DRY_RUN=1은 이미지 업로드와 게시 없이 HTML을 저장합니다.
 from __future__ import annotations
 
 import base64
-import html as _html
 import os
 import random
 import re
@@ -21,7 +20,8 @@ import requests
 import openai  # 예외 타입용
 from openai import OpenAI
 from content_quality import generate_recipe_article, render_recipe, save_preview, safe_url, recent_editorials, remember_editorial, recipe_response_format, split_recipe_steps
-from wp_common import write_post, find_post
+from wp_common import write_post, find_post, recent_recipe_posts
+from content_quality import editorial_context
 
 
 KST = timezone(timedelta(hours=9))
@@ -322,10 +322,12 @@ def wp_auth_header(user: str, app_pass: str) -> Dict[str, str]:
     return {"Authorization": f"Basic {token}", "User-Agent": "daily-recipe-bot/2.0"}
 
 
-def wp_create_post(cfg: WordPressConfig, title: str, slug: str, html: str, featured_media: Optional[int]) -> Tuple[int, str]:
+def wp_create_post(cfg: WordPressConfig, title: str, slug: str, html: str, featured_media: Optional[int], excerpt: str = "") -> Tuple[int, str]:
     url = cfg.base_url.rstrip("/") + "/wp-json/wp/v2/posts"
     headers = {**wp_auth_header(cfg.user, cfg.app_pass), "Content-Type": "application/json"}
     payload: Dict[str, Any] = {"title": title, "slug": slug, "content": html, "status": cfg.status}
+    if excerpt:
+        payload["excerpt"] = excerpt
 
     if cfg.category_ids:
         payload["categories"] = cfg.category_ids
@@ -553,8 +555,8 @@ def run(cfg: AppConfig) -> None:
     ingredients = [f"{x.get('name', '')} {x.get('measure', '')}".strip() for x in ingredients_en]
     def call(instructions, payload):
         return _openai_call_with_retry(client, cfg.openai.model, instructions, payload, cfg.run.openai_max_retries, cfg.run.debug)
-    article = generate_recipe_article(call, title_en, ingredients, steps_en, recent=recent_editorials(cfg.sqlite_path))
-    main_kw = article["title"]
+    recent = editorial_context(recent_editorials(cfg.sqlite_path), recent_recipe_posts(cfg.wp.base_url))
+    article = generate_recipe_article(call, title_en, ingredients, steps_en, recent=recent)
     source = safe_url(recipe.get("source")) or f"https://www.themealdb.com/meal/{recipe_id}"
     body_html = render_recipe(article, source, "TheMealDB 레시피 원문")
 
@@ -572,11 +574,9 @@ def run(cfg: AppConfig) -> None:
             if cfg.run.debug:
                 print("[WARN] media upload failed:", repr(e))
 
-    if cfg.run.embed_image_in_body:
-        img = media_url or final_img_url
-        if img:
-            img_tag = f"<p style='margin:0 0 18px 0;'><img src='{_html.escape(img)}' alt='{_html.escape(main_kw)}' style='max-width:100%;height:auto;border-radius:14px;'/></p>"
-            body_html = img_tag + "\n" + body_html
+    body_html = render_recipe(article, source, "TheMealDB 레시피 원문",
+                              (media_url or final_img_url) if cfg.run.embed_image_in_body else "",
+                              cfg.wp.base_url.rstrip("/") + "/" + slug + "/", recent)
 
     full_html = _style_wrap(body_html)
 
@@ -592,7 +592,7 @@ def run(cfg: AppConfig) -> None:
 
     featured = int(media_id) if (cfg.run.set_featured and media_id) else None
 
-    post_id, link = wp_create_post(cfg.wp, title_final, slug, full_html, featured_media=featured)
+    post_id, link = wp_create_post(cfg.wp, title_final, slug, full_html, featured_media=featured, excerpt=article.get("excerpt", ""))
 
     date_key = now.strftime("%Y-%m-%d") + "_" + slot
     save_post_meta(cfg.sqlite_path, date_key, slot, recipe_id, title_en, post_id, link)
@@ -610,4 +610,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
