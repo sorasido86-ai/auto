@@ -8,7 +8,7 @@ from bs4 import BeautifulSoup
 from content_quality import (ContentQualityError, validate_article, render_recipe,
                              split_recipe_steps, split_recipe_ingredients, editorial_context,
                              review_recipe_article, generate_recipe_article, format_editorial_paragraphs,
-                             recipe_response_format)
+                             recipe_response_format, normalize_mealdb_source)
 from wp_common import recent_recipe_posts
 from site_search_health import page_metadata, xml_locations
 from refresh_site_sitemap import refresh
@@ -90,6 +90,15 @@ class StoryAndSearchTests(unittest.TestCase):
         self.assertEqual(split_recipe_steps(source), ["Boil the potatoes with skins on.", "Mix potatoes and flour.", "Roll into a rope about 1.5 cm wide.", "Serve warm."])
         self.assertEqual(split_recipe_steps("Cook the potatoes until tender.\nUse 1.5 tbsp water."), ["Cook the potatoes until tender.", "Use 1.5 tbsp water."])
 
+    def test_verified_provider_error_uses_linked_original_ingredients_only(self):
+        recipe = {"id": "plov", "source": "https://www.thespruceeats.com/russian-lamb-pilaf-plov-recipe-1137309", "ingredients": [{"name": "Lamb", "measure": "50g"}], "instructions": "Source instructions"}
+        fixed = normalize_mealdb_source(recipe)
+        self.assertEqual(fixed["ingredients"][0], {"name": "Raisins", "measure": "50g"})
+        self.assertIn({"name": "Ground lamb", "measure": "225g"}, fixed["ingredients"])
+        self.assertEqual(fixed["instructions"], recipe["instructions"])
+        other = {**recipe, "source": "https://example.com/other"}
+        self.assertIs(normalize_mealdb_source(other), other)
+
     def test_mfds_group_headers_and_newlines_do_not_merge_or_lose_ingredients(self):
         source = "주재료\n양배추 30g, 쫄면 사리 100g\n\n양념\n올리브유 30g, 참기름 10g"
         expected = ["양배추 30g", "쫄면 사리 100g", "올리브유 30g", "참기름 10g"]
@@ -131,9 +140,9 @@ class StoryAndSearchTests(unittest.TestCase):
     @patch("refresh_site_sitemap.save_sitemap")
     @patch("refresh_site_sitemap.export_sitemap")
     def test_sitemap_refresh_restores_observed_settings_including_exclusions(self, export, save, find):
-        original = {"links_per_sitemap": "200", "exclude_posts": "12,34", "include_images": "on"}
-        changed = {**original, "links_per_sitemap": 201}
-        export.side_effect = [original, changed, {**original, "links_per_sitemap": 200}]
+        original = {"items_per_page": "200", "exclude_posts": "12,34", "include_images": "on"}
+        changed = {**original, "items_per_page": 201}
+        export.side_effect = [original, changed, {**original, "items_per_page": 200}]
         result = refresh("https://example.com", {})
         self.assertTrue(result["settings_restored"])
         self.assertEqual([c.args[2] for c in save.call_args_list], [changed, original])
@@ -142,8 +151,8 @@ class StoryAndSearchTests(unittest.TestCase):
     @patch("refresh_site_sitemap.save_sitemap")
     @patch("refresh_site_sitemap.export_sitemap")
     def test_failed_sitemap_write_is_read_back_and_restored(self, export, save, find):
-        original = {"links_per_sitemap": 200}
-        export.side_effect = [original, {"links_per_sitemap": 201}]
+        original = {"items_per_page": 200}
+        export.side_effect = [original, {"items_per_page": 201}]
         save.side_effect = [__import__("requests").Timeout(), None]
         with self.assertRaises(__import__("requests").Timeout):
             refresh("https://example.com", {})

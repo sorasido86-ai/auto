@@ -21,7 +21,7 @@ import openai  # 예외 타입 용도
 from openai import OpenAI  # 공식 SDK
 from content_quality import generate_recipe_article, render_recipe, save_preview, safe_url, recent_editorials, remember_editorial, recipe_response_format, split_recipe_steps
 from wp_common import write_post, recent_recipe_posts
-from content_quality import editorial_context
+from content_quality import editorial_context, normalize_mealdb_source
 from wp_common import find_post
 
 
@@ -507,7 +507,7 @@ def _normalize_meal(m: Dict[str, Any]) -> Dict[str, Any]:
         if ing:
             ingredients.append({"name": ing, "measure": mea})
 
-    return {
+    return normalize_mealdb_source({
         "id": recipe_id,
         "title": title,
         "category": category,
@@ -517,7 +517,7 @@ def _normalize_meal(m: Dict[str, Any]) -> Dict[str, Any]:
         "thumb": thumb,
         "source": str(m.get("strSource") or "").strip(),
         "youtube": str(m.get("strYoutube") or "").strip(),
-    }
+    })
 
 
 def split_steps(instructions: str) -> List[str]:

@@ -114,6 +114,25 @@ def editorial_context(local, published):
     return result[:12]
 
 
+def normalize_mealdb_source(recipe):
+    """Correct a verified provider transcription error using its linked original."""
+    source = "https://www.thespruceeats.com/russian-lamb-pilaf-plov-recipe-1137309"
+    if recipe.get("source", "").rstrip("/") != source:
+        return recipe
+    # Verified against the linked recipe on 2026-10-07: raisins were labeled lamb,
+    # ground lamb was missing, and the prune amount differed from the original.
+    values = [("Raisins", "50g"), ("Pitted prunes", "115g"), ("Fresh lemon juice", "1 tbsp"),
+              ("Unsalted butter", "2 tbsp"), ("Large onion, chopped", "1"),
+              ("Boneless lamb, cut into 1/2-inch (1-centimeter) cubes", "450g"),
+              ("Ground lamb", "225g"), ("Garlic, crushed", "2 cloves"),
+              ("Lamb stock or vegetable stock", "2 1/2 cups (600ml)"),
+              ("Long-grain white rice, rinsed and drained", "2 cups (350g)"),
+              ("Saffron", "1 large pinch"), ("Salt", "to taste"),
+              ("Freshly ground black pepper", "to taste"), ("Flat-leaf parsley", "for garnish")]
+    print("[SOURCE] 필라프 재료 목록: 링크된 원문의 계량·누락 재료 보정")
+    return {**recipe, "ingredients": [{"name": name, "measure": amount} for name, amount in values]}
+
+
 def require_recipe(ingredients, steps):
     if not ingredients or not steps or any(not str(x).strip() for x in ingredients + steps):
         raise ContentQualityError("재료와 조리 단계가 없는 레시피는 발행하지 않습니다.")
