@@ -173,6 +173,7 @@ def recover_published_recipe(post):
                 continue
             images = data.get("image", [])
             return {"ingredients": ingredients, "steps": steps,
+                    "dish_name": data.get("name", ""), "source_url": safe_url(data.get("isBasedOn")),
                     "image_url": safe_url(images[0]) if isinstance(images, list) and images else ""}
         except (ValueError, TypeError, KeyError, AttributeError):
             continue
@@ -324,14 +325,18 @@ RECIPE_INSTRUCTIONS = """당신은 한국어 요리 매체의 편집자입니다
 먼저 이번 요리의 실제 재료와 과정에서 가장 흥미로운 연결을 발견하세요.
 독자가 눈앞에 그릴 수 있는 장면과 재료의 변화가 이야기의 중심입니다.
 도입을 조리 순서의 축약본으로 쓰지 마세요. 첫째 둘째 마무리로 모든 과정을 미리 나열하지 마세요.
+독자가 이 요리를 준비하며 궁금해할 지점에 집중하세요. 원문에서 확인한 차이·선택·의외의 순서를 이야기로 연결하세요.
+공감은 독자의 실제 조리 상황에서 얻으세요. 작가의 체험이나 음식에 대한 추상적인 감상을 만들어 넣지 마세요.
 장면에서 시작하든 구체적인 질문에서 시작하든, 이번 원문에 가장 자연스러운 전개를 스스로 선택하세요.
 시작 방식이나 제목 유형을 목록에서 뽑거나 정해진 순서로 돌리지 마세요.
-제목과 도입에서 연 호기심은 같은 글에서 구체적인 원문 과정으로 해소하세요.
+제목과 도입에서 연 호기심은 같은 글에서 구체적인 원문 과정으로 해소하세요. 이유가 원문에 없으면 이유를 알려준다고 약속하지 마세요.
 요리 자체보다 작가의 감상이나 추상적인 행복 이야기가 앞서지 않게 하세요.
 제목은 한국어 요리명(dish_name, 45자 이내)을 자연스럽게 포함하고 70자 이내로 작성하세요.
 요리명과 형용사만 붙인 안내문을 넘어서, 왜 이 과정이 눈길을 끄는지 실제 사실로 드러내세요.
 클릭한 뒤 기대와 내용이 일치하도록 하세요. 물음표·콜론·같은 후렴을 매번 반복하지 마세요.
-intro는 650자 이내입니다. 원문이 짧으면 글도 짧아도 좋고, 설명할 연결이 많으면 충분히 풀어주세요.
+가능하면 제목은 30~45자로 간결하게 쓰세요. 최근 제목이 '요리명, ~하는 순서'라면 그 문법을 되풀이하지 마세요.
+intro는 650자 이내입니다. 보통 2~4문장으로 한 가지 관심사를 열고, 재료와 단계 목록으로 이어가세요.
+원문이 짧으면 글도 짧아도 좋고, 설명할 연결이 많으면 충분히 풀어주세요.
 story는 0~3개입니다. intro에서 시작한 이야기를 이어가는 데 필요한 만큼만 작성하세요.
 각 문단의 heading은 필요할 때만 쓰고 45자 이내, 아니면 null입니다. body는 500자 이내입니다.
 position은 before_ingredients/before_steps/after_steps 중 내용의 흐름에 맞게 정하세요.
@@ -375,12 +380,31 @@ def format_editorial_paragraphs(text, limit=180):
     return "\n\n".join(paragraphs)
 
 
+def normalize_recipe_units(text):
+    """Translate leftover unit labels without converting any measurement."""
+    units = {"hours?": "시간", "hrs?": "시간", "minutes?": "분", "mins?": "분",
+             "seconds?": "초", "secs?": "초", "cups?": "컵",
+             "tablespoons?": "큰술", "tbsps?": "큰술", "teaspoons?": "작은술", "tsps?": "작은술",
+             "millilit(?:er|re)s?": "ml", "centimet(?:er|re)s?": "cm", "inch(?:es)?": "인치"}
+    for pattern, label in units.items():
+        text = re.sub(r"(?<![A-Za-z])" + pattern + r"(?![A-Za-z])", label, text, flags=re.I)
+    return text
+
+
 def format_article_prose(article):
+    for key in ("title", "dish_name", "intro", "excerpt", "angle"):
+        if isinstance(article.get(key), str):
+            article[key] = normalize_recipe_units(article[key])
+    for key in ("ingredients", "steps"):
+        if isinstance(article.get(key), list):
+            article[key] = [normalize_recipe_units(x) for x in article[key]]
     if isinstance(article.get("intro"), str):
         article["intro"] = format_editorial_paragraphs(article["intro"])
     for block in [article.get("focus"), *article.get("story", [])]:
         if isinstance(block, dict) and isinstance(block.get("body"), str):
-            block["body"] = format_editorial_paragraphs(block["body"])
+            block["body"] = format_editorial_paragraphs(normalize_recipe_units(block["body"]))
+            if isinstance(block.get("heading"), str):
+                block["heading"] = normalize_recipe_units(block["heading"])
     return article
 
 
@@ -417,6 +441,8 @@ def translate_recipe_items(call, title, ingredients, steps, recent):
                 values = {f"item_{i:03d}": value for i, value in enumerate(values, 1)}
             for key, original_text in items.items():
                 value = values.get(key) if isinstance(values, dict) else None
+                if isinstance(value, str):
+                    value = normalize_recipe_units(value)
                 valid = isinstance(value, str) and value.strip() and re.search(r"[가-힣]", value) and not re.search(r"<[^>]+>|\.\.\.", value)
                 if valid:
                     expected, actual = numbers(original_text), numbers(value)
@@ -444,10 +470,14 @@ EDITORIAL_REVIEW = """이 초안의 제목과 산문을 숙련된 한국어 편�
 과정 전체를 한 문장에 우겨 넣지 마세요. 늘어지는 문장과 어색한 동사·추상적인 평가를 고치세요.
 읽다가 뜻을 되짚어야 하는 문장, 억지 감상, 식재료를 과장되게 의인화한 표현은 삭제하세요.
 요리를 재료가 합류하고 자리를 잡는 연극처럼 쓰지 마세요. 분위기·리듬·흐름 같은 추상어로 제목을 채우지 마세요.
+팬이나 재료가 다른 재료를 '받아요', '받아줘요', '맞이해요'처럼 쓰지 마세요. 넣다·볶다·익히다 등 실제 행동을 말하세요.
 보거나 맡거나 먹지 않은 음식의 냄새·풍미·식감을 상상해서 사실처럼 쓰지 마세요.
 그릇·팬을 주인공으로 삼아 의미 없는 감상을 붙이지 마세요. 독자는 구체적인 재료와 조리 선택에 관심이 있습니다.
 title은 요리명이 포함된 짧고 또렷한 문장이어야 합니다. 억지로 모든 특징을 제목에 담지 마세요.
+한 번에 읽히도록 가능하면 30~45자로 줄이세요. 조리법의 전체 순서를 제목에 설명하지 마세요.
+원문에 이유 설명이 없으면 '이유'를 알려준다고 약속하지 마세요. 독자가 본문에서 확인할 수 있는 호기심만 열어주세요.
 intro는 조리 순서 전체를 다시 풀어 쓰지 말고, 이번 요리에서 관심이 생기는 하나의 연결을 선택하세요.
+실제 조리 중의 선택이나 눈에 보이는 변화로 독자의 관심을 끌어주세요. 대체로 2~4문장이면 충분합니다.
 이야기가 단계 설명의 재방송이면 과감히 줄이세요. 단순한 사실은 짧게 말하고 독자가 이어서 읽을 여백을 남기세요.
 소제목은 아래 문단의 내용에 정확히 맞아야 합니다. 이유를 설명하지 않는 문단에 왜/이유라는 제목을 붙이지 마세요.
 이름과 형용사만 바꾼 상투적인 표현, 정형적인 맺음말을 만들지 마세요.
@@ -481,6 +511,7 @@ def review_recipe_article(call, draft, title, ingredients, steps, recent):
 def generate_recipe_article(call, title, ingredients, steps, recent=None, source_is_korean=False):
     require_recipe(ingredients, steps)
     facts = {"ingredients": list(ingredients), "steps": list(steps)} if source_is_korean else translate_recipe_items(call, title, ingredients, steps, recent)
+    facts = {key: [normalize_recipe_units(x) for x in rows] for key, rows in facts.items()}
     source = {"title": title, **facts, "authoring_mode": "editorial",
               "recent_editorials": list(recent or [])[:12]}
     error = ""

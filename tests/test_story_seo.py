@@ -9,7 +9,7 @@ from content_quality import (ContentQualityError, validate_article, render_recip
                              split_recipe_steps, split_recipe_ingredients, editorial_context,
                              review_recipe_article, generate_recipe_article, format_editorial_paragraphs,
                              recipe_response_format, normalize_mealdb_source, choose_validated_recipe,
-                             recover_published_recipe, translate_recipe_items, numbers)
+                             recover_published_recipe, translate_recipe_items, numbers, normalize_recipe_units)
 from wp_common import recent_recipe_posts
 from site_search_health import page_metadata, xml_locations
 from refresh_site_sitemap import refresh
@@ -174,6 +174,13 @@ class StoryAndSearchTests(unittest.TestCase):
     def test_korean_written_quantities_are_equivalent_and_wrong_values_still_differ(self):
         self.assertEqual(numbers("큰 한 꼬집을 넣고 두 분 끓여요."), numbers("1꼬집을 넣고 2분 끓여요."))
         self.assertNotEqual(numbers("큰 두 꼬집"), numbers("1꼬집"))
+
+    def test_leftover_units_are_translated_without_converting_quantities(self):
+        source = "육수 2 1/2 cups (600 milliliters), 1/2 inch (1cm), 1–2 mins, 최소 1 hour, 몇 minutes, 소금 1 tsp"
+        result = normalize_recipe_units(source)
+        self.assertEqual(result, "육수 2 1/2 컵 (600 ml), 1/2 인치 (1cm), 1–2 분, 최소 1 시간, 몇 분, 소금 1 작은술")
+        self.assertEqual(numbers(source), numbers(result))
+        self.assertEqual(normalize_recipe_units("hoursglass와 1,000ml"), "hoursglass와 1,000ml")
 
     def test_korean_source_quantities_never_depend_on_model_copying(self):
         article = self.article()

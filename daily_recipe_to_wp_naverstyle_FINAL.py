@@ -21,7 +21,7 @@ import openai  # 예외 타입용
 from openai import OpenAI
 from content_quality import generate_recipe_article, render_recipe, save_preview, safe_url, recent_editorials, remember_editorial, recipe_response_format, split_recipe_steps
 from wp_common import write_post, find_post, recent_recipe_posts
-from content_quality import editorial_context, normalize_mealdb_source, choose_validated_recipe
+from content_quality import editorial_context, normalize_mealdb_source, choose_validated_recipe, recover_published_recipe, ContentQualityError
 
 
 KST = timezone(timedelta(hours=9))
@@ -340,6 +340,13 @@ def wp_create_post(cfg: WordPressConfig, title: str, slug: str, html: str, featu
     return int(data["id"]), str(data.get("link") or "")
 
 
+def wp_update_editorial(cfg: WordPressConfig, post_id: int, title: str, html: str, excerpt: str) -> Tuple[int, str]:
+    url = cfg.base_url.rstrip("/") + f"/wp-json/wp/v2/posts/{int(post_id)}"
+    headers = {**wp_auth_header(cfg.user, cfg.app_pass), "Content-Type": "application/json"}
+    data = write_post(url, headers, {"title": title, "content": html, "excerpt": excerpt})
+    return int(data["id"]), str(data.get("link") or "")
+
+
 def wp_upload_media(cfg: WordPressConfig, image_url: str, filename_hint: str = "thumb.jpg") -> Tuple[int, str]:
     media_endpoint = cfg.base_url.rstrip("/") + "/wp-json/wp/v2/media"
     headers = wp_auth_header(cfg.user, cfg.app_pass).copy()
@@ -468,7 +475,7 @@ def _openai_call_with_retry(client: OpenAI, model: str, instructions: str, input
 
 
 # -----------------------------
-# Title: 4 hook styles random
+# Editorial generation uses the source recipe and actual published history.
 # -----------------------------
 
 
@@ -535,10 +542,12 @@ def run(cfg: AppConfig) -> None:
     now = datetime.now(tz=KST)
     slot = cfg.run.run_slot
     slug = f"naverstyle-recipe-{now.strftime('%Y-%m-%d')}-{slot}"
+    existing = None
+    refresh = _env("REFRESH_EDITORIAL") == "1"
     if not cfg.run.dry_run:
         endpoint = cfg.wp.base_url.rstrip("/") + "/wp-json/wp/v2/posts"
         existing = find_post(endpoint, wp_auth_header(cfg.wp.user, cfg.wp.app_pass), slug)
-        if existing:
+        if existing and not refresh:
             print("SKIP(already posted):", existing["id"])
             return
 
@@ -552,10 +561,19 @@ def run(cfg: AppConfig) -> None:
         ingredients = [f"{x.get('name', '')} {x.get('measure', '')}".strip() for x in candidate.get("ingredients", [])]
         return generate_recipe_article(call, candidate.get("title", ""), ingredients,
                                        split_steps(candidate.get("instructions", "")), recent=recent)
-    recipe, article = choose_validated_recipe(lambda: pick_recipe(cfg), author)
+    if existing:
+        snapshot = recover_published_recipe(existing)
+        if not snapshot or not snapshot["dish_name"]:
+            raise ContentQualityError("기존 글의 재료·단계를 검증하지 못해 덮어쓰지 않습니다.")
+        article = generate_recipe_article(call, snapshot["dish_name"], snapshot["ingredients"],
+                                          snapshot["steps"], recent=recent, source_is_korean=True)
+        recipe = {"id": "", "title": snapshot["dish_name"], "source": snapshot["source_url"],
+                  "thumb": snapshot["image_url"]}
+    else:
+        recipe, article = choose_validated_recipe(lambda: pick_recipe(cfg), author)
     recipe_id = recipe.get("id", "")
     title_en = recipe.get("title", "") or "Daily Recipe"
-    source = safe_url(recipe.get("source")) or f"https://www.themealdb.com/meal/{recipe_id}"
+    source = safe_url(recipe.get("source")) or (f"https://www.themealdb.com/meal/{recipe_id}" if recipe_id else "")
     body_html = render_recipe(article, source, "TheMealDB 레시피 원문")
 
     # 원문 레시피의 실제 요리 이미지 사용
@@ -565,7 +583,7 @@ def run(cfg: AppConfig) -> None:
     # WordPress 업로드(이미지 → 본문 상단 삽입)
     media_id = None
     media_url = ""
-    if not cfg.run.dry_run and cfg.run.upload_thumb and final_img_url:
+    if not cfg.run.dry_run and not existing and cfg.run.upload_thumb and final_img_url:
         try:
             media_id, media_url = wp_upload_media(cfg.wp, final_img_url, filename_hint=f"recipe-{now.strftime('%Y%m%d-%H%M%S')}.jpg")
         except Exception as e:
@@ -590,13 +608,15 @@ def run(cfg: AppConfig) -> None:
 
     featured = int(media_id) if (cfg.run.set_featured and media_id) else None
 
-    post_id, link = wp_create_post(cfg.wp, title_final, slug, full_html, featured_media=featured, excerpt=article.get("excerpt", ""))
-
-    date_key = now.strftime("%Y-%m-%d") + "_" + slot
-    save_post_meta(cfg.sqlite_path, date_key, slot, recipe_id, title_en, post_id, link)
+    if existing:
+        post_id, link = wp_update_editorial(cfg.wp, existing["id"], title_final, full_html, article.get("excerpt", ""))
+    else:
+        post_id, link = wp_create_post(cfg.wp, title_final, slug, full_html, featured_media=featured, excerpt=article.get("excerpt", ""))
+        date_key = now.strftime("%Y-%m-%d") + "_" + slot
+        save_post_meta(cfg.sqlite_path, date_key, slot, recipe_id, title_en, post_id, link)
 
     remember_editorial(cfg.sqlite_path, slug, article)
-    print("OK(created):", post_id, link)
+    print("OK(updated):" if existing else "OK(created):", post_id, link)
 
 
 def main():

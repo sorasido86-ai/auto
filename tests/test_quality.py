@@ -370,6 +370,42 @@ class PublishingTests(unittest.TestCase):
 
 
 class BotIntegrationTests(unittest.TestCase):
+    def test_naver_editorial_refresh_updates_verified_existing_recipe_only(self):
+        bot = importlib.import_module("daily_recipe_to_wp_naverstyle_FINAL")
+        with tempfile.TemporaryDirectory() as directory:
+            cfg = bot.load_cfg()
+            cfg.sqlite_path = directory + "/test.sqlite3"
+            cfg.run.dry_run = False
+            existing = {"id": 7, "content": {"raw": render_recipe(ARTICLE, image_url="https://example.com/tofu.jpg")}}
+            with patch.dict(os.environ, {"REFRESH_EDITORIAL": "1"}), patch.object(bot, "find_post", return_value=existing), patch.object(bot, "OpenAI"), patch.object(bot, "recent_recipe_posts", return_value=[]), patch.object(bot, "generate_recipe_article", return_value=ARTICLE) as author, patch.object(bot, "wp_update_editorial", return_value=(7, "url")) as update, patch.object(bot, "wp_create_post") as create, patch.object(bot, "pick_recipe") as pick, patch.object(bot, "wp_upload_media") as upload, patch.object(bot, "save_preview"):
+                with redirect_stdout(StringIO()):
+                    bot.run(cfg)
+                self.assertEqual(update.call_args.args[1], 7)
+                self.assertTrue(author.call_args.kwargs["source_is_korean"])
+                self.assertEqual(author.call_args.args[2], ARTICLE["ingredients"])
+                create.assert_not_called()
+                pick.assert_not_called()
+                upload.assert_not_called()
+
+    def test_naver_refresh_cannot_overwrite_unverified_recipe(self):
+        bot = importlib.import_module("daily_recipe_to_wp_naverstyle_FINAL")
+        with tempfile.TemporaryDirectory() as directory:
+            cfg = bot.load_cfg()
+            cfg.sqlite_path = directory + "/test.sqlite3"
+            cfg.run.dry_run = False
+            with patch.dict(os.environ, {"REFRESH_EDITORIAL": "1"}), patch.object(bot, "find_post", return_value={"id": 7, "content": {"raw": "<p>Old recipe</p>"}}), patch.object(bot, "OpenAI"), patch.object(bot, "recent_recipe_posts", return_value=[]), patch.object(bot, "wp_update_editorial") as update, patch.object(bot, "wp_create_post") as create:
+                with self.assertRaises(ContentQualityError):
+                    bot.run(cfg)
+                update.assert_not_called()
+                create.assert_not_called()
+
+    def test_naver_refresh_post_preserves_existing_publication_settings(self):
+        bot = importlib.import_module("daily_recipe_to_wp_naverstyle_FINAL")
+        with patch.object(bot, "write_post", return_value={"id": 7, "link": "url"}) as write:
+            bot.wp_update_editorial(bot.load_cfg().wp, 7, "새 제목", "<p>본문</p>", "요약")
+        self.assertTrue(write.call_args.args[0].endswith("/posts/7"))
+        self.assertEqual(set(write.call_args.args[2]), {"title", "content", "excerpt"})
+
     def test_all_ten_post_creators_pass_fixed_slug_and_content(self):
         modules = ["daily_post", "daily_recipe_to_wp", "daily_recipe_to_wp_naverstyle_FINAL", "daily_korean_recipe_to_wp", "daily_issue_keywords_to_wp", "community_hotdeal_top20_to_wp", "daily_animal_media_to_wp", "naver_fashion_daily_to_wp", "hot_keyword_naver_shop_to_wp", "trend_keywords_daily_to_wp"]
         for name in modules:
