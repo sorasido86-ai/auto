@@ -57,7 +57,7 @@ jobs:
         WP_CATEGORY_IDS: ${{ secrets.WP_CATEGORY_IDS }}
         WP_TAG_IDS: ${{ secrets.WP_TAG_IDS }}
         OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-        OPENAI_MODEL: ${{ secrets.OPENAI_MODEL }}
+        OPENAI_MODEL: gpt-5.2
         SQLITE_PATH: data/daily_recipe_naverstyle.sqlite3
         RUN_SLOT: ${{ github.event.inputs.run_slot || 'day' }}
         DEBUG: '0'

@@ -870,7 +870,7 @@ def build_body_html(cfg: AppConfig, recipe: Recipe, display_img_url: str, rng: r
             return client.responses.create(model=model, instructions=instructions, input=payload, text=recipe_response_format(payload))
         cfg.run.recent_recipes = editorial_context(recent_editorials(cfg.sqlite_path), recent_recipe_posts(cfg.wp.base_url))
         article = generate_recipe_article(call, recipe.title, recipe.ingredients, recipe.steps,
-                                          recent=cfg.run.recent_recipes)
+                                          recent=cfg.run.recent_recipes, source_is_korean=True)
     else:
         # Without an API key, present the recipe itself without a canned introduction.
         article = {"title": recipe.title, "intro": "", "ingredients": recipe.ingredients, "steps": recipe.steps}
