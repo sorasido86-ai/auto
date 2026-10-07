@@ -10,12 +10,29 @@ from content_quality import (ContentQualityError, validate_article, render_recip
                              review_recipe_article, generate_recipe_article, format_editorial_paragraphs,
                              recipe_response_format, normalize_mealdb_source, choose_validated_recipe,
                              recover_published_recipe, translate_recipe_items, numbers, normalize_recipe_units)
+from content_quality import plan_recipe_editorial, assess_recipe_editorial, EDITORIAL_CRITERIA
 from wp_common import recent_recipe_posts
 from site_search_health import page_metadata, xml_locations
 from refresh_site_sitemap import refresh
 
 
 class StoryAndSearchTests(unittest.TestCase):
+    def brief(self):
+        return {"reader_interest": "두부만 남은 날의 반찬", "factual_anchor": "두부와 간장",
+                "development": "작은 재료 조합에서 조림으로 이어가기", "avoid_recent": "도마에서 시작하는 글 반복 피하기",
+                "title_candidates": ["두부 조림으로 정한 오늘의 반찬", "두부와 간장으로 차리는 두부 조림"],
+                "selected_title": "두부 조림으로 정한 오늘의 반찬"}
+
+    def verdict(self, **changes):
+        return {**dict.fromkeys(EDITORIAL_CRITERIA, True), "issues": [], **changes}
+
+    def model_call(self, article):
+        def respond(instructions, payload):
+            mode = json.loads(payload)["authoring_mode"]
+            value = self.brief() if mode == "planning" else self.verdict() if mode == "assessment" else article
+            return SimpleNamespace(output_text=json.dumps(value, ensure_ascii=False))
+        return Mock(side_effect=respond)
+
     def article(self):
         return {"title": "두부 조림, 깍둑썰기에서 시작하는 한 그릇", "dish_name": "두부 조림",
                 "intro": "먼저 도마 위에 두부를 올려요. 깍둑썰기한 조각은 간장과 함께 냄비로 이어집니다.",
@@ -141,13 +158,13 @@ class StoryAndSearchTests(unittest.TestCase):
     def test_editor_cannot_change_fixed_recipe_facts(self):
         article = self.article()
         edited = {**article, "ingredients": ["두부 50g"], "steps": ["180도에 구워요."]}
-        call = Mock(return_value=SimpleNamespace(output_text=json.dumps(edited)))
+        call = self.model_call(edited)
         result = review_recipe_article(call, article, "Tofu", ["Tofu 150g", "Soy sauce 1 tbsp"], ["Cut tofu into cubes.", "Simmer with soy sauce for 5 minutes."], [])
         self.assertEqual(result["ingredients"], article["ingredients"])
         self.assertEqual(result["steps"], article["steps"])
-        source = json.loads(call.call_args.args[1])
+        source = json.loads(call.call_args_list[0].args[1])
         self.assertEqual(source["authoring_mode"], "editorial")
-        self.assertNotIn("ingredients", recipe_response_format(call.call_args.args[1])["format"]["schema"]["properties"])
+        self.assertNotIn("ingredients", recipe_response_format(call.call_args_list[0].args[1])["format"]["schema"]["properties"])
 
     def test_translation_repairs_only_failed_item_without_rewriting_valid_items(self):
         first = {"ingredients": {"item_001": "두부 150g", "item_002": "간장 1큰술"},
@@ -186,11 +203,59 @@ class StoryAndSearchTests(unittest.TestCase):
         article = self.article()
         article.pop("ingredients")
         article.pop("steps")
-        call = Mock(return_value=SimpleNamespace(output_text=json.dumps(article)))
+        call = self.model_call(article)
         result = generate_recipe_article(call, "두부 조림", ["두부 150g", "간장 1큰술"], ["두부를 깍둑썰기해요.", "간장과 함께 5분 동안 끓여요."], source_is_korean=True)
         self.assertEqual(result["ingredients"], ["두부 150g", "간장 1큰술"])
         self.assertEqual(result["steps"], ["두부를 깍둑썰기해요.", "간장과 함께 5분 동안 끓여요."])
-        self.assertEqual(call.call_count, 2)
+        self.assertEqual(call.call_count, 4)
+        self.assertEqual([json.loads(c.args[1])["authoring_mode"] for c in call.call_args_list],
+                         ["planning", "editorial", "editorial", "assessment"])
+        self.assertEqual(result["editorial_brief"], self.brief())
+
+    def test_semantic_rejection_rewrites_latest_draft_with_specific_feedback(self):
+        rejected = self.verdict(develops_interest=False, issues=[{"quote": "끓이는 시간은 5분이에요.", "repair": "단계를 반복하는 설명을 빼세요."}])
+        revised = {**self.article(), "story": []}
+        values = [self.article(), rejected, revised, self.verdict()]
+        call = Mock(side_effect=[SimpleNamespace(output_text=json.dumps(x)) for x in values])
+        result = review_recipe_article(call, self.article(), "두부 조림", self.article()["ingredients"], self.article()["steps"], [])
+        self.assertEqual(result["story"], [])
+        rewrite = json.loads(call.call_args_list[2].args[1])
+        self.assertEqual(rewrite["reader_assessment"], rejected)
+        self.assertEqual(rewrite["draft"]["story"], self.article()["story"])
+        self.assertTrue(all(result["editorial_assessment"][key] for key in EDITORIAL_CRITERIA))
+
+    def test_persistent_dry_story_is_not_published_as_valid_fallback(self):
+        rejected = self.verdict(natural_prose=False, issues=[{"quote": "도마 위에 두부를 올려요.", "repair": "조리 지시를 도입으로 반복하지 마세요."}])
+        values = [self.article(), rejected] * 3
+        call = Mock(side_effect=[SimpleNamespace(output_text=json.dumps(x)) for x in values])
+        with self.assertRaises(ContentQualityError):
+            review_recipe_article(call, self.article(), "두부 조림", self.article()["ingredients"], self.article()["steps"], [])
+        self.assertEqual(call.call_count, 6)
+
+    def test_assessment_requires_consistent_verdict_and_specific_repairs(self):
+        for verdict in ({"issues": []}, self.verdict(title_interest=False), self.verdict(issues=[{"quote": "문장", "repair": "수정"}])):
+            call = Mock(return_value=SimpleNamespace(output_text=json.dumps(verdict)))
+            with self.assertRaises(ContentQualityError):
+                assess_recipe_editorial(call, self.article(), [])
+
+    def test_planning_uses_this_recipe_and_recent_text_not_repertoire_names(self):
+        call = self.model_call(self.article())
+        facts = {"ingredients": self.article()["ingredients"], "steps": self.article()["steps"]}
+        recent = [self.article()]
+        result = plan_recipe_editorial(call, "두부 조림", facts, recent)
+        source = json.loads(call.call_args.args[1])
+        self.assertEqual(source["recent_editorials"], recent)
+        self.assertEqual(source["steps"], facts["steps"])
+        self.assertIn(result["selected_title"], result["title_candidates"])
+        bad = {**self.brief(), "selected_title": "목록에 없는 제목"}
+        with self.assertRaises(ContentQualityError):
+            plan_recipe_editorial(Mock(return_value=SimpleNamespace(output_text=json.dumps(bad))), "두부 조림", facts, recent)
+
+    def test_planning_and_assessment_have_independent_strict_output_contracts(self):
+        for mode, keys in (("planning", set(self.brief())), ("assessment", set(self.verdict()))):
+            schema = recipe_response_format(json.dumps({"authoring_mode": mode}))["format"]["schema"]
+            self.assertEqual(set(schema["required"]), keys)
+            self.assertFalse(schema["additionalProperties"])
 
     def test_paragraph_reflow_preserves_all_sentences(self):
         parts = ["가나다 " * 14 + ending for ending in ("써요.", "옮겨요.", "끓여요.", "담아요.")]

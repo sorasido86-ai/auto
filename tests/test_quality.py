@@ -36,6 +36,12 @@ def response(value=None, status=200, invalid=False):
 
 
 class RecipeQualityTests(unittest.TestCase):
+    def setUp(self):
+        # These tests isolate fact translation/validation from the planning API.
+        planner = patch("content_quality.plan_recipe_editorial", return_value={})
+        planner.start()
+        self.addCleanup(planner.stop)
+
     def test_source_headings_not_counted_as_steps_and_decimals_kept(self):
         self.assertEqual(split_recipe_steps("STEP 1\nUse 1.5 tbsp sauce.\nSTEP 2\n2. Cook for 5 minutes."), ["Use 1.5 tbsp sauce.", "Cook for 5 minutes."])
         self.assertEqual(split_recipe_steps("1/2 cup of water is added."), ["1/2 cup of water is added."])
@@ -169,6 +175,11 @@ class RecipeQualityTests(unittest.TestCase):
 
 
 class EditorialQualityTests(unittest.TestCase):
+    def setUp(self):
+        planner = patch("content_quality.plan_recipe_editorial", return_value={})
+        planner.start()
+        self.addCleanup(planner.stop)
+
     def article(self):
         result = copy.deepcopy(ARTICLE)
         result["intro"] = "두부를 깍둑썰기한 뒤 끓이는 조림입니다.\n\n재료는 두부와 간장으로 구성됩니다."
