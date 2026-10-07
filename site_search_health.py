@@ -41,7 +41,9 @@ def page_metadata(text, url):
             "canonical": canonical.get("href", "") if canonical else "",
             "robots": robots.get("content", "") if robots else "",
             "h1_count": len(soup.select("h1")), "recipe_schema": len(recipes),
-            "recipe_has_image": any(x.get("image") for x in recipes)}
+            "recipe_has_image": any(x.get("image") for x in recipes),
+            "intro": "\n\n".join(x.get_text(" ", strip=True) for x in soup.select(".recipe-intro")),
+            "story": [x.get_text(" ", strip=True) for x in soup.select(".recipe-story")]}
 
 
 def audit(base):
