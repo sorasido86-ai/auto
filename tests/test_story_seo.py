@@ -8,7 +8,7 @@ from bs4 import BeautifulSoup
 from content_quality import (ContentQualityError, validate_article, render_recipe,
                              split_recipe_steps, split_recipe_ingredients, editorial_context,
                              review_recipe_article, generate_recipe_article, format_editorial_paragraphs,
-                             recipe_response_format, normalize_mealdb_source)
+                             recipe_response_format, normalize_mealdb_source, choose_validated_recipe)
 from wp_common import recent_recipe_posts
 from site_search_health import page_metadata, xml_locations
 from refresh_site_sitemap import refresh
@@ -43,6 +43,33 @@ class StoryAndSearchTests(unittest.TestCase):
             article["story"][0].update(source_steps=refs, body=body)
             with self.assertRaises(ContentQualityError):
                 self.validate(article)
+
+    def test_story_can_quote_a_cited_ingredient_but_cannot_invent_its_quantity(self):
+        article = self.article()
+        article["story"][0].update(body="두부 150g을 도마 위에 올려요.", source_steps=[], source_ingredients=[1])
+        self.validate(article)
+        article["story"][0]["body"] = "두부 250g을 도마 위에 올려요."
+        with self.assertRaises(ContentQualityError):
+            self.validate(article)
+
+    def test_indefinite_english_pinch_may_be_equivalent_numeric_quantity(self):
+        article = self.article()
+        article["steps"] = ["두부를 깍둑썰기해요.", "간장과 소금 큰 1꼬집을 넣고 5분 동안 끓여요."]
+        sources = ["Cut tofu into cubes.", "Add soy sauce and a large pinch of salt and simmer for 5 minutes."]
+        validate_article(article, ["Tofu 150g", "Soy sauce 1 tbsp"], sources)
+        article["steps"][1] = article["steps"][1].replace("1꼬집", "2꼬집")
+        with self.assertRaises(ContentQualityError):
+            validate_article(article, ["Tofu 150g", "Soy sauce 1 tbsp"], sources)
+
+    def test_failed_candidate_is_replaced_only_with_a_validated_candidate(self):
+        pick = Mock(side_effect=[{"id": "bad"}, {"id": "good"}])
+        author = Mock(side_effect=[ContentQualityError("bad quantity"), self.article()])
+        recipe, article = choose_validated_recipe(pick, author)
+        self.assertEqual(recipe["id"], "good")
+        self.assertEqual(article, self.article())
+        self.assertEqual(author.call_count, 2)
+        with self.assertRaises(ContentQualityError):
+            choose_validated_recipe(Mock(side_effect=[{"id": str(i)} for i in range(3)]), Mock(side_effect=ContentQualityError("bad quantity")))
 
     def test_clickable_title_still_requires_real_dish_and_no_false_promises(self):
         for title in ("오늘의 근사한 한 그릇", "두부 조림, 무조건 성공하는 비법"):

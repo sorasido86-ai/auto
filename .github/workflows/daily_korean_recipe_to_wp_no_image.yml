@@ -60,6 +60,7 @@ jobs:
         SQLITE_PATH: data/daily_korean_recipe.sqlite3
         RUN_SLOT: day
         FORCE_NEW: '0'
+        REFRESH_EDITORIAL: ${{ github.event_name == 'push' && '1' || '0' }}
         DEBUG: '0'
         AVOID_REPEAT_DAYS: '90'
         MAX_TRIES: '12'
