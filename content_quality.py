@@ -123,9 +123,16 @@ def split_recipe_ingredients(text):
     return parts
 
 
-def editorial_context(local, published):
+def editorial_context(local, published, exclude=None):
+    # Editing one existing post must not classify its own previous wording as another article.
+    exclude = exclude or {}
+    title = exclude.get("title", {})
+    title = title.get("raw") or title.get("rendered", "") if isinstance(title, dict) else title
+    title = BeautifulSoup(title or "", "html.parser").get_text()
     result, seen = [], set()
     for item in list(published or []) + list(local or []):
+        if (title and item.get("title") == title) or (exclude.get("link") and item.get("link") == exclude["link"]):
+            continue
         key = (item.get("title"), item.get("intro"))
         if key not in seen:
             seen.add(key)

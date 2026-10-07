@@ -556,7 +556,7 @@ def run(cfg: AppConfig) -> None:
     client = OpenAI(api_key=cfg.openai.api_key, timeout=120.0, max_retries=0)
     def call(instructions, payload):
         return _openai_call_with_retry(client, cfg.openai.model, instructions, payload, cfg.run.openai_max_retries, cfg.run.debug)
-    recent = editorial_context(recent_editorials(cfg.sqlite_path), recent_recipe_posts(cfg.wp.base_url))
+    recent = editorial_context(recent_editorials(cfg.sqlite_path), recent_recipe_posts(cfg.wp.base_url), exclude=existing)
     def author(candidate):
         ingredients = [f"{x.get('name', '')} {x.get('measure', '')}".strip() for x in candidate.get("ingredients", [])]
         return generate_recipe_article(call, candidate.get("title", ""), ingredients,
