@@ -89,6 +89,8 @@ class StoryAndSearchTests(unittest.TestCase):
         source = "Prepare the Potatoes\nBoil the potatoes with skins on.\nMake the Dough\nMix potatoes and flour.\nShape the Šúĺlance\nRoll into a rope about 1.5 cm wide.\nServe and Enjoy\nServe warm."
         self.assertEqual(split_recipe_steps(source), ["Boil the potatoes with skins on.", "Mix potatoes and flour.", "Roll into a rope about 1.5 cm wide.", "Serve warm."])
         self.assertEqual(split_recipe_steps("Cook the potatoes until tender.\nUse 1.5 tbsp water."), ["Cook the potatoes until tender.", "Use 1.5 tbsp water."])
+        self.assertEqual(split_recipe_steps("▢\nMix flour.\n▢\nBake for 15 minutes."), ["Mix flour.", "Bake for 15 minutes."])
+        self.assertEqual(split_recipe_steps("Almond base\n▢\nMix the batter.\nYellow egg cream\n▢\nHeat for 15 minutes.\nAssembly\n▢\nSpread the cream."), ["Mix the batter.", "Heat for 15 minutes.", "Spread the cream."])
 
     def test_verified_provider_error_uses_linked_original_ingredients_only(self):
         recipe = {"id": "plov", "source": "https://www.thespruceeats.com/russian-lamb-pilaf-plov-recipe-1137309", "ingredients": [{"name": "Lamb", "measure": "50g"}], "instructions": "Source instructions"}
