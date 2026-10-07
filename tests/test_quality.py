@@ -185,7 +185,7 @@ class EditorialQualityTests(unittest.TestCase):
             article["focus"] = self.focus(position)
             validate_article(article, INGREDIENTS, STEPS)
             body = render_recipe(article)
-            self.assertIn("</p>\n<p>재료는", body)
+            self.assertIn('</p>\n<p class="recipe-intro">재료는', body)
             self.assertLess(body.index(ARTICLE["steps"][0]), body.index(ARTICLE["steps"][1]))
             self.assertEqual(body.count("<li"), 4)
             if position == "before_steps":

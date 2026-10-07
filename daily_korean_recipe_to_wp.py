@@ -22,8 +22,9 @@ from urllib.parse import quote
 import requests
 from openai import OpenAI
 from content_quality import (generate_recipe_article, render_recipe, require_recipe,
-                             save_preview, recent_editorials, remember_editorial, recipe_response_format)
-from wp_common import write_post, find_post
+                             save_preview, recent_editorials, remember_editorial, recipe_response_format,
+                             split_recipe_ingredients, editorial_context)
+from wp_common import write_post, find_post, recent_recipe_posts
 
 
 KST = timezone(timedelta(hours=9))
@@ -687,11 +688,7 @@ def mfds_row_to_recipe(row: Dict[str, Any]) -> Recipe:
     title = str(row.get("RCP_NM") or "").strip()
     parts = str(row.get("RCP_PARTS_DTLS") or "").strip()
 
-    ingredients: List[str] = []
-    for p in re.split(r"\s*,\s*", parts):
-        p = p.strip()
-        if p:
-            ingredients.append(p)
+    ingredients = split_recipe_ingredients(parts)
 
     steps: List[str] = []
     for i in range(1, 21):
@@ -871,15 +868,19 @@ def build_body_html(cfg: AppConfig, recipe: Recipe, display_img_url: str, rng: r
         model = _env("OPENAI_MODEL", "gpt-4.1-mini") or "gpt-4.1-mini"
         def call(instructions, payload):
             return client.responses.create(model=model, instructions=instructions, input=payload, text=recipe_response_format(payload))
+        cfg.run.recent_recipes = editorial_context(recent_editorials(cfg.sqlite_path), recent_recipe_posts(cfg.wp.base_url))
         article = generate_recipe_article(call, recipe.title, recipe.ingredients, recipe.steps,
-                                          recent=recent_editorials(cfg.sqlite_path))
+                                          recent=cfg.run.recent_recipes)
     else:
         # Without an API key, present the recipe itself without a canned introduction.
         article = {"title": recipe.title, "intro": "", "ingredients": recipe.ingredients, "steps": recipe.steps}
     cfg.run.editorial_article = article
     source = "https://www.foodsafetykorea.go.kr/" if recipe.source == "mfds" else ""
     label = f"식품안전나라 공개 레시피 (레시피 번호 {recipe.recipe_id})" if recipe.source == "mfds" else "저장소 기본 레시피"
-    return render_recipe(article, source, label, display_img_url if cfg.img.embed_image_in_body else ""), article["intro"]
+    now = datetime.now(KST).strftime("%Y-%m-%d")
+    page_url = cfg.wp.base_url.rstrip("/") + f"/korean-recipe-{now}-{cfg.run.run_slot}/"
+    return render_recipe(article, source, label, display_img_url if cfg.img.embed_image_in_body else "",
+                         page_url, getattr(cfg.run, "recent_recipes", [])), article.get("excerpt", article["intro"])
 
 
 # -----------------------------
