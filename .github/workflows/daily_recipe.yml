@@ -58,7 +58,7 @@ jobs:
         WP_STATUS: publish
         WP_CATEGORY_IDS: '7'
         SQLITE_PATH: data/daily_recipe.sqlite3
-        OPENAI_MODEL: gpt-5.2
+        OPENAI_MODEL: gpt-5.4
         STRICT_KOREAN: '1'
         FORCE_NEW: '0'
         REFRESH_EDITORIAL: ${{ github.event_name == 'push' && '1' || '0' }}

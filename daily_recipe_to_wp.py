@@ -19,7 +19,7 @@ import requests
 
 import openai  # 예외 타입 용도
 from openai import OpenAI  # 공식 SDK
-from content_quality import generate_recipe_article, render_recipe, save_preview, safe_url, recent_editorials, remember_editorial, recipe_response_format, split_recipe_steps
+from content_quality import generate_recipe_article, render_recipe, save_preview, safe_url, recent_editorials, remember_editorial, recipe_response_format, recipe_model_options, split_recipe_steps
 from wp_common import write_post, recent_recipe_posts
 from content_quality import editorial_context, normalize_mealdb_source, choose_validated_recipe
 from wp_common import find_post
@@ -129,7 +129,7 @@ class RunConfig:
 @dataclass
 class OpenAIConfig:
     api_key: str
-    model: str = "gpt-5.2"
+    model: str = "gpt-5.4"
 
 
 @dataclass
@@ -178,7 +178,7 @@ def load_cfg() -> AppConfig:
     embed_image_in_body = _env_bool("EMBED_IMAGE_IN_BODY", True)
 
     openai_key = _env("OPENAI_API_KEY", "")
-    openai_model = _env("OPENAI_MODEL", "gpt-5.2") or "gpt-5.2"
+    openai_model = _env("OPENAI_MODEL", "gpt-5.4") or "gpt-5.4"
     openai_max_retries = _env_int("OPENAI_MAX_RETRIES", 3)
 
     free_url = _env("FREE_TRANSLATE_URL", "https://libretranslate.de/translate")
@@ -548,6 +548,7 @@ def _openai_call_with_retry(
                 instructions=instructions,
                 input=input_text,
                 text=recipe_response_format(input_text),
+                **recipe_model_options(model),
             )
         except openai.RateLimitError as e:
             if _is_insufficient_quota_error(e):

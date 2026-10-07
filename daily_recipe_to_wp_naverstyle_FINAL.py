@@ -19,7 +19,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import requests
 import openai  # 예외 타입용
 from openai import OpenAI
-from content_quality import generate_recipe_article, render_recipe, save_preview, safe_url, recent_editorials, remember_editorial, recipe_response_format, split_recipe_steps
+from content_quality import generate_recipe_article, render_recipe, save_preview, safe_url, recent_editorials, remember_editorial, recipe_response_format, recipe_model_options, split_recipe_steps
 from wp_common import write_post, find_post, recent_recipe_posts
 from content_quality import editorial_context, normalize_mealdb_source, choose_validated_recipe, recover_published_recipe, ContentQualityError
 
@@ -114,7 +114,7 @@ class NaverStyleConfig:
 @dataclass
 class OpenAIConfig:
     api_key: str
-    model: str = "gpt-4.1-mini"
+    model: str = "gpt-5.4"
 
 
 @dataclass
@@ -164,7 +164,7 @@ def load_cfg() -> AppConfig:
     )
 
     openai_key = _env("OPENAI_API_KEY", "")
-    openai_model = _env("OPENAI_MODEL", "gpt-4.1-mini") or "gpt-4.1-mini"
+    openai_model = _env("OPENAI_MODEL", "gpt-5.4") or "gpt-5.4"
 
     naver_random_level = max(0, min(3, _env_int("NAVER_RANDOM_LEVEL", 2)))
     naver_exp_level = max(0, min(3, _env_int("NAVER_EXPERIENCE_LEVEL", 2)))
@@ -448,7 +448,7 @@ def _is_insufficient_quota_error(e: Exception) -> bool:
 def _openai_call_with_retry(client: OpenAI, model: str, instructions: str, input_text: str, max_retries: int, debug: bool = False):
     for attempt in range(max_retries + 1):
         try:
-            return client.responses.create(model=model, instructions=instructions, input=input_text, text=recipe_response_format(input_text))
+            return client.responses.create(model=model, instructions=instructions, input=input_text, text=recipe_response_format(input_text), **recipe_model_options(model))
         except openai.RateLimitError as e:
             if _is_insufficient_quota_error(e):
                 raise

@@ -22,7 +22,7 @@ from urllib.parse import quote
 import requests
 from openai import OpenAI
 from content_quality import (generate_recipe_article, render_recipe, require_recipe,
-                             save_preview, recent_editorials, remember_editorial, recipe_response_format,
+                             save_preview, recent_editorials, remember_editorial, recipe_response_format, recipe_model_options,
                              split_recipe_ingredients, editorial_context, recover_published_recipe)
 from wp_common import write_post, find_post, recent_recipe_posts
 
@@ -865,9 +865,9 @@ def build_body_html(cfg: AppConfig, recipe: Recipe, display_img_url: str, rng: r
     key = _env("OPENAI_API_KEY", "")
     if key:
         client = OpenAI(api_key=key, timeout=120.0, max_retries=1)
-        model = _env("OPENAI_MODEL", "gpt-4.1-mini") or "gpt-4.1-mini"
+        model = _env("OPENAI_MODEL", "gpt-5.4") or "gpt-5.4"
         def call(instructions, payload):
-            return client.responses.create(model=model, instructions=instructions, input=payload, text=recipe_response_format(payload))
+            return client.responses.create(model=model, instructions=instructions, input=payload, text=recipe_response_format(payload), **recipe_model_options(model))
         cfg.run.recent_recipes = editorial_context(recent_editorials(cfg.sqlite_path), recent_recipe_posts(cfg.wp.base_url))
         article = generate_recipe_article(call, recipe.title, recipe.ingredients, recipe.steps,
                                           recent=cfg.run.recent_recipes, source_is_korean=True)
