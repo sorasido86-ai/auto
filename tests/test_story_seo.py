@@ -8,7 +8,8 @@ from bs4 import BeautifulSoup
 from content_quality import (ContentQualityError, validate_article, render_recipe,
                              split_recipe_steps, split_recipe_ingredients, editorial_context,
                              review_recipe_article, generate_recipe_article, format_editorial_paragraphs,
-                             recipe_response_format, normalize_mealdb_source, choose_validated_recipe)
+                             recipe_response_format, normalize_mealdb_source, choose_validated_recipe,
+                             recover_published_recipe, translate_recipe_items, numbers)
 from wp_common import recent_recipe_posts
 from site_search_health import page_metadata, xml_locations
 from refresh_site_sitemap import refresh
@@ -147,6 +148,32 @@ class StoryAndSearchTests(unittest.TestCase):
         source = json.loads(call.call_args.args[1])
         self.assertEqual(source["authoring_mode"], "editorial")
         self.assertNotIn("ingredients", recipe_response_format(call.call_args.args[1])["format"]["schema"]["properties"])
+
+    def test_translation_repairs_only_failed_item_without_rewriting_valid_items(self):
+        first = {"ingredients": {"item_001": "두부 150g", "item_002": "간장 1큰술"},
+                 "steps": {"item_001": "두부를 깍둑썰기해요.", "item_002": "50분 동안 끓여요."}}
+        repair = {"steps": {"item_002": "5분 동안 끓여요."}}
+        call = Mock(side_effect=[SimpleNamespace(output_text=json.dumps(first)), SimpleNamespace(output_text=json.dumps(repair))])
+        result = translate_recipe_items(call, "Tofu", ["Tofu 150g", "Soy sauce 1 tbsp"], ["Cut tofu into cubes.", "Simmer for 5 minutes."], [])
+        self.assertEqual(result["ingredients"], ["두부 150g", "간장 1큰술"])
+        self.assertEqual(result["steps"], ["두부를 깍둑썰기해요.", "5분 동안 끓여요."])
+        source = json.loads(call.call_args.args[1])
+        self.assertEqual(source["translation_fields"], {"steps": {"item_002": "Simmer for 5 minutes."}})
+        props = recipe_response_format(call.call_args.args[1])["format"]["schema"]["properties"]
+        self.assertEqual(set(props), {"steps"})
+        self.assertEqual(set(props["steps"]["properties"]), {"item_002"})
+
+    def test_published_recipe_recovery_requires_visible_and_structured_facts_to_match(self):
+        body = render_recipe(self.article(), image_url="https://example.com/tofu.jpg")
+        result = recover_published_recipe({"content": {"raw": body}})
+        self.assertEqual(result["ingredients"], self.article()["ingredients"])
+        self.assertEqual(result["steps"], self.article()["steps"])
+        changed = body.replace("<li>두부 150g</li>", "<li>두부 250g</li>")
+        self.assertIsNone(recover_published_recipe({"content": {"raw": changed}}))
+
+    def test_korean_written_quantities_are_equivalent_and_wrong_values_still_differ(self):
+        self.assertEqual(numbers("큰 한 꼬집을 넣고 두 분 끓여요."), numbers("1꼬집을 넣고 2분 끓여요."))
+        self.assertNotEqual(numbers("큰 두 꼬집"), numbers("1꼬집"))
 
     def test_korean_source_quantities_never_depend_on_model_copying(self):
         article = self.article()

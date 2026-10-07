@@ -23,7 +23,7 @@ import requests
 from openai import OpenAI
 from content_quality import (generate_recipe_article, render_recipe, require_recipe,
                              save_preview, recent_editorials, remember_editorial, recipe_response_format,
-                             split_recipe_ingredients, editorial_context)
+                             split_recipe_ingredients, editorial_context, recover_published_recipe)
 from wp_common import write_post, find_post, recent_recipe_posts
 
 
@@ -918,7 +918,13 @@ def run(cfg: AppConfig) -> None:
 
     if not chosen:
         if existing and can_refresh:
-            raise RuntimeError("기존 글의 원문 레시피를 다시 읽지 못해 다른 요리로 덮어쓰지 않았습니다.")
+            facts = recover_published_recipe(existing)
+            if not facts:
+                raise RuntimeError("기존 글의 원문 레시피를 다시 읽지 못해 다른 요리로 덮어쓰지 않았습니다.")
+            chosen = Recipe(today_meta["recipe_source"], today_meta["recipe_id"], today_meta["recipe_title"],
+                            facts["ingredients"], facts["steps"], facts["image_url"])
+            print("[EDITORIAL] 기존 글에서 본문과 일치하는 레시피 사실을 복구했습니다.")
+    if not chosen:
         print("[RECIPE] ... choosing (mfds -> local)")
         chosen = pick_recipe_mfds(cfg, recent_pairs) or pick_recipe_local(cfg, recent_pairs)
 
