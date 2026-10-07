@@ -1,13 +1,5 @@
 name: Daily Korean Recipe to WordPress
 'on':
-  push:
-    branches: [main]
-    paths:
-    - daily_korean_recipe_to_wp.py
-    - content_quality.py
-    - wp_common.py
-    - requirements.txt
-    - .github/workflows/daily_korean_recipe_to_wp_no_image.yml
   schedule:
   - cron: 15 0 * * *
   workflow_dispatch:

@@ -864,10 +864,10 @@ def build_body_html(cfg: AppConfig, recipe: Recipe, display_img_url: str, rng: r
     require_recipe(recipe.ingredients, recipe.steps)
     key = _env("OPENAI_API_KEY", "")
     if key:
-        client = OpenAI(api_key=key, timeout=120.0, max_retries=1)
+        client = OpenAI(api_key=key, timeout=120.0, max_retries=0)
         model = _env("OPENAI_MODEL", "gpt-5.4") or "gpt-5.4"
         def call(instructions, payload):
-            return client.responses.create(model=model, instructions=instructions, input=payload, text=recipe_response_format(payload), **recipe_model_options(model))
+            return client.responses.create(model=model, instructions=instructions, input=payload, text=recipe_response_format(payload), **recipe_model_options(model, payload))
         cfg.run.recent_recipes = editorial_context(recent_editorials(cfg.sqlite_path), recent_recipe_posts(cfg.wp.base_url))
         article = generate_recipe_article(call, recipe.title, recipe.ingredients, recipe.steps,
                                           recent=cfg.run.recent_recipes, source_is_korean=True)

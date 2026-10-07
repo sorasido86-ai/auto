@@ -1,8 +1,5 @@
 name: Editorial storytelling preview
 on:
-  push:
-    branches: [editorial-storytelling]
-    paths: [content_quality.py, editorial_preview.py, .github/workflows/editorial_preview.yml]
   workflow_dispatch:
 permissions:
   contents: read

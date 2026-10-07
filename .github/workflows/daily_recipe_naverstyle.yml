@@ -1,13 +1,5 @@
 name: Daily Recipe (Naverstyle)
 'on':
-  push:
-    branches: [main]
-    paths:
-    - daily_recipe_to_wp_naverstyle_FINAL.py
-    - content_quality.py
-    - wp_common.py
-    - requirements.txt
-    - .github/workflows/daily_recipe_naverstyle.yml
   workflow_dispatch:
     inputs:
       run_slot:

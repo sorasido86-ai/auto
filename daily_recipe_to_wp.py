@@ -179,7 +179,7 @@ def load_cfg() -> AppConfig:
 
     openai_key = _env("OPENAI_API_KEY", "")
     openai_model = _env("OPENAI_MODEL", "gpt-5.4") or "gpt-5.4"
-    openai_max_retries = _env_int("OPENAI_MAX_RETRIES", 3)
+    openai_max_retries = _env_int("OPENAI_MAX_RETRIES", 0)
 
     free_url = _env("FREE_TRANSLATE_URL", "https://libretranslate.de/translate")
     free_api_key = _env("FREE_TRANSLATE_API_KEY", "")
@@ -548,7 +548,7 @@ def _openai_call_with_retry(
                 instructions=instructions,
                 input=input_text,
                 text=recipe_response_format(input_text),
-                **recipe_model_options(model),
+                **recipe_model_options(model, input_text),
             )
         except openai.RateLimitError as e:
             if _is_insufficient_quota_error(e):

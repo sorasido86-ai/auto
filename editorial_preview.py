@@ -17,11 +17,11 @@ def main():
     response.raise_for_status()
     posts = response.json()
     recent = recent_recipe_posts(base)
-    client = OpenAI(api_key=os.environ["OPENAI_API_KEY"], timeout=120, max_retries=1)
+    client = OpenAI(api_key=os.environ["OPENAI_API_KEY"], timeout=120, max_retries=0)
     def call(instructions, payload):
-        return client.responses.create(model=os.environ.get("OPENAI_MODEL", "gpt-5.2"),
+        return client.responses.create(model=os.environ.get("OPENAI_MODEL", "gpt-5.4"),
                                        instructions=instructions, input=payload, text=recipe_response_format(payload),
-                                       **recipe_model_options(os.environ.get("OPENAI_MODEL", "gpt-5.2")))
+                                       **recipe_model_options(os.environ.get("OPENAI_MODEL", "gpt-5.4"), payload))
     reports, seen = [], set()
     for post in posts:
         prefix = next((p for p in ("daily-recipe-", "korean-recipe-", "naverstyle-recipe-") if post["slug"].startswith(p)), None)

@@ -1,13 +1,5 @@
 name: Daily Recipe to WordPress (Naver-friendly)
 'on':
-  push:
-    branches: [main]
-    paths:
-    - daily_recipe_to_wp.py
-    - content_quality.py
-    - wp_common.py
-    - requirements.txt
-    - .github/workflows/daily_recipe.yml
   workflow_dispatch:
     inputs:
       run_slot:
@@ -64,7 +56,7 @@ jobs:
         REFRESH_EDITORIAL: ${{ github.event_name == 'push' && '1' || '0' }}
         AVOID_REPEAT_DAYS: '90'
         MAX_TRIES: '20'
-        OPENAI_MAX_RETRIES: '3'
+        OPENAI_MAX_RETRIES: '0'
         NAVER_STYLE: '1'
         BLOG_TONE: home
         HASHTAG_COUNT: '12'

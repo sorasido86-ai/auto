@@ -160,7 +160,7 @@ def load_cfg() -> AppConfig:
         upload_thumb=_env_bool("UPLOAD_THUMB", True),
         set_featured=_env_bool("SET_FEATURED", True),
         embed_image_in_body=_env_bool("EMBED_IMAGE_IN_BODY", True),
-        openai_max_retries=_env_int("OPENAI_MAX_RETRIES", 3),
+        openai_max_retries=_env_int("OPENAI_MAX_RETRIES", 0),
     )
 
     openai_key = _env("OPENAI_API_KEY", "")
@@ -448,7 +448,7 @@ def _is_insufficient_quota_error(e: Exception) -> bool:
 def _openai_call_with_retry(client: OpenAI, model: str, instructions: str, input_text: str, max_retries: int, debug: bool = False):
     for attempt in range(max_retries + 1):
         try:
-            return client.responses.create(model=model, instructions=instructions, input=input_text, text=recipe_response_format(input_text), **recipe_model_options(model))
+            return client.responses.create(model=model, instructions=instructions, input=input_text, text=recipe_response_format(input_text), **recipe_model_options(model, input_text))
         except openai.RateLimitError as e:
             if _is_insufficient_quota_error(e):
                 raise

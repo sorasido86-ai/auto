@@ -36,11 +36,6 @@ def response(value=None, status=200, invalid=False):
 
 
 class RecipeQualityTests(unittest.TestCase):
-    def setUp(self):
-        # These tests isolate fact translation/validation from the planning API.
-        planner = patch("content_quality.plan_recipe_editorial", return_value={})
-        planner.start()
-        self.addCleanup(planner.stop)
 
     def test_source_headings_not_counted_as_steps_and_decimals_kept(self):
         self.assertEqual(split_recipe_steps("STEP 1\nUse 1.5 tbsp sauce.\nSTEP 2\n2. Cook for 5 minutes."), ["Use 1.5 tbsp sauce.", "Cook for 5 minutes."])
@@ -131,7 +126,7 @@ class RecipeQualityTests(unittest.TestCase):
         call = Mock(return_value=SimpleNamespace(output_text='{"title":"레시피"}'))
         with self.assertRaises(ContentQualityError):
             generate_recipe_article(call, "Tofu", INGREDIENTS, STEPS)
-        self.assertEqual(call.call_count, 3)
+        self.assertEqual(call.call_count, 2)
 
     def test_renderer_preserves_decimal_and_semantics(self):
         rendered = render_recipe(ARTICLE, "https://example.com/recipe?a=1&b=2")
@@ -175,10 +170,6 @@ class RecipeQualityTests(unittest.TestCase):
 
 
 class EditorialQualityTests(unittest.TestCase):
-    def setUp(self):
-        planner = patch("content_quality.plan_recipe_editorial", return_value={})
-        planner.start()
-        self.addCleanup(planner.stop)
 
     def article(self):
         result = copy.deepcopy(ARTICLE)
@@ -249,8 +240,7 @@ class EditorialQualityTests(unittest.TestCase):
         call = Mock(side_effect=[SimpleNamespace(output_text=json.dumps(previous)), SimpleNamespace(output_text=json.dumps(previous)), SimpleNamespace(output_text=json.dumps(changed))])
         self.assertEqual(generate_recipe_article(call, "Tofu", INGREDIENTS, STEPS, [previous]), changed)
         self.assertEqual(call.call_count, 3)
-        self.assertNotIn("recent_editorials", json.loads(call.call_args_list[1].args[1]))
-        self.assertIn("recent_editorial_observations", json.loads(call.call_args_list[1].args[1]))
+        self.assertIn("recent_editorials", json.loads(call.call_args_list[1].args[1]))
         self.assertIn("최근", call.call_args_list[2].args[0])
 
     def test_history_is_bounded_and_replaces_same_post(self):
