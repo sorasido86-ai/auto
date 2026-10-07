@@ -41,7 +41,9 @@ def page_metadata(text, url):
             "canonical": canonical.get("href", "") if canonical else "",
             "robots": robots.get("content", "") if robots else "",
             "h1_count": len(soup.select("h1")), "recipe_schema": len(recipes),
-            "recipe_has_image": any(x.get("image") for x in recipes)}
+            "recipe_has_image": any(x.get("image") for x in recipes),
+            "intro": "\n\n".join(x.get_text(" ", strip=True) for x in soup.select(".recipe-intro")),
+            "story": [x.get_text(" ", strip=True) for x in soup.select(".recipe-story")]}
 
 
 def audit(base):
@@ -49,7 +51,7 @@ def audit(base):
     if not base:
         raise ValueError("Valid SITE_URL required")
     report = {"checked_at": datetime.now(timezone.utc).isoformat(), "site": base, "warnings": []}
-    posts = json.loads(fetch(base + "/wp-json/wp/v2/posts?per_page=6&_fields=link,date,title"))
+    posts = json.loads(fetch(base + "/wp-json/wp/v2/posts?per_page=6&_fields=link,date,title,modified_gmt"))
     urls = [p["link"] for p in posts]
     report["pages"] = [page_metadata(fetch(url), url) for url in urls[:3]]
     robots = fetch(base + "/robots.txt")
@@ -69,12 +71,18 @@ def audit(base):
             if error:
                 errors.append(error)
     report["sitemap_latest_modified"] = max(dates, default="")
+    modified = max((p.get("modified_gmt", "") for p in posts), default="")
+    report["latest_post_modified_gmt"] = modified
+    report["sitemap_stale"] = bool(modified and report["sitemap_latest_modified"] and
+                                  report["sitemap_latest_modified"][:19] < modified[:19])
     report["sitemap_read_errors"] = errors
     report["latest_posts_missing_from_sitemap"] = [u for u in urls if u not in sitemap_urls]
     if errors:
         report["warnings"].append("일부 사이트맵을 읽지 못해 포함 여부를 확정할 수 없습니다.")
     elif report["latest_posts_missing_from_sitemap"]:
         report["warnings"].append("최신 글이 사이트맵에 없습니다. Rank Math 사이트맵 캐시·정적 XML·서버 캐시를 점검하세요.")
+    if report["sitemap_stale"]:
+        report["warnings"].append("사이트맵 갱신 시각이 최신 글 수정 시각보다 오래됐습니다.")
     for page in report["pages"]:
         if "noindex" in page["robots"] or page["canonical"] != page["url"]:
             report["warnings"].append("최신 글의 색인 허용 또는 canonical을 확인하세요: " + page["url"])

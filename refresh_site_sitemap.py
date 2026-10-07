@@ -63,6 +63,17 @@ def refresh(base, headers):
     return {"settings_restored": True, "items_per_page": old}
 
 
+def maintain(base, headers):
+    before = audit(base)
+    if (not before["sitemap_read_errors"] and not before["latest_posts_missing_from_sitemap"]
+            and not before.get("sitemap_stale")):
+        print("[SITEMAP] 최신 글 포함·갱신 확인. 설정 변경 생략.")
+        return {"settings_unchanged": True, "public_audit": before}
+    result = refresh(base, headers)
+    result["public_audit"] = audit(base)
+    return result
+
+
 if __name__ == "__main__":
     base = safe_url(os.environ.get("WP_BASE_URL", "")).rstrip("/")
     user, password = os.environ.get("WP_USER", ""), os.environ.get("WP_APP_PASS", "")
@@ -70,8 +81,11 @@ if __name__ == "__main__":
         raise RuntimeError("WordPress 연결 설정이 필요합니다.")
     token = base64.b64encode((user + ":" + password).encode()).decode()
     headers = {"Authorization": "Basic " + token, "Accept": "application/json"}
-    result = refresh(base, headers)
-    result["public_audit"] = audit(base)
+    result = maintain(base, headers)
     Path("artifacts").mkdir(exist_ok=True)
     Path("artifacts/sitemap_refresh_result.json").write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
     print(json.dumps(result, ensure_ascii=False, indent=2))
+
+    report = result["public_audit"]
+    if report["sitemap_read_errors"] or report["latest_posts_missing_from_sitemap"] or report.get("sitemap_stale"):
+        raise RuntimeError("사이트맵의 최신 글 포함·갱신을 확인하지 못했습니다. 점검 결과를 확인하세요.")

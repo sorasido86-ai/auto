@@ -233,6 +233,30 @@ class StoryAndSearchTests(unittest.TestCase):
         get.side_effect = __import__("requests").Timeout()
         self.assertEqual(recent_recipe_posts("https://example.com"), [])
 
+    def test_editing_existing_post_excludes_its_own_history_only(self):
+        own = {"title": "바나나 팬케이크", "intro": "기존 도입", "link": "https://example.com/current/"}
+        other = {"title": "두부 조림", "intro": "다른 도입", "link": "https://example.com/other/"}
+        result = editorial_context([{"title": own["title"], "intro": own["intro"]}], [own, other],
+                                   exclude={"title": {"raw": own["title"]}, "link": own["link"]})
+        self.assertEqual(result, [other])
+        self.assertEqual(editorial_context([], [own, other]), [own, other])
+
+    @patch("refresh_site_sitemap.refresh")
+    @patch("refresh_site_sitemap.audit")
+    def test_sitemap_maintenance_skips_current_and_refreshes_missing_or_stale(self, audit_mock, refresh_mock):
+        from refresh_site_sitemap import maintain
+        healthy = {"sitemap_read_errors": [], "latest_posts_missing_from_sitemap": [], "sitemap_stale": False}
+        audit_mock.return_value = healthy
+        result = maintain("https://example.com", {})
+        self.assertTrue(result["settings_unchanged"])
+        refresh_mock.assert_not_called()
+        for key, value in (("latest_posts_missing_from_sitemap", ["https://example.com/new/"]), ("sitemap_stale", True)):
+            audit_mock.side_effect = [{**healthy, key: value}, healthy]
+            refresh_mock.return_value = {"settings_restored": True}
+            result = maintain("https://example.com", {})
+            self.assertTrue(result["settings_restored"])
+            self.assertEqual(result["public_audit"], healthy)
+
 
 if __name__ == "__main__":
     unittest.main()
