@@ -68,6 +68,15 @@ def recipe_response_format(payload):
 def split_recipe_steps(instructions):
     text = str(instructions or "").strip()
     parts = [p.strip() for p in re.split(r"\r?\n+", text) if p.strip()]
+    labels = []
+    for index, part in enumerate(parts):
+        next_is_checkbox = index + 1 < len(parts) and re.fullmatch(r"[▢□☐☑✓✔]+", parts[index + 1])
+        noun_heading = re.fullmatch(r"[A-Za-z ]{0,45}(?:base|cream|topping|filling|frosting|sauce|dough)", part, re.I) or part.lower() == "assembly"
+        command = re.match(r"(?:add|mix|cook|make|prepare|stir|roll|place|pour|grind|bake|preheat|boil|let|wait|cool|serve|spread)\b", part, re.I)
+        if not (next_is_checkbox and noun_heading and not command):
+            labels.append(part)
+    parts = labels
+    parts = [re.sub(r"^[▢□☐☑✓✔•●○]+\s*", "", p).strip() for p in parts]
     # STEP 1 is a source label, not an instruction to translate as another step.
     parts = [re.sub(r"^(?:step\s+\d+\s*[:.)-]?\s*|\d+[.)]\s+)", "", p, flags=re.I).strip() for p in parts]
     parts = [p for p in parts if p]
@@ -112,6 +121,25 @@ def editorial_context(local, published):
             seen.add(key)
             result.append(item)
     return result[:12]
+
+
+def normalize_mealdb_source(recipe):
+    """Correct a verified provider transcription error using its linked original."""
+    source = "https://www.thespruceeats.com/russian-lamb-pilaf-plov-recipe-1137309"
+    if recipe.get("source", "").rstrip("/") != source:
+        return recipe
+    # Verified against the linked recipe on 2026-10-07: raisins were labeled lamb,
+    # ground lamb was missing, and the prune amount differed from the original.
+    values = [("Raisins", "50g"), ("Pitted prunes", "115g"), ("Fresh lemon juice", "1 tbsp"),
+              ("Unsalted butter", "2 tbsp"), ("Large onion, chopped", "1"),
+              ("Boneless lamb, cut into 1/2-inch (1-centimeter) cubes", "450g"),
+              ("Ground lamb", "225g"), ("Garlic, crushed", "2 cloves"),
+              ("Lamb stock or vegetable stock", "2 1/2 cups (600ml)"),
+              ("Long-grain white rice, rinsed and drained", "2 cups (350g)"),
+              ("Saffron", "1 large pinch"), ("Salt", "to taste"),
+              ("Freshly ground black pepper", "to taste"), ("Flat-leaf parsley", "for garnish")]
+    print("[SOURCE] 필라프 재료 목록: 링크된 원문의 계량·누락 재료 보정")
+    return {**recipe, "ingredients": [{"name": name, "measure": amount} for name, amount in values]}
 
 
 def require_recipe(ingredients, steps):
@@ -204,6 +232,8 @@ def validate_article(article, ingredients, steps, recent=None):
         raise ContentQualityError("근거 없는 경험담 또는 과장 표현이 있습니다.")
     if re.search(r"오늘은.{0,40}소개|재료와 조리 순서를 정리|원문을 기준으로 안내|누구나 쉽게|한 번 만들어 보|입맛을 사로잡|풍미가 가득|이 글에서는", editorial):
         raise ContentQualityError("요리의 특징이 없는 상투적인 도입 또는 설명입니다.")
+    if re.search(r"한 팬 리듬|냄비 안의 분위기|밀어붙이|이어 받쳐|역할로 남|특별한 순간|입안 가득 풍성한", editorial):
+        raise ContentQualityError("구체적인 요리 내용 대신 추상적인 감상이나 어색한 비유가 있습니다.")
     reference = " ".join(ingredients + steps)
     source_numbers = numbers(reference) + spelled_numbers(reference)
     if set(numbers(article["title"] + " " + article["intro"] + " " + (excerpt or ""))) - set(source_numbers):
@@ -301,6 +331,12 @@ EDITORIAL_REVIEW = """이 초안의 제목과 산문을 숙련된 한국어 편�
 제목과 도입이 조리 순서 요약이나 설명문을 그대로 반복하면 다시 쓰세요.
 과정 전체를 한 문장에 우겨 넣지 마세요. 늘어지는 문장과 어색한 동사·추상적인 평가를 고치세요.
 읽다가 뜻을 되짚어야 하는 문장, 억지 감상, 식재료를 과장되게 의인화한 표현은 삭제하세요.
+요리를 재료가 합류하고 자리를 잡는 연극처럼 쓰지 마세요. 분위기·리듬·흐름 같은 추상어로 제목을 채우지 마세요.
+보거나 맡거나 먹지 않은 음식의 냄새·풍미·식감을 상상해서 사실처럼 쓰지 마세요.
+그릇·팬을 주인공으로 삼아 의미 없는 감상을 붙이지 마세요. 독자는 구체적인 재료와 조리 선택에 관심이 있습니다.
+title은 요리명이 포함된 짧고 또렷한 문장이어야 합니다. 억지로 모든 특징을 제목에 담지 마세요.
+intro는 조리 순서 전체를 다시 풀어 쓰지 말고, 이번 요리에서 관심이 생기는 하나의 연결을 선택하세요.
+이야기가 단계 설명의 재방송이면 과감히 줄이세요. 단순한 사실은 짧게 말하고 독자가 이어서 읽을 여백을 남기세요.
 소제목은 아래 문단의 내용에 정확히 맞아야 합니다. 이유를 설명하지 않는 문단에 왜/이유라는 제목을 붙이지 마세요.
 이름과 형용사만 바꾼 상투적인 표현, 정형적인 맺음말을 만들지 마세요.
 제목을 독자가 실제로 얻을 정보와 연결하고, 이번 요리의 구체적인 호기심을 자연스럽게 드러내세요.
