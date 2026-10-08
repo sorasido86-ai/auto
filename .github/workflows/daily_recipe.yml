@@ -1,5 +1,8 @@
 name: Daily Recipe to WordPress (Naver-friendly)
 'on':
+  push:
+    branches: [main]
+    paths: [.github/recipe_resume.txt]
   workflow_dispatch:
     inputs:
       run_slot:
@@ -53,7 +56,7 @@ jobs:
         OPENAI_MODEL: gpt-5.4
         STRICT_KOREAN: '1'
         FORCE_NEW: '0'
-        REFRESH_EDITORIAL: ${{ github.event_name == 'push' && '1' || '0' }}
+        REFRESH_EDITORIAL: '0'
         AVOID_REPEAT_DAYS: '90'
         MAX_TRIES: '20'
         OPENAI_MAX_RETRIES: '0'

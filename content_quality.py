@@ -89,6 +89,17 @@ def split_recipe_steps(instructions):
     # STEP 1 is a source label, not an instruction to translate as another step.
     parts = [re.sub(r"^(?:step\s+\d+\s*[:.)-]?\s*|\d+[.)]\s+)", "", p, flags=re.I).strip() for p in parts]
     parts = [p for p in parts if p]
+    # Providers also put sequential step numbers on their own lines.
+    # Remove only a 1..N sequence before real text, preserving quantities/ranges.
+    cleaned, expected_label = [], 1
+    for index, part in enumerate(parts):
+        if (re.fullmatch(r"\d+[.)]?", part)
+            and int(part.rstrip(".)")) == expected_label
+            and index + 1 < len(parts) and re.search(r"[A-Za-z가-힣]", parts[index + 1])):
+            expected_label += 1
+            continue
+        cleaned.append(part)
+    parts = cleaned
     parts = [p for p in parts if not (re.fullmatch(r"[^.!?]{1,100}:", p) and not numbers(p))]
     # Editorial source headings are not cooking instructions. Keep actual commands.
     parts = [p for p in parts if not (

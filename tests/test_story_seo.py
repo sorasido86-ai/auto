@@ -205,6 +205,11 @@ class StoryAndSearchTests(unittest.TestCase):
         self.assertEqual(urls, ["https://example.com/tofu/"])
         self.assertEqual(dates, ["2026-10-07"])
 
+    def test_standalone_sequential_step_labels_are_not_sent_to_translation(self):
+        source = "1\nMix flour with 1/2 cup water.\n2\nBake at 180C for 15 minutes."
+        self.assertEqual(split_recipe_steps(source), ["Mix flour with 1/2 cup water.", "Bake at 180C for 15 minutes."])
+        self.assertEqual(split_recipe_steps("180\nHeat the oven."), ["180", "Heat the oven."])
+
     def test_source_headings_do_not_shift_recipe_instructions(self):
         source = "Prepare the Potatoes\nBoil the potatoes with skins on.\nMake the Dough\nMix potatoes and flour.\nShape the Šúĺlance\nRoll into a rope about 1.5 cm wide.\nServe and Enjoy\nServe warm."
         self.assertEqual(split_recipe_steps(source), ["Boil the potatoes with skins on.", "Mix potatoes and flour.", "Roll into a rope about 1.5 cm wide.", "Serve warm."])
