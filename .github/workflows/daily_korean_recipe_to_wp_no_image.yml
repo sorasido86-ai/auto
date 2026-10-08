@@ -1,5 +1,8 @@
 name: Daily Korean Recipe to WordPress
 'on':
+  push:
+    branches: [main]
+    paths: [.github/recipe_resume.txt]
   schedule:
   - cron: 15 0 * * *
   workflow_dispatch:
@@ -52,7 +55,7 @@ jobs:
         SQLITE_PATH: data/daily_korean_recipe.sqlite3
         RUN_SLOT: day
         FORCE_NEW: '0'
-        REFRESH_EDITORIAL: ${{ github.event_name == 'push' && '1' || '0' }}
+        REFRESH_EDITORIAL: '0'
         DEBUG: '0'
         AVOID_REPEAT_DAYS: '90'
         MAX_TRIES: '12'
